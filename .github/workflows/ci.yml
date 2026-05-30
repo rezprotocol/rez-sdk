@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: rez-sdk
+      - uses: actions/checkout@v4
+        with:
+          repository: rezprotocol/rez-core
+          path: rez-core
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+      - run: npm install --no-audit --no-fund
+        working-directory: rez-sdk
+      - run: npm test
+        working-directory: rez-sdk
