@@ -1,7 +1,7 @@
 {
   "name": "@rezprotocol/sdk",
-  "version": "0.0.0",
-  "private": true,
+  "version": "0.2.0",
+  "private": false,
   "license": "Apache-2.0",
   "type": "module",
   "main": "./src/client/index.js",
@@ -22,12 +22,20 @@
     "./pool": "./src/pool/index.js",
     "./filetransfer": "./src/filetransfer/index.js",
     "./profile": "./src/profile/index.js",
-    "./peer-link": "./src/peer-link/index.js"
+    "./peer-link": "./src/peer-link/index.js",
+    "./crypto/bip39": "./src/crypto/bip39.js",
+    "./crypto/seedDerivation": "./src/crypto/seedDerivation.js"
   },
   "dependencies": {
-    "@rezprotocol/core": "file:../rez-core"
+    "@rezprotocol/core": "^0.2.0"
   },
   "scripts": {
     "test": "node --test --test-force-exit"
+  },
+  "files": [
+    "src/"
+  ],
+  "publishConfig": {
+    "access": "public"
   }
 }
