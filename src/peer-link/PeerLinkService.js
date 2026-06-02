@@ -1,15 +1,19 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   E2eeHandshakeAckV1,
+  E2eeHandshakeRejectV1,
   E2eePacketCodec,
   E2eeRehandshakeRequestV1,
   SecureChannelManager,
   X3DHKeyExchange,
   base64ToBytes,
   bytesToBase64,
+  buildDurableRecordV1,
   canonicalJSONStringify,
   deriveAccountIdFromPublicKey,
+  durableRecordSignableBytes,
   nonEmpty,
+  PEERLINK_INVITE_RECORD_KIND,
   requireId,
   signHandshakeEnvelope,
   verifyHandshakeEnvelope,
@@ -89,7 +93,13 @@ function normalizeInviteRecord(input) {
     updatedAtMs: asPositiveInt(input.updatedAtMs, asPositiveInt(input.createdAtMs, Date.now())),
     expiresAtMs: asPositiveInt(input.expiresAtMs, Date.now()),
     maxUses: asPositiveInt(input.maxUses, 1),
-    uses: Math.max(0, Number(input.uses) || 0),
+    // Distinct cryptographically-authenticated acceptor accountIds that have
+    // been honoured by the handshake responder (the single maxUses
+    // enforcement point). Replaces the old `uses` counter: keying on identity
+    // makes re-delivered handshakes idempotent and survives inviter restart.
+    acceptedAcceptors: Array.isArray(input.acceptedAcceptors)
+      ? input.acceptedAcceptors.filter((a) => typeof a === "string" && a.length > 0)
+      : [],
     peerLinkId: nonEmpty(input.peerLinkId),
     groupId: nonEmpty(input.groupId),
     envelope: input.envelope && typeof input.envelope === "object" && !Array.isArray(input.envelope) ? input.envelope : null,
@@ -247,50 +257,6 @@ export class PeerLinkService {
       return null;
     }
     return this._getInviteRecord(ownerAccountId, inviteId);
-  }
-
-  async _claimInvite(record, nowMs) {
-    const normalized = normalizeInviteRecord(record);
-    const lockKey = normalized ? `${normalized.ownerAccountId}:${normalized.inviteId}` : "";
-    return withLock(lockKey, async () => {
-      const current = normalized
-        ? await this._getInviteRecord(normalized.ownerAccountId, normalized.inviteId)
-        : null;
-      if (!current) {
-        return null;
-      }
-      if (nowMs >= current.expiresAtMs) {
-        const expired = {
-          ...current,
-          status: "expired",
-          updatedAtMs: nowMs,
-        };
-        await this._saveInviteRecord(expired);
-        const err = new Error("peer-link invite expired");
-        err.code = "INVITE_EXPIRED";
-        throw err;
-      }
-      if (current.status === "used" || current.uses >= current.maxUses) {
-        const used = {
-          ...current,
-          status: "used",
-          updatedAtMs: nowMs,
-        };
-        await this._saveInviteRecord(used);
-        const err = new Error("peer-link invite already used");
-        err.code = "INVITE_USED_UP";
-        throw err;
-      }
-      const nextUses = current.uses + 1;
-      const next = {
-        ...current,
-        uses: nextUses,
-        status: nextUses >= current.maxUses ? "used" : "active",
-        updatedAtMs: nowMs,
-      };
-      await this._saveInviteRecord(next);
-      return next;
-    });
   }
 
   async _appendPeerLinkEvent({ ownerAccountId = this.ownerAccountId, peerLinkId, type, summary, details, atMs } = {}) {
@@ -873,6 +839,8 @@ export class PeerLinkService {
     creatorDisplayName = null,
     kind = "direct",
     groupId = null,
+    groupCreatedBy = null,
+    groupSalt = null,
     title = null,
     maxUses = 1,
     expiresAtMs = null,
@@ -927,6 +895,15 @@ export class PeerLinkService {
       inviteId,
       kind: resolvedKind,
       groupId: resolvedGroupId,
+      // The group's TRUE founder (group.createdBy), carried so the acceptor
+      // does not have to infer it from the inviter. Without this the inviter
+      // was stamped as createdBy on the acceptor's side and the founder rule
+      // granted them permanent admin (audit pass 5, H2). Signed as part of the
+      // envelope, so the inviter cannot silently alter it after the fact.
+      groupCreatedBy: resolvedKind === "group" ? (nonEmpty(groupCreatedBy) || owner) : null,
+      // Per-group salt binding groupCreatedBy to groupId (verified on accept).
+      // Opaque to the SDK; the chat layer derives + checks it.
+      groupSalt: resolvedKind === "group" ? nonEmpty(groupSalt) : null,
       title: resolvedTitle,
       creatorAccountId: owner,
       creatorDisplayName: nonEmpty(creatorDisplayName),
@@ -952,12 +929,34 @@ export class PeerLinkService {
       updatedAtMs: nowMs,
       expiresAtMs: expires,
       maxUses: asPositiveInt(maxUses, 1),
-      uses: 0,
+      acceptedAcceptors: [],
       peerLinkId: null,
       envelope,
       signatureB64,
     });
     await this.peerLinkStorage.keys.putInvitePreKey(owner, inviteId, inviteBindingState.preKeyState);
+
+    // Build + sign the durable record that carries this signed envelope to
+    // the DHT, so an acceptor can fetch it without the inviter online. The
+    // record is signed by the SAME invite authority (so its publisher key
+    // equals the envelope's signer and the v3 invite code's commitment), and
+    // the node verifies it with the same Ed25519/DER-SPKI primitives. The
+    // chat-server layer (which owns the transport) publishes it.
+    const publisherPublicKeyB64 = authority.signer.getSignerRef().signerPublicKeyB64;
+    const recordPayloadB64 = bytesToBase64(
+      new TextEncoder().encode(JSON.stringify({ envelope, signatureB64 })),
+    );
+    const durableRecord = buildDurableRecordV1({
+      recordKind: PEERLINK_INVITE_RECORD_KIND,
+      recordId: inviteId,
+      publisherPublicKeyB64,
+      payloadB64: recordPayloadB64,
+      issuedAtMs: nowMs,
+      expiresAtMs: expires,
+    });
+    const recordSignatureBytes = await authority.signer.sign(durableRecordSignableBytes(durableRecord));
+    durableRecord.sigB64 = bytesToBase64(recordSignatureBytes);
+
     return {
       peerLinkId: null,
       inviteId,
@@ -965,6 +964,8 @@ export class PeerLinkService {
       expiresAtMs: expires,
       maxUses: asPositiveInt(maxUses, 1),
       createdAtMs: nowMs,
+      publisherPublicKeyB64,
+      durableRecord,
     };
   }
 
@@ -978,42 +979,53 @@ export class PeerLinkService {
     return { envelope: record.envelope, signatureB64: record.signatureB64 || null };
   }
 
-  // Atomic check-and-spend used by the inviter when a remote acceptor
-  // (or the inviter themselves, on the same node) commits to accepting.
-  // Increments `uses`, flips `status` → "used" when exhausted, and returns
-  // the envelope. Throws typed errors (`INVITE_NOT_FOUND` / `INVITE_EXPIRED`
-  // / `INVITE_USED_UP`) so the caller can surface them to the acceptor —
-  // this is the ONLY place maxUses is enforced for cross-network accepts.
-  async claimInviteAsRemote({ ownerAccountId, inviteId, nowMs = null } = {}) {
-    const owner = String(ownerAccountId || "").trim();
-    const id = String(inviteId || "").trim();
-    if (!owner || !id) {
-      const err = new Error("claimInviteAsRemote requires ownerAccountId and inviteId");
-      err.code = "INVITE_NOT_FOUND";
-      throw err;
-    }
+  /**
+   * Authorize a group-join against the stored invite ledger — the same
+   * `acceptedAcceptors`/`maxUses`/expiry rules the handshake responder enforces
+   * (single source of truth). Used by the chat layer to gate a `member.join`
+   * self-announce: it is the ONLY place maxUses can be checked when the joiner
+   * already has an established peer-link (so no fresh handshake runs).
+   *
+   * Runs under the per-invite lock and consumes a slot for a first-time joiner;
+   * a joiner already recorded in `acceptedAcceptors` is idempotent (no double
+   * spend). Returns `{ authorized, reason }`.
+   *
+   * @param {{ ownerAccountId?: string, inviteId: string, joinerAccountId: string, nowMs?: number }} opts
+   */
+  async authorizeInviteJoin({
+    ownerAccountId = this.ownerAccountId,
+    inviteId,
+    joinerAccountId,
+    nowMs = null,
+  } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const id = requireId(inviteId, "inviteId");
+    const joiner = requireId(joinerAccountId, "joinerAccountId");
     const at = Number.isFinite(Number(nowMs)) ? Number(nowMs) : this.clock();
-    const existing = await this._getInviteRecord(owner, id);
-    if (!existing) {
-      const err = new Error("invite not found");
-      err.code = "INVITE_NOT_FOUND";
-      throw err;
-    }
-    if (!existing.envelope) {
-      const err = new Error("invite envelope missing");
-      err.code = "INVITE_NOT_FOUND";
-      throw err;
-    }
-    const claimed = await this._claimInvite(existing, at);
-    if (!claimed) {
-      const err = new Error("invite not found");
-      err.code = "INVITE_NOT_FOUND";
-      throw err;
-    }
-    return {
-      envelope: claimed.envelope,
-      signatureB64: claimed.signatureB64 || null,
-    };
+    return withLock(`${owner}:${id}`, async () => {
+      const fresh = await this._getInviteRecord(owner, id);
+      if (!fresh || fresh.status !== "active") {
+        return { authorized: false, reason: "INVITE_NOT_FOUND" };
+      }
+      if (at >= fresh.expiresAtMs) {
+        return { authorized: false, reason: "INVITE_EXPIRED" };
+      }
+      const accepted = Array.isArray(fresh.acceptedAcceptors) ? fresh.acceptedAcceptors : [];
+      if (accepted.includes(joiner)) {
+        // Already a recorded acceptor (e.g. the handshake responder counted
+        // them) — idempotent, no slot consumed.
+        return { authorized: true, reason: "ALREADY_ACCEPTED" };
+      }
+      if (accepted.length >= fresh.maxUses) {
+        return { authorized: false, reason: "INVITE_USED_UP" };
+      }
+      await this._saveInviteRecord({
+        ...fresh,
+        acceptedAcceptors: [...accepted, joiner],
+        updatedAtMs: at,
+      });
+      return { authorized: true, reason: "CONSUMED" };
+    });
   }
 
   async acceptInvite({
@@ -1059,7 +1071,15 @@ export class PeerLinkService {
     }
 
     const existing = await this.peerLinkStorage.peerLinks.getByPair(acceptor, inviterAccountId);
-    if (existing) {
+    // A peer-link in a terminal dead state (the inviter rejected the handshake,
+    // or a prior handshake send failed) carries no usable session. The store
+    // has no delete — state transitions are the idiom — so a fresh invite from
+    // the same inviter must re-drive the handshake by reusing this record
+    // rather than short-circuiting as idempotent. Live or establishing links
+    // (accept_committed / handshake_sent / handshake_received /
+    // session_established / degraded / rehandshake_requested) stay idempotent.
+    const reattempt = Boolean(existing) && (existing.state === "rejected" || existing.state === "failed");
+    if (existing && !reattempt) {
       // Peer-link records are pure cryptographic channels; they carry no
       // group context. Group membership is signaled by the chat-layer
       // `member.join` op authorized against the invite envelope's
@@ -1081,16 +1101,19 @@ export class PeerLinkService {
       };
     }
 
-    // maxUses is enforced on the inviter side via `claimInviteAsRemote` —
-    // either inside `_handleInboundClaimRequest` (cross-network) or in
-    // `ServerInvitesService.acceptInvite` before this method is called
-    // (same-node). We still resolve the local invite record so we can
-    // back-link `peerLinkId` onto it below, but we MUST NOT re-claim here
-    // (would double-decrement uses on the same-node path).
+    // maxUses is enforced lazily on the inviter side, in
+    // `handleIncomingHandshakePacket` (the single enforcement point — it runs
+    // whenever the inviter is online and the acceptor is cryptographically
+    // authenticated). Accept is optimistic here: we resolve the local invite
+    // record only to back-link `peerLinkId` onto it (same-node case), never to
+    // spend it.
     const tokenHashHex = createHash("sha256").update(canonicalPayloadBytes).digest("hex");
     const localInviteIdForLink = await this._getInviteRecordByHash(inviterAccountId, tokenHashHex);
 
-    const peerLinkId = stableId("pl");
+    // Reuse the existing peer-link id when re-driving a terminal dead link so
+    // the pair stays a single record (getByPair is per-pair); a first accept
+    // mints a new id.
+    const peerLinkId = reattempt ? existing.peerLinkId : stableId("pl");
     // Persist the inviter-signed post-cap so subsequent deposits to this peer
     // attach it. Bearer cap; pubkey blocklist gates per-session-pubkey.
     const inviterPostCapJson = envelope.postCap && typeof envelope.postCap === "object" ? envelope.postCap : null;
@@ -1108,20 +1131,41 @@ export class PeerLinkService {
       err.code = "INVITE_SIGNATURE_INVALID";
       throw err;
     }
-    let peerLinkRecord = await this.peerLinkStorage.peerLinks.create({
-      peerLinkId,
-      localAccountId: acceptor,
-      peerAccountId: inviterAccountId,
-      remoteIdentitySigningPublicKeyB64: inviterIdentitySigningPubKeyB64,
-      state: "accept_committed",
-      activeInviteId: requireId(envelope.inviteId, "inviteId"),
-      activeSessionId: null,
-      peerInboxId: envelope.binding && typeof envelope.binding === "object" ? nonEmpty(envelope.binding.capabilityId) : null,
-      lastStateChangeAtMs: nowMs,
-      lastErrorCode: null,
-      lastErrorMessage: null,
-      version: 1,
-    });
+    const peerInboxIdForLink = envelope.binding && typeof envelope.binding === "object" ? nonEmpty(envelope.binding.capabilityId) : null;
+    let peerLinkRecord;
+    if (reattempt) {
+      // Transition the terminal dead link back into an active accept. A prior
+      // reject already deleted its session + post-cap, and its handshake
+      // attempts were marked terminal, so there is nothing stale to carry over
+      // beyond the row identity itself. Clear the error fields and re-bind the
+      // new invite.
+      peerLinkRecord = await this.peerLinkStorage.peerLinks.update({
+        ...existing,
+        remoteIdentitySigningPublicKeyB64: inviterIdentitySigningPubKeyB64,
+        state: "accept_committed",
+        activeInviteId: requireId(envelope.inviteId, "inviteId"),
+        activeSessionId: null,
+        peerInboxId: peerInboxIdForLink,
+        lastStateChangeAtMs: nowMs,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+      }, existing.version);
+    } else {
+      peerLinkRecord = await this.peerLinkStorage.peerLinks.create({
+        peerLinkId,
+        localAccountId: acceptor,
+        peerAccountId: inviterAccountId,
+        remoteIdentitySigningPublicKeyB64: inviterIdentitySigningPubKeyB64,
+        state: "accept_committed",
+        activeInviteId: requireId(envelope.inviteId, "inviteId"),
+        activeSessionId: null,
+        peerInboxId: peerInboxIdForLink,
+        lastStateChangeAtMs: nowMs,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+        version: 1,
+      });
+    }
     if (inviterPostCapJson) {
       await this.kv.set(_postCapKey(acceptor, peerLinkId), inviterPostCapJson);
     }
@@ -1140,10 +1184,10 @@ export class PeerLinkService {
       lastErrorMessage: null,
       version: 1,
     });
-    // Re-read the invite record before back-linking peerLinkId: the spend
-    // happened on the inviter side (claimInviteAsRemote), so the in-memory
-    // copy from before this method may be stale. Re-reading honours the
-    // "persist first, never patch in-memory snapshots" rule.
+    // Re-read the invite record before back-linking peerLinkId: the handshake
+    // responder may have updated it concurrently (same-node case), so the
+    // in-memory copy from before this method may be stale. Re-reading honours
+    // the "persist first, never patch in-memory snapshots" rule.
     if (localInviteIdForLink) {
       const fresh = await this._getInviteRecord(
         localInviteIdForLink.ownerAccountId,
@@ -1430,19 +1474,69 @@ export class PeerLinkService {
       },
     });
 
-    const preKeyState = await this.peerLinkStorage.keys.getInvitePreKey(owner, inviteId);
-    if (!preKeyState || typeof preKeyState !== "object") {
-      const missingPreKey = new Error("peer-link invite pre-key not found");
-      missingPreKey.code = "PEER_LINK_PREKEY_MISSING";
-      throw missingPreKey;
-    }
-    // Look up the invite to get the inviter's own display name for the ack.
+    // Look up the invite (for the inviter's display name + lazy maxUses).
     const inviteRecord = await this._getInviteRecord(owner, inviteId);
     const localDisplayName = inviteRecord
       && inviteRecord.envelope
       && typeof inviteRecord.envelope.creatorDisplayName === "string"
       ? inviteRecord.envelope.creatorDisplayName
       : "";
+
+    // Lazy maxUses enforcement — the single enforcement point. The inviter is
+    // by definition online here, which is exactly where distinct acceptors
+    // become observable. Count distinct, cryptographically-authenticated
+    // `peerAccountId`s under the invite lock: a re-delivered handshake from an
+    // acceptor already accounted for is idempotent (proceeds, re-establishes),
+    // and two different acceptors racing a single-use invite are serialized
+    // (first wins, second rejected). `acceptedAcceptors` persists on the
+    // invite record, so the count survives inviter restart.
+    //
+    // This runs BEFORE the pre-key gate so an over-limit acceptor gets a clean
+    // signed reject even after the shared invite pre-key was cleared by the
+    // exhausting acceptor. `inviteExhausted` drives pre-key retention below:
+    // the shared pre-key must survive every distinct acceptor for maxUses>1, so
+    // it is only deleted once the last slot is filled. If we hold no invite
+    // record we cannot enforce, so we proceed and fall back to the old
+    // delete-on-first-handshake behaviour.
+    let inviteExhausted = !inviteRecord;
+    if (inviteRecord) {
+      const verdict = await withLock(`${owner}:${inviteId}`, async () => {
+        const fresh = await this._getInviteRecord(owner, inviteId);
+        if (!fresh) return { action: "proceed", exhausted: true };
+        const at = this.clock();
+        if (at >= fresh.expiresAtMs) return { action: "reject", reason: "INVITE_EXPIRED" };
+        const accepted = Array.isArray(fresh.acceptedAcceptors) ? fresh.acceptedAcceptors : [];
+        if (accepted.includes(peerAccountId)) {
+          return { action: "proceed", exhausted: accepted.length >= fresh.maxUses };
+        }
+        if (accepted.length >= fresh.maxUses) return { action: "reject", reason: "INVITE_USED_UP" };
+        const nextAccepted = [...accepted, peerAccountId];
+        await this._saveInviteRecord({
+          ...fresh,
+          acceptedAcceptors: nextAccepted,
+          updatedAtMs: at,
+        });
+        return { action: "proceed", exhausted: nextAccepted.length >= fresh.maxUses };
+      });
+      if (verdict.action === "reject") {
+        return {
+          rejected: true,
+          reason: verdict.reason,
+          ackNonce: nonEmpty(handshakeData.ackNonce) || null,
+          acceptorInboxId: remoteInboxId,
+          peerAccountId,
+        };
+      }
+      inviteExhausted = Boolean(verdict.exhausted);
+    }
+
+    const preKeyState = await this.peerLinkStorage.keys.getInvitePreKey(owner, inviteId);
+    if (!preKeyState || typeof preKeyState !== "object") {
+      const missingPreKey = new Error("peer-link invite pre-key not found");
+      missingPreKey.code = "PEER_LINK_PREKEY_MISSING";
+      throw missingPreKey;
+    }
+
     const nowMs = this.clock();
     const existing = await this.peerLinkStorage.peerLinks.getByPair(owner, peerAccountId);
     let peerLinkRecord = existing;
@@ -1507,7 +1601,11 @@ export class PeerLinkService {
       lastErrorMessage: null,
       version: 1,
     });
-    await this.peerLinkStorage.keys.deleteInvitePreKey(owner, inviteId);
+    // Only clear the shared invite pre-key once the invite is exhausted, so
+    // every distinct acceptor of a maxUses>1 invite can still complete X3DH.
+    if (inviteExhausted) {
+      await this.peerLinkStorage.keys.deleteInvitePreKey(owner, inviteId);
+    }
     const eventRecord = await this._appendPeerLinkEvent({
       ownerAccountId: owner,
       peerLinkId: peerLinkRecord.peerLinkId,
@@ -1685,6 +1783,164 @@ export class PeerLinkService {
       snapshot: await this._buildSnapshot(updatedRecord),
       event: eventRecord,
       remoteDisplayName: typeof remoteDisplayName === "string" ? remoteDisplayName : "",
+    };
+  }
+
+  /**
+   * Build a signed handshake-reject envelope (inviter → acceptor). Mirrors
+   * `createSignedHandshakeAck`: signed with the inviter's X3DH identity signing
+   * private key so the acceptor authenticates it against the
+   * `remoteIdentitySigningPublicKeyB64` it persisted at accept time, and bound
+   * to the acceptor's `ackNonce` so a stale reject can't tear down a later
+   * attempt. Sent when the handshake responder declines (invite used up /
+   * expired) so the acceptor can roll back its optimistic peer-link.
+   *
+   * @param {{ ownerAccountId?: string, reason: string, ackNonce: string }} opts
+   * @returns {Promise<{ rejectBytes: Uint8Array }>}
+   */
+  async createSignedHandshakeReject({
+    ownerAccountId = this.ownerAccountId,
+    reason,
+    ackNonce,
+  } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    if (typeof reason !== "string" || reason.length === 0) {
+      throw new Error("createSignedHandshakeReject requires reason string");
+    }
+    if (typeof ackNonce !== "string" || ackNonce.length === 0) {
+      throw new Error("createSignedHandshakeReject requires ackNonce string");
+    }
+    const { keyPair: identityKeyPair } = await this._requireBoundX3dhIdentity(owner);
+    const rejectPayload = {
+      senderIdentitySigningPubKeyB64: bytesToBase64(identityKeyPair.publicKey),
+      senderAccountId: owner,
+      reason,
+      ackNonce,
+      createdAtMs: this.clock(),
+    };
+    const signatureB64 = await signHandshakeEnvelope({
+      handshake: rejectPayload,
+      crypto: this.cryptoProvider,
+      signingPrivateKey: identityKeyPair.privateKey,
+    });
+    const reject = new E2eeHandshakeRejectV1({ ...rejectPayload, signatureB64 });
+    return { rejectBytes: reject.toBytes() };
+  }
+
+  /**
+   * Handle an authenticated handshake-reject from the inviter (acceptor side).
+   * Rolls back the optimistic peer-link created at `acceptInvite`: tears down
+   * the pending session + post-cap, marks the handshake attempt and peer-link
+   * "rejected", and returns a snapshot so the chat layer can drop the
+   * optimistic thread/contact. No-op if the link already reached
+   * "session_established" (an ack beat the reject) — an established session is
+   * never torn down by a reject.
+   *
+   * Authentication mirrors `handleIncomingHandshakeAck` (pubkey-on-record +
+   * envelope signature + nonce), so a relay cannot forge a reject.
+   *
+   * @param {{ ownerAccountId?: string, rejectPacketBytes: Uint8Array }} opts
+   */
+  async handleHandshakeReject({
+    ownerAccountId = this.ownerAccountId,
+    rejectPacketBytes,
+  } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    if (!(rejectPacketBytes instanceof Uint8Array) || rejectPacketBytes.length === 0) {
+      return null;
+    }
+    let reject;
+    try {
+      reject = E2eeHandshakeRejectV1.fromBytes(rejectPacketBytes);
+    } catch {
+      return null;
+    }
+    const remote = reject.senderAccountId;
+    const peerLinkRecord = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
+    if (!peerLinkRecord) {
+      return null;
+    }
+    // Only roll back a link still awaiting confirmation. If a session was
+    // already established (ack won the race), the reject is stale — ignore it.
+    if (peerLinkRecord.state !== "accept_committed" && peerLinkRecord.state !== "handshake_sent") {
+      return null;
+    }
+    // Authenticate: the reject's signing pubkey must match the one we trusted
+    // on-record at accept time, and the envelope signature must verify.
+    const expectedPubKeyB64 = nonEmpty(peerLinkRecord.remoteIdentitySigningPublicKeyB64);
+    if (!expectedPubKeyB64 || expectedPubKeyB64 !== reject.senderIdentitySigningPubKeyB64) {
+      return null;
+    }
+    const sigOk = await verifyHandshakeEnvelope({
+      handshake: reject.toRejectPayload(),
+      signatureB64: reject.signatureB64,
+      crypto: this.cryptoProvider,
+    });
+    if (!sigOk) {
+      return null;
+    }
+    // Bind to the acceptor's stored nonce so a replayed/stale reject from an
+    // earlier attempt cannot tear down a fresh one.
+    const nonceKey = "peer-link:ack-nonce:" + owner + ":" + peerLinkRecord.peerLinkId;
+    const storedNonce = await this.kv.get(nonceKey);
+    if (storedNonce) {
+      if (String(reject.ackNonce) !== String(storedNonce)) {
+        return null;
+      }
+      await this.kv.delete(nonceKey);
+    }
+
+    const reason = nonEmpty(reject.reason) || "INVITE_REJECTED";
+    const nowMs = this.clock();
+
+    // Tear down the optimistic pending session + post-cap.
+    const session = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, peerLinkRecord.peerLinkId);
+    if (session && session.sessionId) {
+      await this.peerLinkStorage.sessions.delete(owner, session.sessionId);
+    }
+    await this.kv.delete(_postCapKey(owner, peerLinkRecord.peerLinkId));
+
+    // Mark the initiator handshake attempt(s) rejected (diagnostic trail).
+    const attempts = await this.peerLinkStorage.handshakeAttempts.listByPeerLinkId(owner, peerLinkRecord.peerLinkId);
+    for (const attempt of Array.isArray(attempts) ? attempts : []) {
+      if (attempt.status === "completed" || attempt.status === "rejected") continue;
+      await this.peerLinkStorage.handshakeAttempts.update({
+        ...attempt,
+        status: "rejected",
+        lastTriedAtMs: nowMs,
+        lastErrorCode: reason,
+        lastErrorMessage: "handshake rejected by inviter",
+      }, attempt.version);
+    }
+
+    // Transition the peer-link to the terminal "rejected" state. The store has
+    // no delete (state transitions are the idiom), and a terminal state is the
+    // signal the chat layer tears the optimistic thread/contact down on.
+    const rejectedRecord = await this.peerLinkStorage.peerLinks.update({
+      ...peerLinkRecord,
+      state: "rejected",
+      activeSessionId: null,
+      lastStateChangeAtMs: nowMs,
+      lastErrorCode: reason,
+      lastErrorMessage: "handshake rejected by inviter",
+    }, peerLinkRecord.version);
+
+    const eventRecord = await this._appendPeerLinkEvent({
+      ownerAccountId: owner,
+      peerLinkId: rejectedRecord.peerLinkId,
+      type: "handshake_rejected",
+      summary: "Handshake rejected by inviter — peer link rolled back",
+      details: {
+        peerAccountId: remote,
+        reason,
+      },
+      atMs: nowMs,
+    });
+
+    return {
+      snapshot: await this._buildSnapshot(rejectedRecord),
+      event: eventRecord,
+      reason,
     };
   }
 

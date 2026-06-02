@@ -2,6 +2,7 @@ import { SDK_EVENTS } from "../events/SdkEvents.js";
 import { REZ_CONTRACT_TYPES } from "@rezprotocol/core";
 import { MetricsCollector } from "../observability/MetricsCollector.js";
 import { MailboxCapability } from "../capabilities/MailboxCapability.js";
+import { DurableRecordsCapability } from "../capabilities/DurableRecordsCapability.js";
 import { NodeCapability } from "../capabilities/NodeCapability.js";
 import { SubscriptionCapability } from "../capabilities/SubscriptionCapability.js";
 import { ConnectivityCapability } from "../capabilities/ConnectivityCapability.js";
@@ -33,6 +34,7 @@ export class RezClient {
 
   // Capabilities
   #mailbox;
+  #durableRecords;
   #node;
   #subscriptions;
   #connectivity;
@@ -78,6 +80,7 @@ export class RezClient {
     // Initialize capabilities
     this.#meshHandlers = new Set();
     this.#mailbox = new MailboxCapability({ pool });
+    this.#durableRecords = new DurableRecordsCapability({ pool });
     this.#node = new NodeCapability({ pool });
     this.#subscriptions = new SubscriptionCapability({ pool, eventBus });
     this.#connectivity = new ConnectivityCapability({ pool, eventBus });
@@ -448,6 +451,10 @@ export class RezClient {
 
   get mailbox() {
     return this.#mailbox;
+  }
+
+  get durableRecords() {
+    return this.#durableRecords;
   }
 
   get node() {

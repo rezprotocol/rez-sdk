@@ -41,6 +41,7 @@ export { MetricsCollector } from "../observability/MetricsCollector.js";
 
 // Invite codes (browser-safe, no rez-node dependency)
 export { isInviteCodeV2, parseInviteCodeV2, encodeInviteCodeV2 } from "../util/inviteCodeV2.js";
+export { isInviteCodeV3, parseInviteCodeV3, encodeInviteCodeV3, PEERLINK_INVITE_RECORD_KIND } from "../util/inviteCodeV3.js";
 
 // --- Existing exports (backward-compat) ---
 export { createDefaultCodecChain } from "../defaults/createDefaultCodecChain.js";
@@ -64,6 +65,7 @@ export {
   BrowserCryptoProvider,
   E2eeDeliveryAckV1,
   E2eeHandshakeAckV1,
+  E2eeHandshakeRejectV1,
   E2eeRehandshakeRequestV1,
 } from "../e2ee/index.js";
 export { REZ_CONTRACT_TYPES } from "../contracts/index.js";

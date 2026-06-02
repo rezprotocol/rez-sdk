@@ -5,6 +5,7 @@ export {
   X3DHKeyExchange,
   E2eeDeliveryAckV1,
   E2eeHandshakeAckV1,
+  E2eeHandshakeRejectV1,
   E2eeRehandshakeRequestV1,
 } from "@rezprotocol/core";
 export { BrowserCryptoProvider } from "./BrowserCryptoProvider.js";
