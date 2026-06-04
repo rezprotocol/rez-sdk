@@ -9,8 +9,8 @@ import { MetricsCollector } from "../src/observability/MetricsCollector.js";
 // sealForPeer is the "build the object" step: it encrypts + resolves the peer's
 // inbox into a protocol address + attaches the post-cap, and NEVER touches a
 // transport. These tests pin that contract so chat services can rely on the
-// returned { ciphertextBytes, inboxAddress, capChain, metadata } and hand it
-// straight to mesh.dispatch.
+// returned { object: { payloadBytes, metadata, capChain }, address } and hand it
+// straight to mesh.dispatch(object, address).
 
 const STUB_IDENTITY = {
   accountId: "rez:acct:test",
@@ -133,6 +133,60 @@ test("sealForPeer throws NO_DELIVERY_TARGET when no inbox can be resolved", asyn
       plaintextBodyBytes: new Uint8Array([1]),
     }),
     (err) => err && err.code === "NO_DELIVERY_TARGET",
+  );
+  assert.equal(pool.sent.length, 0);
+});
+
+// --- Shape A security invariants (re-homed from the deleted
+// sendEncryptedDeposit test; these must never regress) ---
+
+test("seals to ciphertext — the plaintext never appears in the sealed object", async () => {
+  const pool = makeFakePool();
+  const plaintext = new Uint8Array([72, 101, 108, 108, 111]); // "Hello"
+  const ciphertext = new Uint8Array([0xCC, 0xCC, 0xCC, 0xCC]);
+  const peerLinkService = {
+    encryptDirectMessage: async () => ({ encryptedPacket: { toBytes: () => ciphertext } }),
+  };
+  const client = makeClient({ pool, peerLinkService });
+
+  const sealed = await client.sealForPeer({
+    peerAccountId: "rez:acct:peer",
+    plaintextBodyBytes: plaintext,
+    deliverInboxId: "inbox:peer",
+  });
+
+  // The object carries the peer-link's ciphertext, NOT the plaintext.
+  assert.deepEqual([...sealed.object.payloadBytes], [...ciphertext]);
+  // Plaintext must not be recoverable anywhere in the sealed object — not as
+  // bytes, not as text, not as base64. This is the Shape A invariant: the node
+  // never sees plaintext.
+  const serialized = JSON.stringify(sealed.object, (_k, v) =>
+    v instanceof Uint8Array ? [...v] : v);
+  assert.equal(serialized.includes("Hello"), false);
+  assert.equal(serialized.includes(Buffer.from(plaintext).toString("base64")), false);
+  for (const b of plaintext) {
+    assert.equal(sealed.object.payloadBytes.includes(b), false,
+      "plaintext byte " + b + " leaked into the sealed payload");
+  }
+});
+
+test("propagates an encryption failure — fails closed, never produces an object", async () => {
+  const pool = makeFakePool();
+  const peerLinkService = {
+    ownerAccountId: "rez:acct:owner",
+    peerLinkStorage: { peerLinks: { getByPair: async () => ({ peerInboxId: "inbox:peer" }) } },
+    encryptDirectMessage: async () => { throw new Error("crypto bork"); },
+  };
+  const client = makeClient({ pool, peerLinkService });
+
+  // A crypto failure must surface — never a silent fallback that could send
+  // the message unencrypted or drop it without the caller knowing.
+  await assert.rejects(
+    () => client.sealForPeer({
+      peerAccountId: "rez:acct:peer",
+      plaintextBodyBytes: new Uint8Array([1]),
+    }),
+    /crypto bork/,
   );
   assert.equal(pool.sent.length, 0);
 });

@@ -16,12 +16,17 @@ const T = REZ_CONTRACT_TYPES;
  *   - rendezvous: publish the object's signed record on the durable overlay so
  *                 any holder of the coordinate can pull it, publisher offline.
  *
- * Transitional note (Phase 1 of transport unification): `object` is still
- * kind-specific because signing/encryption have not yet moved into routing.
- * Phases 3-4 collapse it to opaque payload bytes once the generic
- * self-authenticating value envelope and its validation gate land. Until then
- * dispatch delegates to the existing mailbox / durable-record capabilities so
- * the wire op stays single-sourced.
+ * The `object` is intentionally kind-specific — and stays that way. inbox and
+ * rendezvous are NOT two encodings of one thing waiting to be unified; they are
+ * the irreducible content-vs-location split: inbox pushes opaque ciphertext to
+ * a registered claimant queue (a location), while rendezvous publishes a
+ * self-authenticating signed record at a content coordinate any holder can pull
+ * (publisher offline). The self-authenticating value + its validation gate
+ * already exist in rez-node (durableRecordV1 + verifyDurableRecord); there is no
+ * "collapse to opaque bytes" pending, because the two semantics genuinely
+ * differ. dispatch delegates to the existing mailbox / durable-record
+ * capabilities so the wire op stays single-sourced; it never inspects payload
+ * meaning, only routes by address kind.
  *
  * Also retains `getMeshStatus()` (mesh-status query) — unchanged.
  */
