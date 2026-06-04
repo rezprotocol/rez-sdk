@@ -1,5 +1,5 @@
 import { SDK_EVENTS } from "../events/SdkEvents.js";
-import { REZ_CONTRACT_TYPES } from "@rezprotocol/core";
+import { REZ_CONTRACT_TYPES, buildInboxAddress } from "@rezprotocol/core";
 import { MetricsCollector } from "../observability/MetricsCollector.js";
 import { MailboxCapability } from "../capabilities/MailboxCapability.js";
 import { DurableRecordsCapability } from "../capabilities/DurableRecordsCapability.js";
@@ -7,6 +7,7 @@ import { NodeCapability } from "../capabilities/NodeCapability.js";
 import { SubscriptionCapability } from "../capabilities/SubscriptionCapability.js";
 import { ConnectivityCapability } from "../capabilities/ConnectivityCapability.js";
 import { IdentityCapability } from "../capabilities/IdentityCapability.js";
+import { MeshCapability } from "../capabilities/MeshCapability.js";
 import { bytesToBase64, base64ToBytes } from "../util/bytes.js";
 import { buildRezClientRuntime } from "./buildRezClientRuntime.js";
 import { RezPayloadSendParams } from "./RezPayloadSendParams.js";
@@ -39,6 +40,7 @@ export class RezClient {
   #subscriptions;
   #connectivity;
   #identityCap;
+  #mesh;
   // Local PeerLinkService instance (Shape A). When set, the SDK encrypts
   // outbound messages locally and sends them as plain MAILBOX_DEPOSIT, so the
   // node never sees plaintext. Constructed by the caller (e.g. chat-server)
@@ -85,6 +87,9 @@ export class RezClient {
     this.#subscriptions = new SubscriptionCapability({ pool, eventBus });
     this.#connectivity = new ConnectivityCapability({ pool, eventBus });
     this.#identityCap = new IdentityCapability({ pool, eventBus, identity });
+    // The one mesh-dispatch verb. Delegates to mailbox / durableRecords so the
+    // wire op stays single-sourced; apps call rez.mesh.dispatch(object, address).
+    this.#mesh = new MeshCapability({ pool, mailbox: this.#mailbox, durableRecords: this.#durableRecords });
   }
 
   #resolveRuntime(options) {
@@ -303,27 +308,31 @@ export class RezClient {
   }
 
   /**
-   * Encrypted-deposit (Shape A): the SDK encrypts locally via the injected
-   * peerLinkService and issues a plain MAILBOX_DEPOSIT carrying ciphertext.
-   * The node never sees plaintext.
+   * Seal a plaintext body for a peer (Shape A — the "build the object" step).
+   *
+   * This is an identity/relationship concern: it encrypts locally via the
+   * injected peerLinkService, resolves the peer's current inbox into a protocol
+   * `inbox(inboxId)` address, and attaches the inviter-signed post-cap (if any).
+   * It NEVER touches a transport — it returns a ready-to-dispatch mesh object
+   * plus its protocol address, which the caller hands straight to
+   * `rez.mesh.dispatch(sealed.object, sealed.address)`. The dispatch-object
+   * shape is single-sourced HERE so no creator re-assembles it. Routing owns
+   * mechanism selection; the creator only seals and dispatches.
+   *
+   * @returns {Promise<{ object: { payloadBytes: Uint8Array, metadata: object, capChain: array|null }, address: object }>}
    */
-  async sendEncryptedDeposit({ peerAccountId, plaintextBodyBytes, deliverInboxId, receiptInboxId } = {}) {
+  async sealForPeer({ peerAccountId, plaintextBodyBytes, deliverInboxId, receiptInboxId } = {}) {
     if (!(plaintextBodyBytes instanceof Uint8Array)) {
-      throw new Error("sendEncryptedDeposit requires Uint8Array plaintextBodyBytes");
+      throw new Error("sealForPeer requires Uint8Array plaintextBodyBytes");
     }
     const remote = typeof peerAccountId === "string" ? peerAccountId.trim() : "";
     if (!remote) {
-      throw new Error("sendEncryptedDeposit requires peerAccountId");
+      throw new Error("sealForPeer requires peerAccountId");
     }
     const peerLinkService = this.#peerLinkService;
     if (!peerLinkService || typeof peerLinkService.encryptDirectMessage !== "function") {
-      throw new Error("sendEncryptedDeposit requires a peerLinkService — pass one to createRezClient");
+      throw new Error("sealForPeer requires a peerLinkService — pass one to createRezClient");
     }
-    return this.#sendLocalEncrypted({ peerAccountId: remote, plaintextBodyBytes, deliverInboxId, receiptInboxId });
-  }
-
-  async #sendLocalEncrypted({ peerAccountId, plaintextBodyBytes, deliverInboxId, receiptInboxId }) {
-    const peerLinkService = this.#peerLinkService;
 
     let resolvedDeliverInboxId = typeof deliverInboxId === "string" ? deliverInboxId.trim() : "";
     let peerLinkRecord = null;
@@ -331,36 +340,35 @@ export class RezClient {
       const storage = peerLinkService.peerLinkStorage;
       const ownerAccountId = peerLinkService.ownerAccountId;
       if (!storage || !ownerAccountId) {
-        const err = new Error("sendEncryptedDeposit: cannot resolve deliverInboxId — peerLinkService missing storage or ownerAccountId");
+        const err = new Error("sealForPeer: cannot resolve deliverInboxId — peerLinkService missing storage or ownerAccountId");
         err.code = "NO_DELIVERY_TARGET";
         throw err;
       }
-      peerLinkRecord = await storage.peerLinks.getByPair(ownerAccountId, peerAccountId);
+      peerLinkRecord = await storage.peerLinks.getByPair(ownerAccountId, remote);
       if (!peerLinkRecord || typeof peerLinkRecord.peerInboxId !== "string" || !peerLinkRecord.peerInboxId.trim()) {
-        const err = new Error("sendEncryptedDeposit: no peer-link target inbox for " + peerAccountId);
+        const err = new Error("sealForPeer: no peer-link target inbox for " + remote);
         err.code = "NO_DELIVERY_TARGET";
         throw err;
       }
       resolvedDeliverInboxId = peerLinkRecord.peerInboxId.trim();
     } else if (peerLinkService.peerLinkStorage && peerLinkService.ownerAccountId) {
       peerLinkRecord = await peerLinkService.peerLinkStorage.peerLinks.getByPair(
-        peerLinkService.ownerAccountId, peerAccountId,
+        peerLinkService.ownerAccountId, remote,
       );
     }
 
     const encResult = await peerLinkService.encryptDirectMessage({
-      peerAccountId,
+      peerAccountId: remote,
       plaintextBytes: plaintextBodyBytes,
     });
     if (!encResult || !encResult.encryptedPacket) {
-      throw new Error("sendEncryptedDeposit: peerLinkService.encryptDirectMessage returned no packet");
+      throw new Error("sealForPeer: peerLinkService.encryptDirectMessage returned no packet");
     }
     const ciphertextBytes = encResult.encryptedPacket.toBytes();
-    const ciphertextB64 = bytesToBase64(ciphertextBytes);
 
     // Look up the inviter-signed bearer post-cap for this peer-link, if one
-    // was attached at invite time. Without a cap, the deposit relies on the
-    // recipient's relay to accept anonymous deposits (subject to its pubkey
+    // was attached at invite time. Without a cap, delivery relies on the
+    // recipient's relay accepting anonymous deposits (subject to its pubkey
     // blocklist).
     let capChain = null;
     if (peerLinkRecord && peerLinkRecord.peerLinkId && typeof peerLinkService.getPostCapForPeerLink === "function") {
@@ -368,34 +376,18 @@ export class RezClient {
       if (cap) capChain = [cap];
     }
 
-    const objectId = "msg_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
-    const depositBody = {
-      mailboxId: resolvedDeliverInboxId,
-      objectId,
-      ciphertextB64,
-      metadata: {},
-    };
-    if (Array.isArray(capChain) && capChain.length > 0) {
-      depositBody.capChain = capChain;
-    }
+    const metadata = {};
     if (typeof receiptInboxId === "string" && receiptInboxId.trim().length > 0) {
-      depositBody.metadata.receiptInboxId = receiptInboxId.trim();
+      metadata.receiptInboxId = receiptInboxId.trim();
     }
-    const response = await this.#pool.sendRequest({
-      type: T.MAILBOX_DEPOSIT,
-      body: depositBody,
-      expectedResponseType: T.MAILBOX_DEPOSIT_RES,
-    });
-    const body = response && typeof response.body === "object" ? response.body : {};
-    // queued=true means the node couldn't synchronously route to the
-    // destination's relay but persisted the deposit into
-    // PersistentOutboundQueue; RetryScheduler will deliver in the
-    // background. Callers should treat this as a successful send with
-    // pending delivery (not a failure).
+
     return {
-      mailboxId: typeof body.mailboxId === "string" ? body.mailboxId : resolvedDeliverInboxId,
-      eventId: typeof body.eventId === "string" ? body.eventId : "",
-      queued: body.queued === true,
+      object: {
+        payloadBytes: ciphertextBytes,
+        metadata,
+        capChain: Array.isArray(capChain) && capChain.length > 0 ? capChain : null,
+      },
+      address: buildInboxAddress({ inboxId: resolvedDeliverInboxId }),
     };
   }
 
@@ -471,5 +463,9 @@ export class RezClient {
 
   get identity() {
     return this.#identityCap;
+  }
+
+  get mesh() {
+    return this.#mesh;
   }
 }
