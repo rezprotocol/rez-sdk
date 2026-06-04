@@ -69,6 +69,13 @@ export {
   E2eeRehandshakeRequestV1,
 } from "../e2ee/index.js";
 export { REZ_CONTRACT_TYPES } from "../contracts/index.js";
+export {
+  MESH_ADDRESS_KINDS,
+  buildInboxAddress,
+  buildRendezvousAddress,
+  isMeshAddress,
+  assertValidMeshAddress,
+} from "../contracts/index.js";
 export { RCapability, CapabilitySigner, CapabilityValidator } from "../capabilities/index.js";
 export { canonicalJSONStringify } from "../util/canonical.js";
 export { UplinkPoolClient } from "./UplinkPoolClient.js";
