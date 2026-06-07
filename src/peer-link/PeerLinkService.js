@@ -754,11 +754,16 @@ export class PeerLinkService {
       throw new Error("decryptDirectMessageAnyPeer requires non-empty packetBytes");
     }
     const rows = await this.peerLinkStorage.peerLinks.listByOwner(owner);
+    const trace = process.env.REZ_PEERLINK_TRACE === "1";
+    const tried = [];
 
     for (const row of rows) {
       if (!row || !row.peerAccountId) continue;
       const sessionRecord = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, row.peerLinkId);
-      if (!sessionRecord || typeof sessionRecord !== "object") continue;
+      if (!sessionRecord || typeof sessionRecord !== "object") {
+        if (trace) tried.push(row.peerAccountId + ":no-session");
+        continue;
+      }
       const sessionStatus = nonEmpty(sessionRecord.status) || "pending";
       const canDecrypt = (
         sessionStatus === "active"
@@ -766,14 +771,20 @@ export class PeerLinkService {
         || sessionStatus === "ready"
         || sessionStatus === "established"
       );
-      if (!canDecrypt) continue;
+      if (!canDecrypt) {
+        if (trace) tried.push(row.peerAccountId + ":status=" + sessionStatus);
+        continue;
+      }
 
       const secureChannelManager = this._createSecureChannelManager(sessionRecord.ratchetSnapshot);
       const codec = new E2eePacketCodec({ secureChannelManager });
       const result = await codec.decryptIncoming({ packetBytes });
 
       // Wrong session — SID mismatch returns peerId null, no state mutation
-      if (!result.encrypted || !result.peerId) continue;
+      if (!result.encrypted || !result.peerId) {
+        if (trace) tried.push(row.peerAccountId + ":no-match(enc=" + (result.encrypted ? 1 : 0) + ",pid=" + (result.peerId ? 1 : 0) + ")");
+        continue;
+      }
 
       // Successful trial decrypt — persist ratchet and update peer link state
       const successKey = owner + ":" + row.peerAccountId;
@@ -822,6 +833,10 @@ export class PeerLinkService {
       };
     }
 
+    if (trace) {
+      // eslint-disable-next-line no-console
+      console.log("[PLTRACE] decryptAnyPeer owner=" + owner + " NO MATCH; links tried=[" + tried.join(", ") + "] (rows=" + rows.length + ")");
+    }
     const err = new Error("No peer link could decrypt packet");
     err.code = "THREAD_NOT_READY";
     throw err;
