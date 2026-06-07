@@ -80,7 +80,7 @@ export class UplinkPool {
     if (!authMachine) throw new Error("UplinkPool requires authMachine");
     if (!eventBus) throw new Error("UplinkPool requires eventBus");
 
-    this.#uplinks = uplinks.map((u) => String(typeof u === "string" ? u : u?.url || "").trim()).filter(Boolean);
+    this.#uplinks = uplinks.map((u) => String(typeof u === "string" ? u : u && u.url || "").trim()).filter(Boolean);
     this.#transportFactory = transportFactory;
     this.#authMachine = authMachine;
     this.#eventBus = eventBus;
@@ -115,9 +115,9 @@ export class UplinkPool {
     }
 
     if (!this.#ready || !this.#activeUrl) {
-      this.#emitState({ phase: "offline", reason: firstErr?.message || "no uplinks available" });
+      this.#emitState({ phase: "offline", reason: firstErr && firstErr.message || "no uplinks available" });
       this.#scheduleReconnect();
-      throw errObj({ code: "UNREACHABLE", message: firstErr?.message || "no uplinks available", retryable: true });
+      throw errObj({ code: "UNREACHABLE", message: firstErr && firstErr.message || "no uplinks available", retryable: true });
     }
     await this.#ensureWarmSpareTarget();
   }
@@ -139,8 +139,8 @@ export class UplinkPool {
       return {
         url,
         active: url === this.#activeUrl,
-        ready: state?.ready === true,
-        healthy: state?.healthy === true,
+        ready: (state && state.ready) === true,
+        healthy: (state && state.healthy) === true,
       };
     });
   }
@@ -193,7 +193,7 @@ export class UplinkPool {
         throw errObj({ code: "NOT_READY", message: "uplink pool not ready", retryable: true });
       }
       const active = this.#conns.get(this.#activeUrl);
-      if (!active?.ready) {
+      if (!(active && active.ready)) {
         throw errObj({ code: "UNREACHABLE", message: "no ready uplink", retryable: true });
       }
       return active.transport.sendRequest({ type: frameType, body, expectedResponseType, timeoutMs });
@@ -216,7 +216,7 @@ export class UplinkPool {
       }
 
       const state = this.#conns.get(url);
-      if (!state?.ready) continue;
+      if (!(state && state.ready)) continue;
       try {
         const frame = await state.transport.sendRequest({ type: frameType, body, expectedResponseType, timeoutMs });
         if (adoptSuccessfulUplink && url !== this.#activeUrl) {
@@ -227,7 +227,7 @@ export class UplinkPool {
         return frame;
       } catch (err) {
         lastErr = err;
-        const code = String(err?.code || "").trim();
+        const code = String(err && err.code || "").trim();
         if (!allowedCodes.has(code)) throw err;
       }
     }
@@ -242,9 +242,9 @@ export class UplinkPool {
 
   async #ensureConnected(url) {
     const existing = this.#conns.get(url);
-    if (existing?.ready) return existing;
+    if (existing && existing.ready) return existing;
 
-    const transport = existing?.transport || this.#transportFactory(url);
+    const transport = existing && existing.transport || this.#transportFactory(url);
     if (!existing) {
       const offFrame = transport.onFrame((frame) => {
         this.#onInboundFrame(url, frame).catch(() => {});
@@ -276,8 +276,8 @@ export class UplinkPool {
     this.#largeWarnLastMeta = null;
     for (const [, state] of entries) {
       try {
-        state.offFrame?.();
-        state.offState?.();
+        if (state.offFrame) state.offFrame();
+        if (state.offState) state.offState();
         await state.transport.close();
       } catch {
         // ignore close failures
@@ -307,10 +307,10 @@ export class UplinkPool {
   }
 
   async #onConnState(url, state) {
-    if (state?.phase === "warn") {
-      this.#emit("warn", { code: "FRAME_WARN", uplink: url, reason: state?.reason || "warn" });
+    if (state && state.phase === "warn") {
+      this.#emit("warn", { code: "FRAME_WARN", uplink: url, reason: state && state.reason || "warn" });
     }
-    if (state?.phase === "disconnected" || state?.phase === "error") {
+    if (state && state.phase === "disconnected" || state && state.phase === "error") {
       this.#mark(url, { ready: false, healthy: false });
       if (url === this.#activeUrl) {
         const promoted = await this.#promoteNextConnectedSpare("active_disconnect");
@@ -318,7 +318,7 @@ export class UplinkPool {
           this.#ready = false;
           this.#activeUrl = null;
           this.#sessionInfo = null;
-          this.#emitState({ phase: "offline", activeUplink: url, reason: state?.reason || null });
+          this.#emitState({ phase: "offline", activeUplink: url, reason: state && state.reason || null });
           this.#scheduleReconnect();
         }
       } else {
@@ -407,7 +407,7 @@ export class UplinkPool {
       const connectedSpares = () => this.#uplinks.filter((url) => {
         if (url === this.#activeUrl) return false;
         const st = this.#conns.get(url);
-        return !!(st?.ready && st?.healthy);
+        return !!(st && st.ready && st && st.healthy);
       }).length;
 
       if (connectedSpares() >= target) return;
@@ -415,7 +415,7 @@ export class UplinkPool {
         if (url === this.#activeUrl) continue;
         if (connectedSpares() >= target) break;
         const st = this.#conns.get(url);
-        if (st?.ready && st?.healthy) continue;
+        if (st && st.ready && st && st.healthy) continue;
         try { await this.#ensureConnected(url); } catch { this.#mark(url, { ready: false, healthy: false }); }
       }
     })();
@@ -434,7 +434,7 @@ export class UplinkPool {
     for (const url of this.#uplinks) {
       if (url === this.#activeUrl) continue;
       const st = this.#conns.get(url);
-      if (st?.ready && st?.healthy) return url;
+      if (st && st.ready && st && st.healthy) return url;
     }
     return null;
   }
@@ -479,11 +479,11 @@ export class UplinkPool {
 // --- Dedupe helpers ---
 
 async function dedupeDecision(frame) {
-  const body = frame?.body && typeof frame.body === "object" ? frame.body : {};
-  const serverMsgId = firstNonEmptyString(body.serverMsgId, body?.message?.serverMsgId, body?.message?.id);
+  const body = frame && frame.body && typeof frame.body === "object" ? frame.body : {};
+  const serverMsgId = firstNonEmptyString(body.serverMsgId, body && body.message && body.message.serverMsgId, body && body.message && body.message.id);
   if (serverMsgId) return { key: `s:${serverMsgId}`, dropLargeUnidentifiable: false };
 
-  const packetId = firstNonEmptyString(body.packetId, body?.message?.packetId);
+  const packetId = firstNonEmptyString(body.packetId, body && body.message && body.message.packetId);
   if (packetId) return { key: `p:${packetId}`, dropLargeUnidentifiable: false };
 
   const b64 = extractBase64Payload(body);
@@ -510,7 +510,7 @@ function firstNonEmptyString(...values) {
 }
 
 function extractBase64Payload(body) {
-  const candidates = [body?.payload?.ciphertextB64, body?.payload?.packetB64, body?.packetB64, body?.message?.packetB64];
+  const candidates = [body && body.payload && body.payload.ciphertextB64, body && body.payload && body.payload.packetB64, body && body.packetB64, body && body.message && body.message.packetB64];
   for (const c of candidates) {
     if (typeof c === "string" && c.length > 0) return c;
   }
@@ -530,7 +530,7 @@ function estimateBase64Bytes(value) {
 }
 
 async function sha256Hex(bytes) {
-  if (globalThis.crypto?.subtle) {
+  if (globalThis.crypto && globalThis.crypto.subtle) {
     const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
     return toHex(new Uint8Array(digest));
   }

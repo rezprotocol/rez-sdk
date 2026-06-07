@@ -50,10 +50,10 @@ export class ConnectionStateMachine {
       // CONNECTING
       this.#transition(CONNECTION_STATES.CONNECTING);
       await this.#transport.close().catch(() => {});
-      this.#offTransportState?.();
+      if (this.#offTransportState) this.#offTransportState();
       this.#offTransportState = this.#transport.onState((state) => {
-        if (state?.phase === "disconnected" || state?.phase === "error") {
-          this.#onTransportDisconnect(state?.reason || "transport disconnected");
+        if ((state && state.phase === "disconnected") || (state && state.phase === "error")) {
+          this.#onTransportDisconnect((state && state.reason) || "transport disconnected");
         }
       });
 
@@ -68,7 +68,7 @@ export class ConnectionStateMachine {
       this.#transition(CONNECTION_STATES.CONNECTED);
     } catch (err) {
       if (this.#closed) return;
-      this.#transition(CONNECTION_STATES.FAILED, { error: err?.message });
+      this.#transition(CONNECTION_STATES.FAILED, { error: err && err.message });
       throw err;
     }
   }
@@ -77,7 +77,7 @@ export class ConnectionStateMachine {
     this.#closed = true;
     this.#stopReconnectTimer();
     this.#reconnectAttempts = 0;
-    this.#offTransportState?.();
+    if (this.#offTransportState) this.#offTransportState();
     this.#offTransportState = null;
     await this.#transport.close().catch(() => {});
     this.#authMachine.reset();

@@ -91,16 +91,16 @@ export class WsTransport extends Transport {
       };
       const onErr = (evt) => {
         cleanup();
-        reject(asError("CONNECT_FAILED", evt?.message || "connect failed", true));
+        reject(asError("CONNECT_FAILED", evt && evt.message || "connect failed", true));
       };
       ws.addEventListener("open", onOpen);
       ws.addEventListener("error", onErr);
     });
 
-    ws.addEventListener("message", (evt) => this.#onRawFrame(evt?.data));
+    ws.addEventListener("message", (evt) => this.#onRawFrame(evt ? evt.data : undefined));
     ws.addEventListener("close", (evt) => this.#onClosed(evt));
     ws.addEventListener("error", (evt) => {
-      this.#emitState({ phase: "error", url: this.#wsUrl, reason: evt?.message || "socket error" });
+      this.#emitState({ phase: "error", url: this.#wsUrl, reason: evt && evt.message || "socket error" });
     });
 
     this.#startHeartbeat();
@@ -174,7 +174,7 @@ export class WsTransport extends Transport {
       } catch (err) {
         clearTimeout(timer);
         this.#pending.delete(id);
-        reject(asError("SEND_FAILED", err?.message || "send failed", true));
+        reject(asError("SEND_FAILED", err && err.message || "send failed", true));
       }
     });
   }
@@ -236,13 +236,13 @@ export class WsTransport extends Transport {
 
   #onClosed(evt) {
     this.#stopHeartbeat();
-    const err = asError("DISCONNECTED", evt?.reason || "socket closed", true);
+    const err = asError("DISCONNECTED", evt && evt.reason || "socket closed", true);
     for (const [, entry] of this.#pending) {
       clearTimeout(entry.timer);
       entry.reject(err);
     }
     this.#pending.clear();
-    this.#emitState({ phase: "disconnected", url: this.#wsUrl, reason: evt?.reason || null });
+    this.#emitState({ phase: "disconnected", url: this.#wsUrl, reason: evt && evt.reason || null });
   }
 
   #onRawFrame(rawData) {
@@ -318,10 +318,10 @@ export class WsTransport extends Transport {
 
     // Unsolicited frame — emit to frame listeners
     const framePayload = {
-      id: typeof frame?.id === "string" ? frame.id : null,
-      t: String(frame?.type || ""),
-      v: frame?.version,
-      body: frame?.body && typeof frame.body === "object" ? frame.body : {},
+      id: typeof (frame && frame.id) === "string" ? frame.id : null,
+      t: String(frame && frame.type || ""),
+      v: frame ? frame.version : undefined,
+      body: frame && frame.body && typeof frame.body === "object" ? frame.body : {},
     };
     for (const listener of [...this.#frameListeners]) {
       try {

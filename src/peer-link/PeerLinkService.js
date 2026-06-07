@@ -1547,7 +1547,18 @@ export class PeerLinkService {
               lastErrorCode: errorCode,
               lastErrorMessage: errorMessage,
             }, handshakeAttempt.version);
-          } catch { /* best effort — attempt record may also have version conflict */ }
+          } catch (attemptUpdateErr) {
+            // Attempt-record update is best-effort (it may also hit a version
+            // conflict), but we never swallow silently: surface it so a broken
+            // diagnostic trail is visible while still degrading the peer link.
+            console.warn(
+              "[PeerLinkService] handshake-attempt failure update conflicted for "
+                + peerLinkId + ": "
+                + (attemptUpdateErr && attemptUpdateErr.message
+                  ? attemptUpdateErr.message
+                  : String(attemptUpdateErr))
+            );
+          }
           this.#checkPeerLinkTransition(currentForErr.state, PEER_LINK_STATE.DEGRADED, currentForErr.peerLinkId);
           peerLinkRecord = await this.peerLinkStorage.peerLinks.update({
             ...currentForErr,
@@ -1760,7 +1771,12 @@ export class PeerLinkService {
       sessionStatus: SESSION_STATUS.ACTIVE,
       peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
       existingSession,
-      peerInboxId: remoteInboxId || peerLinkRecord.peerInboxId,
+      // Write-once routing: keep an already-recorded peer inbox rather than
+      // letting a handshake-declared senderInboxId overwrite it (the ack path
+      // applies the same no-hijack guard). A genuine inbox change is delivered
+      // through the explicit rehandshake flow, not a stray handshake packet.
+      // For a freshly-created link peerInboxId already equals remoteInboxId.
+      peerInboxId: nonEmpty(peerLinkRecord.peerInboxId) || remoteInboxId,
       eventType: "handshake_received",
       eventSummary: "Handshake received and session established",
       eventDetails: { inviteId },

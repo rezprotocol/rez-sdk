@@ -58,7 +58,7 @@ export class X3DHKeyExchange {
    * @returns {{ handshakeData: object, sid: Uint8Array }}
    */
   async processAcceptedInvite({ inviteBinding, peerId } = {}) {
-    if (!inviteBinding?.x3dh) {
+    if (!(inviteBinding && inviteBinding.x3dh)) {
       throw new Error("processAcceptedInvite requires inviteBinding with x3dh field");
     }
     if (!peerId || typeof peerId !== "string") {

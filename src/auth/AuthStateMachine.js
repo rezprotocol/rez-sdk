@@ -106,7 +106,7 @@ export class AuthStateMachine {
       });
 
       // Step 2: Expect session.challenge
-      const responseType = String(helloResponse?.t || "");
+      const responseType = String((helloResponse && helloResponse.t) || "");
       if (responseType !== SESSION_CHALLENGE_TYPE) {
         throw new AuthFailure(`unexpected response type: ${responseType || "unknown"}`);
       }
@@ -208,7 +208,7 @@ export class AuthStateMachine {
       });
 
       // Step 5: Store session info
-      const readyType = String(readyResponse?.t || "");
+      const readyType = String((readyResponse && readyResponse.t) || "");
       if (this.#sessionHello.responseType && readyType !== this.#sessionHello.responseType) {
         throw new AuthFailure(`unexpected ready type: ${readyType || "unknown"}`);
       }
@@ -233,8 +233,8 @@ export class AuthStateMachine {
 
       return this.#sessionInfo;
     } catch (err) {
-      this.#transition(AUTH_STATES.FAILED, { error: err?.message });
-      throw err instanceof AuthFailure ? err : new AuthFailure(err?.message || "auth failed", { cause: err });
+      this.#transition(AUTH_STATES.FAILED, { error: err && err.message });
+      throw err instanceof AuthFailure ? err : new AuthFailure((err && err.message) || "auth failed", { cause: err });
     }
   }
 

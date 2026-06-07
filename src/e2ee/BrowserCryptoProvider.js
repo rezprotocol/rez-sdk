@@ -13,7 +13,7 @@ export class BrowserCryptoProvider extends RCryptoProvider {
   constructor({ subtle = null, getRandomValues = null } = {}) {
     super();
     const cryptoObj = globalThis.crypto;
-    this.#subtle = subtle || cryptoObj?.subtle;
+    this.#subtle = subtle || (cryptoObj && cryptoObj.subtle);
     this.#getRandomValues = getRandomValues || (cryptoObj ? (buf) => cryptoObj.getRandomValues(buf) : null);
 
     if (!this.#subtle || typeof this.#subtle.generateKey !== "function") {

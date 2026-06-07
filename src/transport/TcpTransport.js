@@ -105,7 +105,7 @@ export class TcpTransport extends Transport {
 
       const onErr = (err) => {
         cleanup();
-        reject(asError("CONNECT_FAILED", err?.message || "tcp connect failed", true));
+        reject(asError("CONNECT_FAILED", err && err.message || "tcp connect failed", true));
       };
 
       socket.once("error", onErr);
@@ -114,7 +114,7 @@ export class TcpTransport extends Transport {
     this.#socket.on("data", (chunk) => this.#onData(chunk));
     this.#socket.on("close", () => this.#onClosed({ reason: "socket closed" }));
     this.#socket.on("error", (err) => {
-      this.#emitState({ phase: "error", url: this.url, reason: err?.message || "socket error" });
+      this.#emitState({ phase: "error", url: this.url, reason: err && err.message || "socket error" });
     });
 
     this.#startKeepAlive();
@@ -190,7 +190,7 @@ export class TcpTransport extends Transport {
       } catch (err) {
         clearTimeout(timer);
         this.#pending.delete(id);
-        reject(asError("SEND_FAILED", err?.message || "send failed", true));
+        reject(asError("SEND_FAILED", err && err.message || "send failed", true));
       }
     });
   }
@@ -237,21 +237,21 @@ export class TcpTransport extends Transport {
     try {
       frame = this.#codec.decodeFrame(raw);
     } catch (err) {
-      this.#emitState({ phase: "warn", url: this.url, reason: err?.message || "bad frame" });
+      this.#emitState({ phase: "warn", url: this.url, reason: err && err.message || "bad frame" });
       return;
     }
 
     // Request-response correlation
-    if (typeof frame?.id === "string" && this.#pending.has(frame.id)) {
+    if (typeof (frame && frame.id) === "string" && this.#pending.has(frame.id)) {
       const pending = this.#pending.get(frame.id);
       this.#pending.delete(frame.id);
       clearTimeout(pending.timer);
 
       if (frame.type === "error") {
         pending.reject(asError(
-          String(frame.body?.code || "REMOTE_ERR"),
-          frame.body?.message || "remote error",
-          frame.body?.retryable === true,
+          String(frame.body && frame.body.code || "REMOTE_ERR"),
+          frame.body && frame.body.message || "remote error",
+          (frame.body && frame.body.retryable) === true,
         ));
         return;
       }
@@ -276,10 +276,10 @@ export class TcpTransport extends Transport {
 
     // Unsolicited frame
     const framePayload = {
-      id: typeof frame?.id === "string" ? frame.id : null,
-      t: String(frame?.type || ""),
-      v: frame?.version,
-      body: frame?.body && typeof frame.body === "object" ? frame.body : {},
+      id: typeof (frame && frame.id) === "string" ? frame.id : null,
+      t: String(frame && frame.type || ""),
+      v: frame ? frame.version : undefined,
+      body: frame && frame.body && typeof frame.body === "object" ? frame.body : {},
     };
     for (const listener of [...this.#frameListeners]) {
       try {
@@ -325,13 +325,13 @@ export class TcpTransport extends Transport {
   #onClosed(evt) {
     this.#stopKeepAlive();
     this.#connected = false;
-    const err = asError("DISCONNECTED", evt?.reason || "socket closed", true);
+    const err = asError("DISCONNECTED", evt && evt.reason || "socket closed", true);
     for (const [, entry] of this.#pending) {
       clearTimeout(entry.timer);
       entry.reject(err);
     }
     this.#pending.clear();
-    this.#emitState({ phase: "disconnected", url: this.url, reason: evt?.reason || null });
+    this.#emitState({ phase: "disconnected", url: this.url, reason: evt && evt.reason || null });
   }
 
   #emitState(payload) {

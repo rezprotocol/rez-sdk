@@ -25,7 +25,7 @@ export class TypedEventBus {
     }
     let off;
     const wrapper = (payload) => {
-      off?.();
+      if (off) off();
       handler(payload);
     };
     off = this.on(eventName, wrapper);

@@ -6,7 +6,7 @@ import { WsTransport } from "./WsTransport.js";
  * - tcp:// or tls:// -> TcpTransport (lazy-loaded, server-side only)
  */
 export async function createTransport(endpoint, options = {}) {
-  const url = typeof endpoint === "string" ? endpoint : String(endpoint?.url || "");
+  const url = typeof endpoint === "string" ? endpoint : String(endpoint && endpoint.url || "");
   if (!url) throw new Error("createTransport requires endpoint url");
 
   if (url.startsWith("ws://") || url.startsWith("wss://")) {
