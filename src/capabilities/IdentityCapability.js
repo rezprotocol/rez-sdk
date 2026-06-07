@@ -23,16 +23,16 @@ export class IdentityCapability {
   }
 
   getAccountId() {
-    return this.#identity?.accountId ?? null;
+    return this.#identity && this.#identity.accountId != null ? this.#identity.accountId : null;
   }
 
   getDeviceId() {
-    return this.#identity?.deviceId ?? null;
+    return this.#identity && this.#identity.deviceId != null ? this.#identity.deviceId : null;
   }
 
   getLocalInboxId() {
     const session = this.#pool.getSessionInfo();
-    return session?.localInboxId ?? null;
+    return session && session.localInboxId != null ? session.localInboxId : null;
   }
 
   onAuthStateChanged(handler) {
