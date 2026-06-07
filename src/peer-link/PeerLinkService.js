@@ -19,6 +19,12 @@ import {
   verifyHandshakeEnvelope,
 } from "@rezprotocol/core";
 import { canonicalPayloadBytesV1 } from "./inviteCodeV1.js";
+import {
+  PEER_LINK_STATE,
+  SESSION_STATUS,
+  isSessionUsable,
+  assertTransition,
+} from "./PeerLinkStateMachine.js";
 
 const PEER_LINK_INVITE_PREFIX = "app:peer-links:invites/";
 const PEER_LINK_INVITE_HASH_PREFIX = "app:peer-links:inviteHash/";
@@ -163,6 +169,16 @@ function _postCapKey(ownerAccountId, peerLinkId) {
 
 export class PeerLinkService {
   #decryptFailureCounts;
+  // Per-(owner:peer) count of any-peer trial-decrypt total misses. Unlike
+  // #decryptFailureCounts (per-peer, set by decryptDirectMessage), this tracks
+  // the recipient-side recovery signal for decryptDirectMessageAnyPeer, which
+  // cannot attribute a miss to one peer from the packet alone. Cleared on any
+  // successful establish/decrypt for the peer.
+  #anyPeerMissCounts;
+  // When true, an untabulated peer-link transition throws instead of being
+  // logged-and-allowed. Default false (observe-only) for this ship; flip once
+  // the transition table is proven against production telemetry.
+  #strictTransitions;
 
   constructor({
     storageProvider,
@@ -174,6 +190,7 @@ export class PeerLinkService {
     inviteBinding = null,
     cryptoProvider = null,
     inboxClaimantSigner = null,
+    strictTransitions = false,
   } = {}) {
     if (!storageProvider || typeof storageProvider.getPeerLinkStorage !== "function") {
       throw new Error("PeerLinkService requires storageProvider.getPeerLinkStorage()");
@@ -208,6 +225,8 @@ export class PeerLinkService {
     // envelope so the acceptor can deposit to the inviter's mailbox.
     this.inboxClaimantSigner = inboxClaimantSigner;
     this.#decryptFailureCounts = new Map();
+    this.#anyPeerMissCounts = new Map();
+    this.#strictTransitions = strictTransitions === true;
   }
 
   /**
@@ -283,6 +302,157 @@ export class PeerLinkService {
       manager.importSnapshot(snapshot);
     }
     return manager;
+  }
+
+  // Observe-only reporter for an illegal peer-link transition. Wired into
+  // #commitSession (and the bespoke acceptInvite/reject/rehandshake updates)
+  // via assertTransition so every state write is validated against the SSOT
+  // transition table without changing behavior. See PeerLinkStateMachine.
+  #logIllegalTransition(result, peerLinkId) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[PLTRACE] illegal peer-link transition "
+      + (result && result.from ? result.from : "<none>")
+      + " -> " + (result && result.to ? result.to : "<none>")
+      + " peerLinkId=" + (peerLinkId || "<unknown>"),
+    );
+  }
+
+  // Validate (and log-or-throw on) a peer-link state transition using the
+  // service's strict flag and the shared reporter. Returns the check result.
+  #checkPeerLinkTransition(fromState, toState, peerLinkId) {
+    return assertTransition(fromState, toState, {
+      onIllegal: (r) => this.#logIllegalTransition(r, peerLinkId),
+      strict: this.#strictTransitions,
+    });
+  }
+
+  // X3DH responder derivation — the body shared by handleIncomingHandshakePacket
+  // and handleRehandshakeResponse. Completes the invite handshake against our
+  // stored pre-key state and returns the secured channel manager (the caller
+  // persists it via #commitSession).
+  async #establishAsResponder({ ownerAccountId, preKeyState, handshakeData, peerId }) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const remote = requireId(peerId, "peerId");
+    const secureChannelManager = this._createSecureChannelManager();
+    const x3dh = new X3DHKeyExchange({ secureChannelManager });
+    const { identityDhKeyPair } = await this._requireBoundX3dhIdentity(owner);
+    await x3dh.completeInviteHandshake({
+      preKeyState,
+      identityDhPrivate: identityDhKeyPair.privateKey,
+      handshakeData,
+      peerId: remote,
+    });
+    return { secureChannelManager };
+  }
+
+  // The single peer-link/session state-writer. EVERY establishment path that
+  // moves a peer link toward (or confirms) a session routes its persistence
+  // through here so the lifecycle is written in exactly one place:
+  //   1. resolve session identity/version (reuse existingSession when given),
+  //   2. export the ratchet snapshot (or reuse the stored one for ack flips),
+  //   3. sessions.put,
+  //   4. validate + apply the peerLinks.update transition,
+  //   5. append the lifecycle event,
+  //   6. clear stale decrypt/recovery counters for the peer.
+  // The caller passes its live peerLinkRecord so the optimistic-lock `version`
+  // flows through unchanged; #commitSession never re-reads the record. A
+  // peerLinks version mismatch propagates to the caller (the ack path wraps it
+  // to recover from a duplicate ack).
+  async #commitSession({
+    ownerAccountId,
+    peerLinkRecord,
+    peerAccountId,
+    secureChannelManager = null,
+    sessionStatus,
+    peerLinkState,
+    existingSession = null,
+    resetSessionCreatedAt = false,
+    peerInboxId,
+    eventType,
+    eventSummary = null,
+    eventDetails = {},
+    atMs = null,
+  } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const remote = requireId(peerAccountId, "peerAccountId");
+    if (!peerLinkRecord || typeof peerLinkRecord !== "object") {
+      throw new Error("#commitSession requires peerLinkRecord");
+    }
+    const peerLinkId = requireId(peerLinkRecord.peerLinkId, "peerLinkId");
+    const now = asPositiveInt(atMs, this.clock());
+
+    // 1-3. Persist the session, unless this is a pure state write with neither a
+    // fresh ratchet nor a stored snapshot to carry (the ack path tolerates a
+    // missing session: it then only advances the peer-link state).
+    let storedSession = null;
+    let ratchetSnapshot = null;
+    if (secureChannelManager) {
+      ratchetSnapshot = secureChannelManager.exportSnapshot();
+    } else if (existingSession && existingSession.ratchetSnapshot) {
+      ratchetSnapshot = existingSession.ratchetSnapshot;
+    }
+    if (ratchetSnapshot) {
+      const sessionId = existingSession && existingSession.sessionId ? existingSession.sessionId : stableId("pls");
+      const createdAtMs = (!resetSessionCreatedAt && existingSession && existingSession.createdAtMs)
+        ? existingSession.createdAtMs
+        : now;
+      const sessionVersion = existingSession && existingSession.version ? existingSession.version : 1;
+      storedSession = await this.peerLinkStorage.sessions.put({
+        ...(existingSession && typeof existingSession === "object" ? existingSession : {}),
+        sessionId,
+        peerLinkId,
+        localAccountId: owner,
+        peerAccountId: remote,
+        status: sessionStatus,
+        ratchetSnapshot,
+        createdAtMs,
+        updatedAtMs: now,
+        version: sessionVersion,
+      });
+    }
+
+    // 4. Validate (log-and-allow) then apply the peer-link state transition.
+    this.#checkPeerLinkTransition(peerLinkRecord.state, peerLinkState, peerLinkId);
+    const nextActiveSessionId = storedSession ? storedSession.sessionId : peerLinkRecord.activeSessionId;
+    const nextPeerInboxId = peerInboxId === undefined ? peerLinkRecord.peerInboxId : peerInboxId;
+    const nextPeerLinkRecord = await this.peerLinkStorage.peerLinks.update({
+      ...peerLinkRecord,
+      state: peerLinkState,
+      activeSessionId: nextActiveSessionId,
+      peerInboxId: nextPeerInboxId,
+      lastStateChangeAtMs: now,
+      lastErrorCode: null,
+      lastErrorMessage: null,
+    }, peerLinkRecord.version);
+
+    // 5. Append the lifecycle event. peerAccountId + sessionId are common to
+    //    every establish event, so they are merged in here; the caller passes
+    //    only the extras (inviteId / requestId). Caller keys win on collision.
+    const event = await this._appendPeerLinkEvent({
+      ownerAccountId: owner,
+      peerLinkId: nextPeerLinkRecord.peerLinkId,
+      type: eventType,
+      summary: eventSummary,
+      details: {
+        peerAccountId: remote,
+        sessionId: storedSession ? storedSession.sessionId : null,
+        ...(eventDetails && typeof eventDetails === "object" && !Array.isArray(eventDetails) ? eventDetails : {}),
+      },
+      atMs: now,
+    });
+
+    // 6. A successful establish clears stale decrypt/recovery accounting.
+    const counterKey = owner + ":" + remote;
+    this.#decryptFailureCounts.delete(counterKey);
+    this.#anyPeerMissCounts.delete(counterKey);
+
+    return {
+      snapshot: await this._buildSnapshot(nextPeerLinkRecord),
+      event,
+      sessionRecord: storedSession,
+      peerLinkRecord: nextPeerLinkRecord,
+    };
   }
 
   _normalizeStoredAccountKeyRecord(stored) {
@@ -594,13 +764,7 @@ export class PeerLinkService {
       missingSession.code = "THREAD_NOT_READY";
       throw missingSession;
     }
-    const sessionStatus = nonEmpty(sessionRecord.status) || "pending";
-    const canSend = (
-      sessionStatus === "active"
-      || sessionStatus === "pending_remote_confirm"
-      || sessionStatus === "ready"
-      || sessionStatus === "established"
-    );
+    const canSend = isSessionUsable(sessionRecord.status);
     if (!canSend) {
       const unavailableSession = new Error("Secure session is not ready yet");
       unavailableSession.code = "THREAD_NOT_READY";
@@ -653,12 +817,7 @@ export class PeerLinkService {
       throw missingSession;
     }
     const sessionStatus = nonEmpty(sessionRecord.status) || "pending";
-    const canDecrypt = (
-      sessionStatus === "active"
-      || sessionStatus === "pending_remote_confirm"
-      || sessionStatus === "ready"
-      || sessionStatus === "established"
-    );
+    const canDecrypt = isSessionUsable(sessionStatus);
     if (!canDecrypt) {
       const unavailableSession = new Error("Secure session is not ready yet");
       unavailableSession.code = "THREAD_NOT_READY";
@@ -694,13 +853,40 @@ export class PeerLinkService {
       throw decryptErr;
     }
 
-    // Successful decrypt — reset failure counter for this peer.
+    // Successful decrypt — reset failure/recovery counters for this peer.
     const successKey = owner + ":" + remote;
     this.#decryptFailureCounts.delete(successKey);
+    this.#anyPeerMissCounts.delete(successKey);
+
+    const nextSessionStatus = sessionStatus === "pending_remote_confirm" ? "active" : sessionStatus;
+    // A first successful decrypt confirms the session (and any pending_remote_confirm
+    // → active flip); route that establishment write through the single
+    // #commitSession path. Steady-state decrypts (already established, no status
+    // change) only persist the advanced ratchet — no peer-link write/event.
+    if (peerLinkRecord.state !== "session_established" || nextSessionStatus !== sessionStatus) {
+      const commit = await this.#commitSession({
+        ownerAccountId: owner,
+        peerLinkRecord,
+        peerAccountId: remote,
+        secureChannelManager,
+        sessionStatus: nextSessionStatus,
+        peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
+        existingSession: sessionRecord,
+        eventType: "session_established",
+        eventSummary: "Secure session confirmed",
+        eventDetails: { sessionId: sessionRecord.sessionId, peerAccountId: remote },
+        atMs: this.clock(),
+      });
+      return {
+        plaintextBytes: result.plaintextBytes,
+        encrypted: result.encrypted === true,
+        snapshot: commit.snapshot,
+        event: commit.event,
+      };
+    }
 
     const sessionSnapshot = secureChannelManager.exportSnapshot();
-    const nextSessionStatus = sessionStatus === "pending_remote_confirm" ? "active" : sessionStatus;
-    const storedSession = await this.peerLinkStorage.sessions.put({
+    await this.peerLinkStorage.sessions.put({
       ...sessionRecord,
       localAccountId: owner,
       peerAccountId: remote,
@@ -709,35 +895,11 @@ export class PeerLinkService {
       updatedAtMs: this.clock(),
     });
 
-    let nextPeerLinkRecord = peerLinkRecord;
-    let eventRecord = null;
-    if (peerLinkRecord.state !== "session_established" || nextSessionStatus !== sessionStatus) {
-      nextPeerLinkRecord = await this.peerLinkStorage.peerLinks.update({
-        ...peerLinkRecord,
-        state: "session_established",
-        activeSessionId: storedSession.sessionId,
-        lastStateChangeAtMs: this.clock(),
-        lastErrorCode: null,
-        lastErrorMessage: null,
-      }, peerLinkRecord.version);
-      eventRecord = await this._appendPeerLinkEvent({
-        ownerAccountId: owner,
-        peerLinkId: nextPeerLinkRecord.peerLinkId,
-        type: "session_established",
-        summary: "Secure session confirmed",
-        details: {
-          sessionId: storedSession.sessionId,
-          peerAccountId: remote,
-        },
-        atMs: this.clock(),
-      });
-    }
-
     return {
       plaintextBytes: result.plaintextBytes,
       encrypted: result.encrypted === true,
-      snapshot: await this._buildSnapshot(nextPeerLinkRecord),
-      event: eventRecord,
+      snapshot: await this._buildSnapshot(peerLinkRecord),
+      event: null,
     };
   }
 
@@ -756,6 +918,9 @@ export class PeerLinkService {
     const rows = await this.peerLinkStorage.peerLinks.listByOwner(owner);
     const trace = process.env.REZ_PEERLINK_TRACE === "1";
     const tried = [];
+    // Links with a usable session that nonetheless failed to decrypt this packet
+    // ("should have decrypted but didn't") — the recovery-attribution candidates.
+    const candidates = [];
 
     for (const row of rows) {
       if (!row || !row.peerAccountId) continue;
@@ -765,12 +930,7 @@ export class PeerLinkService {
         continue;
       }
       const sessionStatus = nonEmpty(sessionRecord.status) || "pending";
-      const canDecrypt = (
-        sessionStatus === "active"
-        || sessionStatus === "pending_remote_confirm"
-        || sessionStatus === "ready"
-        || sessionStatus === "established"
-      );
+      const canDecrypt = isSessionUsable(sessionStatus);
       if (!canDecrypt) {
         if (trace) tried.push(row.peerAccountId + ":status=" + sessionStatus);
         continue;
@@ -780,19 +940,48 @@ export class PeerLinkService {
       const codec = new E2eePacketCodec({ secureChannelManager });
       const result = await codec.decryptIncoming({ packetBytes });
 
-      // Wrong session — SID mismatch returns peerId null, no state mutation
+      // Wrong session — SID mismatch returns peerId null, no state mutation.
+      // This link had a usable session yet did not decrypt the packet, so it is
+      // a recovery candidate (see total-miss handling below).
       if (!result.encrypted || !result.peerId) {
         if (trace) tried.push(row.peerAccountId + ":no-match(enc=" + (result.encrypted ? 1 : 0) + ",pid=" + (result.peerId ? 1 : 0) + ")");
+        candidates.push(row);
         continue;
       }
 
-      // Successful trial decrypt — persist ratchet and update peer link state
+      // Successful trial decrypt — reset counters, persist ratchet, confirm link.
       const successKey = owner + ":" + row.peerAccountId;
       this.#decryptFailureCounts.delete(successKey);
+      this.#anyPeerMissCounts.delete(successKey);
+
+      const nextSessionStatus = sessionStatus === "pending_remote_confirm" ? "active" : sessionStatus;
+      // First successful trial decrypt confirms the session — route that
+      // establishment write through the single #commitSession path. Steady-state
+      // trial decrypts only persist the advanced ratchet (no peer-link write).
+      if (row.state !== "session_established" || nextSessionStatus !== sessionStatus) {
+        const commit = await this.#commitSession({
+          ownerAccountId: owner,
+          peerLinkRecord: row,
+          peerAccountId: row.peerAccountId,
+          secureChannelManager,
+          sessionStatus: nextSessionStatus,
+          peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
+          existingSession: sessionRecord,
+          eventType: "session_established",
+          eventSummary: "Secure session confirmed",
+          eventDetails: { sessionId: sessionRecord.sessionId, peerAccountId: row.peerAccountId },
+          atMs: this.clock(),
+        });
+        return {
+          plaintextBytes: result.plaintextBytes,
+          encrypted: result.encrypted === true,
+          snapshot: commit.snapshot,
+          event: commit.event,
+        };
+      }
 
       const sessionSnapshot = secureChannelManager.exportSnapshot();
-      const nextSessionStatus = sessionStatus === "pending_remote_confirm" ? "active" : sessionStatus;
-      const storedSession = await this.peerLinkStorage.sessions.put({
+      await this.peerLinkStorage.sessions.put({
         ...sessionRecord,
         localAccountId: owner,
         peerAccountId: row.peerAccountId,
@@ -801,35 +990,11 @@ export class PeerLinkService {
         updatedAtMs: this.clock(),
       });
 
-      let nextPeerLinkRecord = row;
-      let eventRecord = null;
-      if (row.state !== "session_established" || nextSessionStatus !== sessionStatus) {
-        nextPeerLinkRecord = await this.peerLinkStorage.peerLinks.update({
-          ...row,
-          state: "session_established",
-          activeSessionId: storedSession.sessionId,
-          lastStateChangeAtMs: this.clock(),
-          lastErrorCode: null,
-          lastErrorMessage: null,
-        }, row.version);
-        eventRecord = await this._appendPeerLinkEvent({
-          ownerAccountId: owner,
-          peerLinkId: nextPeerLinkRecord.peerLinkId,
-          type: "session_established",
-          summary: "Secure session confirmed",
-          details: {
-            sessionId: storedSession.sessionId,
-            peerAccountId: row.peerAccountId,
-          },
-          atMs: this.clock(),
-        });
-      }
-
       return {
         plaintextBytes: result.plaintextBytes,
         encrypted: result.encrypted === true,
-        snapshot: await this._buildSnapshot(nextPeerLinkRecord),
-        event: eventRecord,
+        snapshot: await this._buildSnapshot(row),
+        event: null,
       };
     }
 
@@ -837,8 +1002,25 @@ export class PeerLinkService {
       // eslint-disable-next-line no-console
       console.log("[PLTRACE] decryptAnyPeer owner=" + owner + " NO MATCH; links tried=[" + tried.join(", ") + "] (rows=" + rows.length + ")");
     }
+    // Recovery attribution. We cannot read the sender from an opaque packet, so
+    // a total miss against usable sessions means one of those links may carry a
+    // desynced/one-sided session. Increment a per-link miss counter and surface
+    // the candidates on the error; the caller (chat-server) triggers a single
+    // rehandshake only when EXACTLY ONE candidate has crossed the threshold —
+    // ambiguous or zero candidates are left to retry, never guessed.
     const err = new Error("No peer link could decrypt packet");
     err.code = "THREAD_NOT_READY";
+    err.recoveryCandidates = candidates.map((row) => {
+      const key = owner + ":" + row.peerAccountId;
+      const misses = (this.#anyPeerMissCounts.get(key) || 0) + 1;
+      this.#anyPeerMissCounts.set(key, misses);
+      return {
+        peerAccountId: row.peerAccountId,
+        peerLinkId: row.peerLinkId,
+        consecutiveMisses: misses,
+        rehandshakeNeeded: misses >= REHANDSHAKE_DECRYPT_FAILURE_THRESHOLD,
+      };
+    });
     throw err;
   }
 
@@ -1247,34 +1429,25 @@ export class PeerLinkService {
       initiatorIdentityDhKeyPair: acceptorIdentityDhKeyPair,
       initiatorIdentityDhSignature: acceptorIdentityDhSignature,
     });
-    const sessionSnapshot = secureChannelManager.exportSnapshot();
-    const sessionRecord = await this.peerLinkStorage.sessions.put({
-      sessionId: stableId("pls"),
-      peerLinkId,
-      localAccountId: acceptor,
-      peerAccountId: inviterAccountId,
-      status: "pending_remote_confirm",
-      ratchetSnapshot: sessionSnapshot,
-      createdAtMs: nowMs,
-      updatedAtMs: nowMs,
-      version: 1,
-    });
-    peerLinkRecord = await this.peerLinkStorage.peerLinks.update({
-      ...peerLinkRecord,
-      activeSessionId: sessionRecord.sessionId,
-      lastStateChangeAtMs: nowMs,
-    }, peerLinkRecord.version);
-    let eventRecord = await this._appendPeerLinkEvent({
+    // Persist the unilaterally-derived initiator session (pending the inviter's
+    // confirm) through the single #commitSession path. The peer-link stays in
+    // accept_committed here (a self-transition); the send branches below drive
+    // it to handshake_sent / degraded / session_established.
+    const commit = await this.#commitSession({
       ownerAccountId: acceptor,
-      peerLinkId,
-      type: "handshake_pending",
-      summary: "Handshake state created",
-      details: {
-        inviteId: envelope.inviteId,
-        sessionId: sessionRecord.sessionId,
-      },
+      peerLinkRecord,
+      peerAccountId: inviterAccountId,
+      secureChannelManager,
+      sessionStatus: SESSION_STATUS.PENDING_REMOTE_CONFIRM,
+      peerLinkState: PEER_LINK_STATE.ACCEPT_COMMITTED,
+      eventType: "handshake_pending",
+      eventSummary: "Handshake state created",
+      eventDetails: { inviteId: envelope.inviteId },
       atMs: nowMs,
     });
+    peerLinkRecord = commit.peerLinkRecord;
+    const sessionRecord = commit.sessionRecord;
+    let eventRecord = commit.event;
     if (typeof sendHandshake === "function") {
       // Include the acceptor's account binding so the inviter can verify
       // that senderAccountId actually controls the X3DH identity key used
@@ -1333,9 +1506,10 @@ export class PeerLinkService {
             lastErrorMessage: null,
           }, handshakeAttempt.version);
           const currentForUpdate = freshAfterSend || peerLinkRecord;
+          this.#checkPeerLinkTransition(currentForUpdate.state, PEER_LINK_STATE.HANDSHAKE_SENT, currentForUpdate.peerLinkId);
           peerLinkRecord = await this.peerLinkStorage.peerLinks.update({
             ...currentForUpdate,
-            state: "handshake_sent",
+            state: PEER_LINK_STATE.HANDSHAKE_SENT,
             lastStateChangeAtMs: nowMs,
             lastErrorCode: null,
             lastErrorMessage: null,
@@ -1374,9 +1548,10 @@ export class PeerLinkService {
               lastErrorMessage: errorMessage,
             }, handshakeAttempt.version);
           } catch { /* best effort — attempt record may also have version conflict */ }
+          this.#checkPeerLinkTransition(currentForErr.state, PEER_LINK_STATE.DEGRADED, currentForErr.peerLinkId);
           peerLinkRecord = await this.peerLinkStorage.peerLinks.update({
             ...currentForErr,
-            state: "degraded",
+            state: PEER_LINK_STATE.DEGRADED,
             lastStateChangeAtMs: nowMs,
             lastErrorCode: errorCode,
             lastErrorMessage: errorMessage,
@@ -1570,37 +1745,29 @@ export class PeerLinkService {
         version: 1,
       });
     }
-    const secureChannelManager = this._createSecureChannelManager();
-    const x3dh = new X3DHKeyExchange({ secureChannelManager });
-    const { identityDhKeyPair: ownerIdentityDhKeyPair } = await this._requireBoundX3dhIdentity(owner);
-    await x3dh.completeInviteHandshake({
+    const { secureChannelManager } = await this.#establishAsResponder({
+      ownerAccountId: owner,
       preKeyState,
-      identityDhPrivate: ownerIdentityDhKeyPair.privateKey,
       handshakeData,
       peerId: peerAccountId,
     });
-    const sessionSnapshot = secureChannelManager.exportSnapshot();
     const existingSession = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, peerLinkRecord.peerLinkId);
-    const sessionRecord = await this.peerLinkStorage.sessions.put({
-      sessionId: existingSession && existingSession.sessionId ? existingSession.sessionId : stableId("pls"),
-      peerLinkId: peerLinkRecord.peerLinkId,
-      localAccountId: owner,
+    const commit = await this.#commitSession({
+      ownerAccountId: owner,
+      peerLinkRecord,
       peerAccountId,
-      status: "active",
-      ratchetSnapshot: sessionSnapshot,
-      createdAtMs: existingSession && existingSession.createdAtMs ? existingSession.createdAtMs : nowMs,
-      updatedAtMs: nowMs,
-      version: existingSession && existingSession.version ? existingSession.version : 1,
-    });
-    peerLinkRecord = await this.peerLinkStorage.peerLinks.update({
-      ...peerLinkRecord,
-      state: "session_established",
-      activeSessionId: sessionRecord.sessionId,
+      secureChannelManager,
+      sessionStatus: SESSION_STATUS.ACTIVE,
+      peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
+      existingSession,
       peerInboxId: remoteInboxId || peerLinkRecord.peerInboxId,
-      lastStateChangeAtMs: nowMs,
-      lastErrorCode: null,
-      lastErrorMessage: null,
-    }, peerLinkRecord.version);
+      eventType: "handshake_received",
+      eventSummary: "Handshake received and session established",
+      eventDetails: { inviteId },
+      atMs: nowMs,
+    });
+    peerLinkRecord = commit.peerLinkRecord;
+    const sessionRecord = commit.sessionRecord;
     await this.peerLinkStorage.handshakeAttempts.create({
       handshakeAttemptId: stableId("hs"),
       peerLinkId: peerLinkRecord.peerLinkId,
@@ -1621,21 +1788,9 @@ export class PeerLinkService {
     if (inviteExhausted) {
       await this.peerLinkStorage.keys.deleteInvitePreKey(owner, inviteId);
     }
-    const eventRecord = await this._appendPeerLinkEvent({
-      ownerAccountId: owner,
-      peerLinkId: peerLinkRecord.peerLinkId,
-      type: "handshake_received",
-      summary: "Handshake received and session established",
-      details: {
-        inviteId,
-        peerAccountId,
-        sessionId: sessionRecord.sessionId,
-      },
-      atMs: nowMs,
-    });
     return {
-      snapshot: await this._buildSnapshot(peerLinkRecord),
-      event: eventRecord,
+      snapshot: commit.snapshot,
+      event: commit.event,
       ackNonce: nonEmpty(handshakeData.ackNonce) || null,
       remoteDisplayName,
       localDisplayName,
@@ -1748,55 +1903,39 @@ export class PeerLinkService {
 
     const nowMs = this.clock();
 
-    // Update session status from "pending_remote_confirm" to "active"
+    // Confirm the session: flip pending_remote_confirm → active and advance the
+    // peer link to session_established through the single #commitSession path
+    // (no ratchet derivation — only the status flip). peerInboxId is never taken
+    // from the ack (routing-hijack guard). A peerLinks version mismatch means a
+    // duplicate ack arrived via multiple relays, or acceptInvite already
+    // advanced the record — re-read and treat an established link as success.
     const existingSession = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, peerLinkRecord.peerLinkId);
-    if (existingSession) {
-      await this.peerLinkStorage.sessions.put({
-        ...existingSession,
-        status: "active",
-        updatedAtMs: nowMs,
-      });
-    }
-
-    // Never overwrite peerInboxId from the ack — use only the
-    // inbox already stored from the invite envelope to prevent routing hijack.
-    const remoteInbox = peerLinkRecord.peerInboxId;
-    let updatedRecord;
+    let commit;
     try {
-      updatedRecord = await this.peerLinkStorage.peerLinks.update({
-        ...peerLinkRecord,
-        state: "session_established",
-        peerInboxId: remoteInbox,
-        lastStateChangeAtMs: nowMs,
-        lastErrorCode: null,
-        lastErrorMessage: null,
-      }, peerLinkRecord.version);
-    } catch {
-      // Version mismatch — duplicate ack (same ack via multiple relays) or
-      // acceptInvite already advanced the record. Re-read current state.
+      commit = await this.#commitSession({
+        ownerAccountId: owner,
+        peerLinkRecord,
+        peerAccountId: remote,
+        sessionStatus: SESSION_STATUS.ACTIVE,
+        peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
+        existingSession,
+        peerInboxId: peerLinkRecord.peerInboxId,
+        eventType: "handshake_ack_received",
+        eventSummary: "Handshake acknowledged — session established",
+        atMs: nowMs,
+      });
+    } catch (err) {
       const fresh = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
       if (fresh && fresh.state === "session_established") {
         return { snapshot: await this._buildSnapshot(fresh), event: null };
       }
-      // Genuinely unexpected — re-throw
+      // Genuinely unexpected — surface as a version conflict.
       throw new Error(`Peer link version conflict for ${peerLinkRecord.peerLinkId}`);
     }
 
-    const eventRecord = await this._appendPeerLinkEvent({
-      ownerAccountId: owner,
-      peerLinkId: updatedRecord.peerLinkId,
-      type: "handshake_ack_received",
-      summary: "Handshake acknowledged — session established",
-      details: {
-        peerAccountId: remote,
-        sessionId: existingSession ? existingSession.sessionId : null,
-      },
-      atMs: nowMs,
-    });
-
     return {
-      snapshot: await this._buildSnapshot(updatedRecord),
-      event: eventRecord,
+      snapshot: commit.snapshot,
+      event: commit.event,
       remoteDisplayName: typeof remoteDisplayName === "string" ? remoteDisplayName : "",
     };
   }
@@ -1931,9 +2070,10 @@ export class PeerLinkService {
     // Transition the peer-link to the terminal "rejected" state. The store has
     // no delete (state transitions are the idiom), and a terminal state is the
     // signal the chat layer tears the optimistic thread/contact down on.
+    this.#checkPeerLinkTransition(peerLinkRecord.state, PEER_LINK_STATE.REJECTED, peerLinkRecord.peerLinkId);
     const rejectedRecord = await this.peerLinkStorage.peerLinks.update({
       ...peerLinkRecord,
-      state: "rejected",
+      state: PEER_LINK_STATE.REJECTED,
       activeSessionId: null,
       lastStateChangeAtMs: nowMs,
       lastErrorCode: reason,
@@ -2026,9 +2166,10 @@ export class PeerLinkService {
 
     // Mark the peer link as "rehandshake_requested".
     const nowMs = this.clock();
+    this.#checkPeerLinkTransition(peerLinkRecord.state, PEER_LINK_STATE.REHANDSHAKE_REQUESTED, peerLinkRecord.peerLinkId);
     const updatedRecord = await this.peerLinkStorage.peerLinks.update({
       ...peerLinkRecord,
-      state: "rehandshake_requested",
+      state: PEER_LINK_STATE.REHANDSHAKE_REQUESTED,
       lastStateChangeAtMs: nowMs,
       lastErrorCode: "RATCHET_DESYNC",
       lastErrorMessage: "Re-handshake requested due to decrypt failures",
@@ -2103,48 +2244,27 @@ export class PeerLinkService {
       initiatorIdentityDhKeyPair: ownerIdentityDhKeyPair,
       initiatorIdentityDhSignature: ownerIdentityDhSignature,
     });
-    const sessionSnapshot = secureChannelManager.exportSnapshot();
-
-    // Replace the existing session with the new one.
+    // Replace the existing session with the freshly-derived one through the
+    // single #commitSession writer. createdAtMs is reset (a brand-new session).
     const nowMs = this.clock();
     const existingSession = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, peerLinkRecord.peerLinkId);
-    const sessionRecord = await this.peerLinkStorage.sessions.put({
-      sessionId: existingSession && existingSession.sessionId ? existingSession.sessionId : stableId("pls"),
-      peerLinkId: peerLinkRecord.peerLinkId,
-      localAccountId: owner,
-      peerAccountId: remote,
-      status: "active",
-      ratchetSnapshot: sessionSnapshot,
-      createdAtMs: nowMs,
-      updatedAtMs: nowMs,
-      version: existingSession && existingSession.version ? existingSession.version : 1,
-    });
-
-    const updatedRecord = await this.peerLinkStorage.peerLinks.update({
-      ...peerLinkRecord,
-      state: "session_established",
-      activeSessionId: sessionRecord.sessionId,
-      peerInboxId: senderInboxId,
-      lastStateChangeAtMs: nowMs,
-      lastErrorCode: null,
-      lastErrorMessage: null,
-    }, peerLinkRecord.version);
-
-    // Reset decrypt failure counter.
-    this.#decryptFailureCounts.delete(owner + ":" + remote);
-
-    const eventRecord = await this._appendPeerLinkEvent({
+    const commit = await this.#commitSession({
       ownerAccountId: owner,
-      peerLinkId: peerLinkRecord.peerLinkId,
-      type: "rehandshake_completed",
-      summary: "Re-handshake completed — new session established",
-      details: {
-        requestId,
-        peerAccountId: remote,
-        sessionId: sessionRecord.sessionId,
-      },
+      peerLinkRecord,
+      peerAccountId: remote,
+      secureChannelManager,
+      sessionStatus: SESSION_STATUS.ACTIVE,
+      peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
+      existingSession,
+      resetSessionCreatedAt: true,
+      peerInboxId: senderInboxId,
+      eventType: "rehandshake_completed",
+      eventSummary: "Re-handshake completed — new session established",
+      eventDetails: { requestId },
       atMs: nowMs,
     });
+    const updatedRecord = commit.peerLinkRecord;
+    const eventRecord = commit.event;
 
     // Build the handshake packet to send back. The receiver identifies the
     // sender via the signed handshake (senderIdentitySigningPubKeyB64 +
@@ -2268,64 +2388,39 @@ export class PeerLinkService {
       return null;
     }
 
-    // Act as X3DH responder using our stored pre-key state.
-    const secureChannelManager = this._createSecureChannelManager();
-    const x3dh = new X3DHKeyExchange({ secureChannelManager });
-    const { identityDhKeyPair: ownerIdentityDhKeyPair } = await this._requireBoundX3dhIdentity(owner);
-    await x3dh.completeInviteHandshake({
+    // Act as X3DH responder using our stored pre-key state, then persist the
+    // re-established session through the single #commitSession writer. peerInboxId
+    // is left unchanged (the responder keeps its existing routing). createdAtMs
+    // is reset (a brand-new session).
+    const { secureChannelManager } = await this.#establishAsResponder({
+      ownerAccountId: owner,
       preKeyState,
-      identityDhPrivate: ownerIdentityDhKeyPair.privateKey,
       handshakeData,
       peerId: remote,
     });
-    const sessionSnapshot = secureChannelManager.exportSnapshot();
-
-    // Replace the existing session with the new one.
     const nowMs = this.clock();
     const existingSession = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, peerLinkRecord.peerLinkId);
-    const sessionRecord = await this.peerLinkStorage.sessions.put({
-      sessionId: existingSession && existingSession.sessionId ? existingSession.sessionId : stableId("pls"),
-      peerLinkId: peerLinkRecord.peerLinkId,
-      localAccountId: owner,
+    const commit = await this.#commitSession({
+      ownerAccountId: owner,
+      peerLinkRecord,
       peerAccountId: remote,
-      status: "active",
-      ratchetSnapshot: sessionSnapshot,
-      createdAtMs: nowMs,
-      updatedAtMs: nowMs,
-      version: existingSession && existingSession.version ? existingSession.version : 1,
+      secureChannelManager,
+      sessionStatus: SESSION_STATUS.ACTIVE,
+      peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
+      existingSession,
+      resetSessionCreatedAt: true,
+      eventType: "rehandshake_response_completed",
+      eventSummary: "Re-handshake response processed — session re-established",
+      eventDetails: { requestId },
+      atMs: nowMs,
     });
-
-    const updatedRecord = await this.peerLinkStorage.peerLinks.update({
-      ...peerLinkRecord,
-      state: "session_established",
-      activeSessionId: sessionRecord.sessionId,
-      lastStateChangeAtMs: nowMs,
-      lastErrorCode: null,
-      lastErrorMessage: null,
-    }, peerLinkRecord.version);
 
     // Clean up the stored pre-key state.
     await this.kv.delete(preKeyStorageKey);
 
-    // Reset decrypt failure counter.
-    this.#decryptFailureCounts.delete(owner + ":" + remote);
-
-    const eventRecord = await this._appendPeerLinkEvent({
-      ownerAccountId: owner,
-      peerLinkId: peerLinkRecord.peerLinkId,
-      type: "rehandshake_response_completed",
-      summary: "Re-handshake response processed — session re-established",
-      details: {
-        requestId,
-        peerAccountId: remote,
-        sessionId: sessionRecord.sessionId,
-      },
-      atMs: nowMs,
-    });
-
     return {
-      snapshot: await this._buildSnapshot(updatedRecord),
-      event: eventRecord,
+      snapshot: commit.snapshot,
+      event: commit.event,
     };
   }
 }
