@@ -2221,7 +2221,8 @@ export class PeerLinkService {
    * pre-key bundle, then sends a standard handshake packet back.
    *
    * @param {{ ownerAccountId?: string, requestId: string, senderAccountId: string, senderInboxId: string, bundleJson: object }} opts
-   * @returns {{ snapshot: object, event: object|null, handshakePacket: Uint8Array }|null}
+   * @returns {{ snapshot: object, event: object|null, handshakePacket: E2eeHandshakePacketV1, deliverInboxId: string }|null}
+   *   `handshakePacket` is an on-wire record — call `.toBytes()` before dispatch.
    */
   async handleIncomingRehandshake({
     ownerAccountId = this.ownerAccountId,
@@ -2572,7 +2573,8 @@ export class PeerLinkService {
    * invoking this method — the SDK stays crypto-only and group-unaware.
    *
    * @param {{ ownerAccountId?: string, ownerInboxId?: string, introductionId: string, senderAccountId: string, senderInboxId: string, bundleJson: object }} opts
-   * @returns {{ snapshot: object, event: object|null, handshakePacket: Uint8Array, deliverInboxId: string }|null}
+   * @returns {{ snapshot: object, event: object|null, handshakePacket: E2eeHandshakePacketV1, deliverInboxId: string }|null}
+   *   `handshakePacket` is an on-wire record — call `.toBytes()` before dispatch.
    */
   async handleIncomingIntroduction({
     ownerAccountId = this.ownerAccountId,
