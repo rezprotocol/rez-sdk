@@ -18,7 +18,6 @@ export const PEER_LINK_STATE = Object.freeze({
   HANDSHAKE_RECEIVED: "handshake_received",
   SESSION_ESTABLISHED: "session_established",
   DEGRADED: "degraded",
-  REHANDSHAKE_REQUESTED: "rehandshake_requested",
   REJECTED: "rejected",
   FAILED: "failed",
 });
@@ -49,17 +48,22 @@ export function isSessionUsable(status) {
 }
 
 // Allowed next-states per current peer-link state. Built strictly from the
-// transitions the seven establishment paths actually perform — no speculative
-// edges. A `from === to` self-transition and a fresh create (no prior state)
-// are always allowed and are NOT enumerated here.
+// transitions the establishment + recovery paths actually perform — no
+// speculative edges. A `from === to` self-transition and a fresh create (no
+// prior state) are always allowed and are NOT enumerated here.
+//
+// Recovery is now just a re-invite: a desynced link re-enters `accept_committed`
+// via acceptInvite({forceReestablish}), so `session_established → accept_committed`
+// and `degraded → accept_committed` are the recovery edges. The old dedicated
+// `rehandshake_requested` state was removed when the bespoke rehandshake path was
+// replaced by recovery-via-reinvite.
 const TRANSITIONS = Object.freeze({
   invite_issued: Object.freeze(["accept_committed", "rejected", "failed"]),
   accept_committed: Object.freeze(["handshake_sent", "session_established", "degraded", "rejected", "failed"]),
   handshake_sent: Object.freeze(["session_established", "degraded", "rejected", "failed"]),
   handshake_received: Object.freeze(["session_established", "failed"]),
-  session_established: Object.freeze(["session_established", "degraded", "rehandshake_requested", "failed"]),
-  degraded: Object.freeze(["accept_committed", "session_established", "rehandshake_requested", "rejected", "failed"]),
-  rehandshake_requested: Object.freeze(["session_established", "degraded", "failed"]),
+  session_established: Object.freeze(["session_established", "accept_committed", "degraded", "failed"]),
+  degraded: Object.freeze(["accept_committed", "session_established", "rejected", "failed"]),
   rejected: Object.freeze(["accept_committed"]),
   failed: Object.freeze(["accept_committed"]),
 });

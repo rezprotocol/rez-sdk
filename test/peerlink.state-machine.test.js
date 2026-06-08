@@ -23,7 +23,6 @@ test("PEER_LINK_STATE maps to the exact legacy persisted strings", () => {
     HANDSHAKE_RECEIVED: "handshake_received",
     SESSION_ESTABLISHED: "session_established",
     DEGRADED: "degraded",
-    REHANDSHAKE_REQUESTED: "rehandshake_requested",
     REJECTED: "rejected",
     FAILED: "failed",
   });
@@ -67,8 +66,11 @@ test("checkTransition encodes the verified establishment edges", () => {
   assert.equal(checkTransition("accept_committed", "handshake_sent").allowed, true);
   assert.equal(checkTransition("handshake_sent", "session_established").allowed, true);
   assert.equal(checkTransition("handshake_received", "session_established").allowed, true);
-  assert.equal(checkTransition("session_established", "rehandshake_requested").allowed, true);
-  assert.equal(checkTransition("rehandshake_requested", "session_established").allowed, true);
+  // Recovery is a re-invite: a desynced/degraded link re-enters accept_committed.
+  assert.equal(checkTransition("session_established", "accept_committed").allowed, true);
+  assert.equal(checkTransition("degraded", "accept_committed").allowed, true);
+  // The dedicated rehandshake_requested state was removed with the bespoke path.
+  assert.equal(checkTransition("session_established", "rehandshake_requested").allowed, false);
   // Reattempt: a terminal dead link is re-driven by acceptInvite.
   assert.equal(checkTransition("rejected", "accept_committed").allowed, true);
   assert.equal(checkTransition("failed", "accept_committed").allowed, true);

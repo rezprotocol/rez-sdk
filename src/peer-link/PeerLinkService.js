@@ -3,8 +3,6 @@ import {
   E2eeHandshakeAckV1,
   E2eeHandshakeRejectV1,
   E2eePacketCodec,
-  E2eeRehandshakeRequestV1,
-  E2eeIntroductionRequestV1,
   SecureChannelManager,
   X3DHKeyExchange,
   base64ToBytes,
@@ -32,6 +30,14 @@ const PEER_LINK_INVITE_HASH_PREFIX = "app:peer-links:inviteHash/";
 const INVITE_CLAIM_LOCKS = new Map();
 const HANDSHAKE_ACK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const REHANDSHAKE_DECRYPT_FAILURE_THRESHOLD = 3;
+// A session that successfully decrypted authenticated traffic within this window
+// is treated as HEALTHY: undecryptable packets arriving alongside it are noise
+// or replay, NOT a desync, and must NOT arm a destructive re-handshake. Defeats
+// "malicious relay injects bad packets to tear down a working link". An idle link
+// (no recent success) can still recover — those recoveries are low-harm and are
+// further bounded by the chat-layer recovery-invite trigger cooldown and the
+// short recovery-invite TTL (a stale/replayed invite auto-expires).
+const HEALTHY_SESSION_DECRYPT_GUARD_MS = 30 * 1000;
 
 function asPositiveInt(value, fallback) {
   const num = Number(value);
@@ -176,6 +182,10 @@ export class PeerLinkService {
   // cannot attribute a miss to one peer from the packet alone. Cleared on any
   // successful establish/decrypt for the peer.
   #anyPeerMissCounts;
+  // Per-(owner:peer) timestamp of the last successful any-peer trial decrypt.
+  // Used to protect a demonstrably-healthy session from being torn down by
+  // injected/undecryptable noise (HEALTHY_SESSION_DECRYPT_GUARD_MS).
+  #anyPeerLastSuccessAt;
   // When true, an untabulated peer-link transition throws instead of being
   // logged-and-allowed. Default false (observe-only) for this ship; flip once
   // the transition table is proven against production telemetry.
@@ -227,6 +237,7 @@ export class PeerLinkService {
     this.inboxClaimantSigner = inboxClaimantSigner;
     this.#decryptFailureCounts = new Map();
     this.#anyPeerMissCounts = new Map();
+    this.#anyPeerLastSuccessAt = new Map();
     this.#strictTransitions = strictTransitions === true;
   }
 
@@ -306,9 +317,9 @@ export class PeerLinkService {
   }
 
   // Observe-only reporter for an illegal peer-link transition. Wired into
-  // #commitSession (and the bespoke acceptInvite/reject/rehandshake updates)
-  // via assertTransition so every state write is validated against the SSOT
-  // transition table without changing behavior. See PeerLinkStateMachine.
+  // #commitSession (and the acceptInvite/reject updates) via assertTransition so
+  // every state write is validated against the SSOT transition table without
+  // changing behavior. See PeerLinkStateMachine.
   #logIllegalTransition(result, peerLinkId) {
     // eslint-disable-next-line no-console
     console.warn(
@@ -328,10 +339,9 @@ export class PeerLinkService {
     });
   }
 
-  // X3DH responder derivation — the body shared by handleIncomingHandshakePacket
-  // and handleRehandshakeResponse. Completes the invite handshake against our
-  // stored pre-key state and returns the secured channel manager (the caller
-  // persists it via #commitSession).
+  // X3DH responder derivation used by handleIncomingHandshakePacket. Completes
+  // the invite handshake against our stored pre-key state and returns the secured
+  // channel manager (the caller persists it via #commitSession).
   async #establishAsResponder({ ownerAccountId, preKeyState, handshakeData, peerId }) {
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const remote = requireId(peerId, "peerId");
@@ -443,10 +453,20 @@ export class PeerLinkService {
       atMs: now,
     });
 
-    // 6. A successful establish clears stale decrypt/recovery accounting.
+    // 6. A successful establish clears stale decrypt/recovery accounting AND
+    // marks the link healthy (an X3DH establish is authenticated traffic). This
+    // is load-bearing for recovery convergence: when a desynced link is re-keyed
+    // by re-invite, the messages the peer already sent against the OLD (now dead)
+    // session are still buffered and keep failing to decrypt — without this they
+    // would immediately re-arm recovery and the two sides would chase each other
+    // re-keying (the live churn that defeated the first cut). Treating the fresh
+    // session as healthy for HEALTHY_SESSION_DECRYPT_GUARD_MS lets the new session
+    // prove itself (the peer's next real message decrypts) before any residual
+    // miss can trigger another recovery.
     const counterKey = owner + ":" + remote;
     this.#decryptFailureCounts.delete(counterKey);
     this.#anyPeerMissCounts.delete(counterKey);
+    this.#anyPeerLastSuccessAt.set(counterKey, now);
 
     return {
       snapshot: await this._buildSnapshot(nextPeerLinkRecord),
@@ -954,6 +974,9 @@ export class PeerLinkService {
       const successKey = owner + ":" + row.peerAccountId;
       this.#decryptFailureCounts.delete(successKey);
       this.#anyPeerMissCounts.delete(successKey);
+      // Mark the session healthy: it just decrypted authenticated traffic. Used
+      // to refuse a destructive re-handshake armed by undecryptable noise.
+      this.#anyPeerLastSuccessAt.set(successKey, this.clock());
 
       const nextSessionStatus = sessionStatus === "pending_remote_confirm" ? "active" : sessionStatus;
       // First successful trial decrypt confirms the session — route that
@@ -1011,15 +1034,23 @@ export class PeerLinkService {
     // ambiguous or zero candidates are left to retry, never guessed.
     const err = new Error("No peer link could decrypt packet");
     err.code = "THREAD_NOT_READY";
+    const nowMs = this.clock();
     err.recoveryCandidates = candidates.map((row) => {
       const key = owner + ":" + row.peerAccountId;
       const misses = (this.#anyPeerMissCounts.get(key) || 0) + 1;
       this.#anyPeerMissCounts.set(key, misses);
+      // Healthy-session guard (Layer 3): if this link successfully decrypted
+      // authenticated traffic within the guard window, the undecryptable packets
+      // are noise/replay — refuse to arm a destructive re-handshake. Protects an
+      // actively-used link from a malicious relay injecting bad packets. A link
+      // with no recent success (idle/genuinely dead) can still recover.
+      const lastSuccessAt = this.#anyPeerLastSuccessAt.get(key) || 0;
+      const sessionHealthy = lastSuccessAt > 0 && (nowMs - lastSuccessAt) < HEALTHY_SESSION_DECRYPT_GUARD_MS;
       return {
         peerAccountId: row.peerAccountId,
         peerLinkId: row.peerLinkId,
         consecutiveMisses: misses,
-        rehandshakeNeeded: misses >= REHANDSHAKE_DECRYPT_FAILURE_THRESHOLD,
+        rehandshakeNeeded: misses >= REHANDSHAKE_DECRYPT_FAILURE_THRESHOLD && !sessionHealthy,
       };
     });
     throw err;
@@ -1055,6 +1086,16 @@ export class PeerLinkService {
     const resolvedBindingTarget = nonEmpty(peerInboxId)
       || nonEmpty(this.inviteBinding && this.inviteBinding.capabilityId)
       || nonEmpty(this.inviteBinding && this.inviteBinding.mailboxId);
+    // Fail loud: an invite with no reply binding is ALWAYS broken — the acceptor
+    // has nowhere to route the handshake back, so acceptInvite degrades. Rather
+    // than silently emit one, require the binding to resolve (from the service's
+    // configured inviteBinding or an explicit peerInboxId override). This turns a
+    // forgotten anchor into an immediate, attributable error at construction time.
+    if (!resolvedBindingTarget) {
+      const err = new Error("createInvite requires a reply binding: configure PeerLinkService inviteBinding (capabilityId/mailboxId) or pass peerInboxId");
+      err.code = "INVITE_BINDING_REQUIRED";
+      throw err;
+    }
     const inviteBindingState = await x3dh.prepareInviteBinding({
       accountId: owner,
       identityKeyPair,
@@ -1233,6 +1274,7 @@ export class PeerLinkService {
     acceptorDisplayName = null,
     sendHandshake = null,
     senderInboxId = null,
+    forceReestablish = false,
   } = {}) {
     const acceptor = requireId(acceptorAccountId, "acceptorAccountId");
     if (!envelopeArg || typeof envelopeArg !== "object") {
@@ -1275,8 +1317,19 @@ export class PeerLinkService {
     // the same inviter must re-drive the handshake by reusing this record
     // rather than short-circuiting as idempotent. Live or establishing links
     // (accept_committed / handshake_sent / handshake_received /
-    // session_established / degraded / rehandshake_requested) stay idempotent.
-    const reattempt = Boolean(existing) && (existing.state === "rejected" || existing.state === "failed");
+    // session_established / degraded) normally stay idempotent.
+    //
+    // `forceReestablish` (used by automated link RECOVERY — re-inviting a known
+    // contact whose ratchet desynced) opts an established link into the reattempt
+    // path so a fresh X3DH session replaces the broken one. It re-keys the SAME
+    // peerLinkId and overwrites the SAME session row (see existingSessionForCommit
+    // below) — history is untouched (messages persist independently of the
+    // ratchet). Only `invite_issued` (a not-yet-accepted link) is excluded.
+    const reattempt = Boolean(existing) && (
+      existing.state === "rejected"
+      || existing.state === "failed"
+      || (forceReestablish === true && existing.state !== "invite_issued")
+    );
     if (existing && !reattempt) {
       // Peer-link records are pure cryptographic channels; they carry no
       // group context. Group membership is signaled by the chat-layer
@@ -1434,6 +1487,15 @@ export class PeerLinkService {
     // confirm) through the single #commitSession path. The peer-link stays in
     // accept_committed here (a self-transition); the send branches below drive
     // it to handshake_sent / degraded / session_established.
+    //
+    // On a reattempt that re-establishes an EXISTING session (forceReestablish
+    // recovery of a live link), reuse the current session row so the fresh
+    // ratchet OVERWRITES it in place rather than leaving the old row orphaned in
+    // the store. For rejected/failed reattempts the session was already removed,
+    // so getByPeerLinkId returns null and a new row is minted as before.
+    const existingSessionForCommit = reattempt
+      ? await this.peerLinkStorage.sessions.getByPeerLinkId(acceptor, peerLinkId)
+      : null;
     const commit = await this.#commitSession({
       ownerAccountId: acceptor,
       peerLinkRecord,
@@ -1441,6 +1503,8 @@ export class PeerLinkService {
       secureChannelManager,
       sessionStatus: SESSION_STATUS.PENDING_REMOTE_CONFIRM,
       peerLinkState: PEER_LINK_STATE.ACCEPT_COMMITTED,
+      existingSession: existingSessionForCommit,
+      resetSessionCreatedAt: reattempt,
       eventType: "handshake_pending",
       eventSummary: "Handshake state created",
       eventDetails: { inviteId: envelope.inviteId },
@@ -2131,687 +2195,4 @@ export class PeerLinkService {
     return { items };
   }
 
-  /**
-   * Request a re-handshake with a peer whose ratchet state has desynchronized.
-   * Generates a fresh X3DH pre-key bundle and sends it to the peer so they can
-   * act as the X3DH initiator and establish a new session.
-   *
-   * @param {{ ownerAccountId?: string, peerAccountId: string, senderInboxId: string }} opts
-   * @returns {{ requestId: string, snapshot: object, event: object|null }}
-   */
-  async requestRehandshake({
-    ownerAccountId = this.ownerAccountId,
-    peerAccountId,
-    senderInboxId,
-  } = {}) {
-    const owner = requireId(ownerAccountId, "ownerAccountId");
-    const remote = requireId(peerAccountId, "peerAccountId");
-    const resolvedSenderInboxId = requireId(senderInboxId, "senderInboxId");
-
-    const peerLinkRecord = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
-    if (!peerLinkRecord) {
-      const err = new Error("No peer link exists for re-handshake");
-      err.code = "PEER_LINK_NOT_FOUND";
-      throw err;
-    }
-
-    // Generate fresh pre-key bundle.
-    const secureChannelManager = this._createSecureChannelManager();
-    const x3dh = new X3DHKeyExchange({ secureChannelManager });
-    const { keyPair: identityKeyPair, identityDhKeyPair, accountBinding } = await this._requireBoundX3dhIdentity(owner);
-    const inviteBindingState = await x3dh.prepareInviteBinding({
-      accountId: owner,
-      identityKeyPair,
-      identityDhKeyPair,
-      accountBinding,
-      existingBinding: {},
-    });
-
-    // Store the pre-key state so we can complete the handshake when the response arrives.
-    const requestId = randomUUID();
-    const preKeyStorageKey = "peer-link:rehandshake-prekey:" + owner + ":" + requestId;
-    await this.kv.set(preKeyStorageKey, JSON.stringify(inviteBindingState.preKeyState));
-
-    // Build the re-handshake request record.
-    const bundleJson = inviteBindingState.binding.x3dh;
-    const request = new E2eeRehandshakeRequestV1({
-      requestId,
-      senderAccountId: owner,
-      senderInboxId: resolvedSenderInboxId,
-      bundleJson,
-    });
-
-    // Mark the peer link as "rehandshake_requested".
-    const nowMs = this.clock();
-    this.#checkPeerLinkTransition(peerLinkRecord.state, PEER_LINK_STATE.REHANDSHAKE_REQUESTED, peerLinkRecord.peerLinkId);
-    const updatedRecord = await this.peerLinkStorage.peerLinks.update({
-      ...peerLinkRecord,
-      state: PEER_LINK_STATE.REHANDSHAKE_REQUESTED,
-      lastStateChangeAtMs: nowMs,
-      lastErrorCode: "RATCHET_DESYNC",
-      lastErrorMessage: "Re-handshake requested due to decrypt failures",
-    }, peerLinkRecord.version);
-
-    // Reset decrypt failure counter since we're handling it.
-    this.#decryptFailureCounts.delete(owner + ":" + remote);
-
-    const eventRecord = await this._appendPeerLinkEvent({
-      ownerAccountId: owner,
-      peerLinkId: peerLinkRecord.peerLinkId,
-      type: "rehandshake_requested",
-      summary: "Re-handshake requested — ratchet desync detected",
-      details: {
-        requestId,
-        peerAccountId: remote,
-      },
-      atMs: nowMs,
-    });
-
-    return {
-      requestId,
-      rehandshakeRecord: request,
-      snapshot: await this._buildSnapshot(updatedRecord),
-      event: eventRecord,
-    };
-  }
-
-  /**
-   * Handle an incoming re-handshake request from a peer whose ratchet state
-   * has desynchronized. Acts as the X3DH initiator using the peer's fresh
-   * pre-key bundle, then sends a standard handshake packet back.
-   *
-   * @param {{ ownerAccountId?: string, requestId: string, senderAccountId: string, senderInboxId: string, bundleJson: object }} opts
-   * @returns {{ snapshot: object, event: object|null, handshakePacket: E2eeHandshakePacketV1, deliverInboxId: string }|null}
-   *   `handshakePacket` is an on-wire record — call `.toBytes()` before dispatch.
-   */
-  async handleIncomingRehandshake({
-    ownerAccountId = this.ownerAccountId,
-    requestId,
-    senderAccountId,
-    senderInboxId,
-    bundleJson,
-  } = {}) {
-    const owner = requireId(ownerAccountId, "ownerAccountId");
-    const remote = requireId(senderAccountId, "senderAccountId");
-    requireId(requestId, "requestId");
-    requireId(senderInboxId, "senderInboxId");
-    if (!bundleJson || typeof bundleJson !== "object") {
-      throw new Error("handleIncomingRehandshake requires bundleJson object");
-    }
-
-    const peerLinkRecord = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
-    if (!peerLinkRecord) {
-      // No existing peer link — cannot re-handshake with unknown peer.
-      return null;
-    }
-
-    // Act as X3DH initiator using the requestor's fresh pre-key bundle.
-    const secureChannelManager = this._createSecureChannelManager();
-    const x3dh = new X3DHKeyExchange({ secureChannelManager });
-    const bundle = X3DHKeyExchange.deserializeBundle(bundleJson);
-    const {
-      keyPair: ownerSigningKeyPair,
-      identityDhKeyPair: ownerIdentityDhKeyPair,
-      identityDhSignature: ownerIdentityDhSignature,
-      accountBinding: ownerAccountBinding,
-    } = await this._requireBoundX3dhIdentity(owner);
-    const { handshakeData } = await secureChannelManager.establishInitiatorSession({
-      peerId: remote,
-      receiverBundle: bundle,
-      initiatorIdentityKeyPair: ownerSigningKeyPair,
-      initiatorIdentityDhKeyPair: ownerIdentityDhKeyPair,
-      initiatorIdentityDhSignature: ownerIdentityDhSignature,
-    });
-    // Replace the existing session with the freshly-derived one through the
-    // single #commitSession writer. createdAtMs is reset (a brand-new session).
-    const nowMs = this.clock();
-    const existingSession = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, peerLinkRecord.peerLinkId);
-    const commit = await this.#commitSession({
-      ownerAccountId: owner,
-      peerLinkRecord,
-      peerAccountId: remote,
-      secureChannelManager,
-      sessionStatus: SESSION_STATUS.ACTIVE,
-      peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
-      existingSession,
-      resetSessionCreatedAt: true,
-      peerInboxId: senderInboxId,
-      eventType: "rehandshake_completed",
-      eventSummary: "Re-handshake completed — new session established",
-      eventDetails: { requestId },
-      atMs: nowMs,
-    });
-    const updatedRecord = commit.peerLinkRecord;
-    const eventRecord = commit.event;
-
-    // Build the handshake packet to send back. The receiver identifies the
-    // sender via the signed handshake (senderIdentitySigningPubKeyB64 +
-    // senderAccountBinding); we do not transmit senderAccountId as
-    // plaintext anymore.
-    const rehandshakeHandshakeData = {
-      ...handshakeData,
-      inviteId: requestId,
-      senderInboxId: nonEmpty(peerLinkRecord.peerInboxId) || null,
-      senderAccountBinding: ownerAccountBinding ? cloneJson(ownerAccountBinding) : null,
-      ackNonce: randomUUID(),
-      rehandshakeRequestId: requestId,
-      createdAtMs: nowMs,
-    };
-    if (!rehandshakeHandshakeData.senderAccountBinding) {
-      const err = new Error("rehandshake responder missing accountBinding");
-      err.code = "REAUTH_REQUIRED";
-      throw err;
-    }
-    const rehandshakeSignatureB64 = await signHandshakeEnvelope({
-      handshake: rehandshakeHandshakeData,
-      crypto: this.cryptoProvider,
-      signingPrivateKey: ownerSigningKeyPair.privateKey,
-    });
-    const handshakePacket = E2eePacketCodec.createHandshakePacket({
-      handshakeData: rehandshakeHandshakeData,
-      signatureB64: rehandshakeSignatureB64,
-    });
-
-    return {
-      snapshot: await this._buildSnapshot(updatedRecord),
-      event: eventRecord,
-      handshakePacket,
-      deliverInboxId: senderInboxId,
-    };
-  }
-
-  /**
-   * Handle the handshake response to a re-handshake request we initiated.
-   * Called when we receive a handshake packet whose handshakeData contains
-   * a `rehandshakeRequestId` matching one of our pending requests.
-   *
-   * The packet bytes are the raw bytes of the on-wire E2eeHandshakePacketV1
-   * (wire type `x3dh.handshake.v2`). This method verifies the envelope
-   * signature, the sender's account binding, and derives `peerAccountId`
-   * from the verified pubkey — no plaintext trust.
-   *
-   * @param {{ ownerAccountId?: string, packetBytes: Uint8Array }} opts
-   * @returns {{ snapshot: object, event: object|null }|null}
-   */
-  async handleRehandshakeResponse({
-    ownerAccountId = this.ownerAccountId,
-    packetBytes,
-  } = {}) {
-    const owner = requireId(ownerAccountId, "ownerAccountId");
-    if (!(packetBytes instanceof Uint8Array) || packetBytes.length === 0) {
-      throw new Error("handleRehandshakeResponse requires packetBytes Uint8Array");
-    }
-    const packetText = new TextDecoder().decode(packetBytes);
-    const packet = JSON.parse(packetText);
-    if (!packet || typeof packet !== "object" || Array.isArray(packet)
-      || Object.hasOwn(packet, "__proto__") || Object.hasOwn(packet, "constructor") || Object.hasOwn(packet, "prototype")) {
-      return null;
-    }
-    if (packet.e2ee !== 1 || packet.type !== "x3dh.handshake.v2" || !packet.handshake || typeof packet.handshake !== "object") {
-      return null;
-    }
-    if (typeof packet.signatureB64 !== "string" || packet.signatureB64.length === 0) {
-      const err = new Error("Rehandshake response missing signatureB64");
-      err.code = "HANDSHAKE_SIGNATURE_INVALID";
-      throw err;
-    }
-    const handshakeData = cloneJson(packet.handshake);
-    const envelopeVerified = await verifyHandshakeEnvelope({
-      handshake: handshakeData,
-      signatureB64: packet.signatureB64,
-      crypto: this.cryptoProvider,
-    });
-    if (!envelopeVerified) {
-      const err = new Error("Rehandshake response envelope signature did not verify");
-      err.code = "HANDSHAKE_SIGNATURE_INVALID";
-      throw err;
-    }
-    const senderBinding = handshakeData.senderAccountBinding;
-    if (!senderBinding || typeof senderBinding !== "object") {
-      const err = new Error("Rehandshake response missing senderAccountBinding");
-      err.code = "HANDSHAKE_AUTH_FAILED";
-      throw err;
-    }
-    if (nonEmpty(senderBinding.x3dhIdentityPublicKeyB64) !== nonEmpty(handshakeData.senderIdentitySigningPubKeyB64)) {
-      const err = new Error("Rehandshake response account binding does not cover the X3DH identity that signed the envelope");
-      err.code = "HANDSHAKE_AUTH_FAILED";
-      throw err;
-    }
-    const remote = deriveAccountIdFromPublicKey(base64ToBytes(nonEmpty(senderBinding.accountIdentityPublicKeyB64)));
-    await this._verifyInviteX3dhBinding({
-      ownerAccountId: remote,
-      inviteBinding: {
-        x3dh: {
-          accountIdentityPublicKeyB64: nonEmpty(senderBinding.accountIdentityPublicKeyB64),
-          accountBindingSigB64: nonEmpty(senderBinding.accountBindingSigB64),
-          identitySigningPublicKeyB64: nonEmpty(senderBinding.x3dhIdentityPublicKeyB64),
-          accountBindingExpiresAtMs: Number(senderBinding.expiresAtMs),
-          accountBindingIssuedAtMs: Number(senderBinding.issuedAtMs),
-        },
-      },
-    });
-    const requestId = requireId(handshakeData.rehandshakeRequestId, "rehandshakeRequestId");
-
-    // Look up the stored pre-key state for this request.
-    const preKeyStorageKey = "peer-link:rehandshake-prekey:" + owner + ":" + requestId;
-    const preKeyStateJson = await this.kv.get(preKeyStorageKey);
-    if (!preKeyStateJson) {
-      // Unknown request ID — may be stale or already completed.
-      return null;
-    }
-    const preKeyState = JSON.parse(preKeyStateJson);
-
-    const peerLinkRecord = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
-    if (!peerLinkRecord) {
-      return null;
-    }
-
-    // Act as X3DH responder using our stored pre-key state, then persist the
-    // re-established session through the single #commitSession writer. peerInboxId
-    // is left unchanged (the responder keeps its existing routing). createdAtMs
-    // is reset (a brand-new session).
-    const { secureChannelManager } = await this.#establishAsResponder({
-      ownerAccountId: owner,
-      preKeyState,
-      handshakeData,
-      peerId: remote,
-    });
-    const nowMs = this.clock();
-    const existingSession = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, peerLinkRecord.peerLinkId);
-    const commit = await this.#commitSession({
-      ownerAccountId: owner,
-      peerLinkRecord,
-      peerAccountId: remote,
-      secureChannelManager,
-      sessionStatus: SESSION_STATUS.ACTIVE,
-      peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
-      existingSession,
-      resetSessionCreatedAt: true,
-      eventType: "rehandshake_response_completed",
-      eventSummary: "Re-handshake response processed — session re-established",
-      eventDetails: { requestId },
-      atMs: nowMs,
-    });
-
-    // Clean up the stored pre-key state.
-    await this.kv.delete(preKeyStorageKey);
-
-    return {
-      snapshot: commit.snapshot,
-      event: commit.event,
-    };
-  }
-
-  /**
-   * Request a peer-link INTRODUCTION with a co-member we have no link to yet.
-   *
-   * Unlike requestRehandshake (which needs an existing, desynced link), this is
-   * the bootstrap for two group members who never invited each other: it creates
-   * the local peer-link record if absent, generates a fresh X3DH pre-key bundle,
-   * and returns an E2eeIntroductionRequestV1 to be sent UNSEALED to the peer's
-   * inbox. The peer — after a co-membership authorization check applied at the
-   * chat-server layer — acts as the X3DH initiator and sends a standard handshake
-   * back, which we complete via handleIntroductionResponse. Same X3DH/establish
-   * machinery as rehandshake; only the trigger and trust model differ.
-   *
-   * Idempotent: if an established session already exists, returns it and emits
-   * no request packet (alreadyLinked=true, introductionRecord=null).
-   *
-   * @param {{ ownerAccountId?: string, peerAccountId: string, peerInboxId: string, senderInboxId: string }} opts
-   * @returns {{ introductionId: string|null, introductionRecord: object|null, snapshot: object, event: object|null, alreadyLinked: boolean }}
-   */
-  async requestPeerLinkIntroduction({
-    ownerAccountId = this.ownerAccountId,
-    peerAccountId,
-    peerInboxId,
-    senderInboxId,
-  } = {}) {
-    const owner = requireId(ownerAccountId, "ownerAccountId");
-    const remote = requireId(peerAccountId, "peerAccountId");
-    const resolvedPeerInboxId = requireId(peerInboxId, "peerInboxId");
-    const resolvedSenderInboxId = requireId(senderInboxId, "senderInboxId");
-
-    const existing = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
-    if (existing && existing.state === PEER_LINK_STATE.SESSION_ESTABLISHED) {
-      // Already meshed with this peer — nothing to do.
-      return {
-        introductionId: null,
-        introductionRecord: null,
-        snapshot: await this._buildSnapshot(existing),
-        event: null,
-        alreadyLinked: true,
-      };
-    }
-
-    // Generate a fresh pre-key bundle (identical machinery to requestRehandshake).
-    const secureChannelManager = this._createSecureChannelManager();
-    const x3dh = new X3DHKeyExchange({ secureChannelManager });
-    const { keyPair: identityKeyPair, identityDhKeyPair, accountBinding } = await this._requireBoundX3dhIdentity(owner);
-    const inviteBindingState = await x3dh.prepareInviteBinding({
-      accountId: owner,
-      identityKeyPair,
-      identityDhKeyPair,
-      accountBinding,
-      existingBinding: {},
-    });
-
-    // Persist the pre-key state so handleIntroductionResponse can complete X3DH.
-    const introductionId = randomUUID();
-    const preKeyStorageKey = "peer-link:introduction-prekey:" + owner + ":" + introductionId;
-    await this.kv.set(preKeyStorageKey, JSON.stringify(inviteBindingState.preKeyState));
-
-    const bundleJson = inviteBindingState.binding.x3dh;
-    const request = new E2eeIntroductionRequestV1({
-      introductionId,
-      senderAccountId: owner,
-      senderInboxId: resolvedSenderInboxId,
-      bundleJson,
-    });
-
-    // Create (or move) the peer-link record into the awaiting-response state.
-    // REHANDSHAKE_REQUESTED is reused deliberately: it is the "bundle sent, await
-    // handshake back" pending state and (unlike handshake_sent) carries no 5-min
-    // auto-expiry, which matches the introduction request/response mechanism.
-    const nowMs = this.clock();
-    let pendingRecord;
-    if (existing) {
-      this.#checkPeerLinkTransition(existing.state, PEER_LINK_STATE.REHANDSHAKE_REQUESTED, existing.peerLinkId);
-      pendingRecord = await this.peerLinkStorage.peerLinks.update({
-        ...existing,
-        state: PEER_LINK_STATE.REHANDSHAKE_REQUESTED,
-        peerInboxId: nonEmpty(resolvedPeerInboxId) || existing.peerInboxId,
-        lastStateChangeAtMs: nowMs,
-        lastErrorCode: null,
-        lastErrorMessage: null,
-      }, existing.version);
-    } else {
-      pendingRecord = await this.peerLinkStorage.peerLinks.create({
-        peerLinkId: stableId("pl"),
-        localAccountId: owner,
-        peerAccountId: remote,
-        state: PEER_LINK_STATE.REHANDSHAKE_REQUESTED,
-        activeInviteId: null,
-        activeSessionId: null,
-        peerInboxId: resolvedPeerInboxId,
-        lastStateChangeAtMs: nowMs,
-        lastErrorCode: null,
-        lastErrorMessage: null,
-        version: 1,
-      });
-    }
-
-    const eventRecord = await this._appendPeerLinkEvent({
-      ownerAccountId: owner,
-      peerLinkId: pendingRecord.peerLinkId,
-      type: "introduction_requested",
-      summary: "Peer-link introduction requested — co-member mesh bootstrap",
-      details: {
-        introductionId,
-        peerAccountId: remote,
-      },
-      atMs: nowMs,
-    });
-
-    return {
-      introductionId,
-      introductionRecord: request,
-      snapshot: await this._buildSnapshot(pendingRecord),
-      event: eventRecord,
-      alreadyLinked: false,
-    };
-  }
-
-  /**
-   * Handle an incoming peer-link introduction from a co-member we may have no
-   * link to. Mirrors handleIncomingRehandshake (acts as X3DH initiator off the
-   * sender's bundle and returns a handshake to send back) but CREATES the local
-   * peer-link record when none exists, since the two members never invited each
-   * other. The handshake response is tagged with `introductionId` so the
-   * originator routes it to handleIntroductionResponse.
-   *
-   * Co-membership authorization is enforced by the caller (chat-server) BEFORE
-   * invoking this method — the SDK stays crypto-only and group-unaware.
-   *
-   * @param {{ ownerAccountId?: string, ownerInboxId?: string, introductionId: string, senderAccountId: string, senderInboxId: string, bundleJson: object }} opts
-   * @returns {{ snapshot: object, event: object|null, handshakePacket: E2eeHandshakePacketV1, deliverInboxId: string }|null}
-   *   `handshakePacket` is an on-wire record — call `.toBytes()` before dispatch.
-   */
-  async handleIncomingIntroduction({
-    ownerAccountId = this.ownerAccountId,
-    ownerInboxId,
-    introductionId,
-    senderAccountId,
-    senderInboxId,
-    bundleJson,
-  } = {}) {
-    const owner = requireId(ownerAccountId, "ownerAccountId");
-    const remote = requireId(senderAccountId, "senderAccountId");
-    requireId(introductionId, "introductionId");
-    requireId(senderInboxId, "senderInboxId");
-    if (!bundleJson || typeof bundleJson !== "object") {
-      throw new Error("handleIncomingIntroduction requires bundleJson object");
-    }
-
-    // Idempotency: a duplicate/late introduction must not tear down a live
-    // session — if we are already established with this peer, ignore it.
-    const existing = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
-    if (existing && existing.state === PEER_LINK_STATE.SESSION_ESTABLISHED) {
-      return null;
-    }
-
-    // Act as X3DH initiator using the sender's fresh pre-key bundle.
-    const secureChannelManager = this._createSecureChannelManager();
-    const x3dh = new X3DHKeyExchange({ secureChannelManager });
-    const bundle = X3DHKeyExchange.deserializeBundle(bundleJson);
-    const {
-      keyPair: ownerSigningKeyPair,
-      identityDhKeyPair: ownerIdentityDhKeyPair,
-      identityDhSignature: ownerIdentityDhSignature,
-      accountBinding: ownerAccountBinding,
-    } = await this._requireBoundX3dhIdentity(owner);
-    const { handshakeData } = await secureChannelManager.establishInitiatorSession({
-      peerId: remote,
-      receiverBundle: bundle,
-      initiatorIdentityKeyPair: ownerSigningKeyPair,
-      initiatorIdentityDhKeyPair: ownerIdentityDhKeyPair,
-      initiatorIdentityDhSignature: ownerIdentityDhSignature,
-    });
-
-    const nowMs = this.clock();
-    let peerLinkRecord = existing;
-    if (!peerLinkRecord) {
-      peerLinkRecord = await this.peerLinkStorage.peerLinks.create({
-        peerLinkId: stableId("pl"),
-        localAccountId: owner,
-        peerAccountId: remote,
-        state: PEER_LINK_STATE.HANDSHAKE_RECEIVED,
-        activeInviteId: null,
-        activeSessionId: null,
-        peerInboxId: senderInboxId,
-        lastStateChangeAtMs: nowMs,
-        lastErrorCode: null,
-        lastErrorMessage: null,
-        version: 1,
-      });
-    }
-    const existingSession = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, peerLinkRecord.peerLinkId);
-    const commit = await this.#commitSession({
-      ownerAccountId: owner,
-      peerLinkRecord,
-      peerAccountId: remote,
-      secureChannelManager,
-      sessionStatus: SESSION_STATUS.ACTIVE,
-      peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
-      existingSession,
-      resetSessionCreatedAt: true,
-      // Write-once routing: keep an already-recorded inbox over the introduction's
-      // declared one (same no-hijack guard as the handshake path).
-      peerInboxId: nonEmpty(peerLinkRecord.peerInboxId) || senderInboxId,
-      eventType: "introduction_received",
-      eventSummary: "Introduction received and session established",
-      eventDetails: { introductionId },
-      atMs: nowMs,
-    });
-    const updatedRecord = commit.peerLinkRecord;
-    const eventRecord = commit.event;
-
-    // Build the handshake packet to send back, tagged with introductionId. Unlike
-    // the rehandshake path we set senderInboxId to OUR OWN inbox (provided by the
-    // chat-server) so the originator records correct routing for us.
-    const introHandshakeData = {
-      ...handshakeData,
-      inviteId: introductionId,
-      senderInboxId: nonEmpty(ownerInboxId) || nonEmpty(updatedRecord.peerInboxId) || null,
-      senderAccountBinding: ownerAccountBinding ? cloneJson(ownerAccountBinding) : null,
-      ackNonce: randomUUID(),
-      introductionId,
-      createdAtMs: nowMs,
-    };
-    if (!introHandshakeData.senderAccountBinding) {
-      const err = new Error("introduction responder missing accountBinding");
-      err.code = "REAUTH_REQUIRED";
-      throw err;
-    }
-    const introSignatureB64 = await signHandshakeEnvelope({
-      handshake: introHandshakeData,
-      crypto: this.cryptoProvider,
-      signingPrivateKey: ownerSigningKeyPair.privateKey,
-    });
-    const handshakePacket = E2eePacketCodec.createHandshakePacket({
-      handshakeData: introHandshakeData,
-      signatureB64: introSignatureB64,
-    });
-
-    return {
-      snapshot: await this._buildSnapshot(updatedRecord),
-      event: eventRecord,
-      handshakePacket,
-      deliverInboxId: senderInboxId,
-    };
-  }
-
-  /**
-   * Handle the handshake response to an introduction we initiated. Called when we
-   * receive a handshake packet whose handshakeData contains an `introductionId`
-   * matching one of our pending introductions. Mirrors handleRehandshakeResponse:
-   * verifies the envelope + account binding, derives peerAccountId from the
-   * verified key, and completes X3DH as responder using our stored pre-key.
-   *
-   * @param {{ ownerAccountId?: string, packetBytes: Uint8Array }} opts
-   * @returns {{ snapshot: object, event: object|null }|null}
-   */
-  async handleIntroductionResponse({
-    ownerAccountId = this.ownerAccountId,
-    packetBytes,
-  } = {}) {
-    const owner = requireId(ownerAccountId, "ownerAccountId");
-    if (!(packetBytes instanceof Uint8Array) || packetBytes.length === 0) {
-      throw new Error("handleIntroductionResponse requires packetBytes Uint8Array");
-    }
-    const packetText = new TextDecoder().decode(packetBytes);
-    const packet = JSON.parse(packetText);
-    if (!packet || typeof packet !== "object" || Array.isArray(packet)
-      || Object.hasOwn(packet, "__proto__") || Object.hasOwn(packet, "constructor") || Object.hasOwn(packet, "prototype")) {
-      return null;
-    }
-    if (packet.e2ee !== 1 || packet.type !== "x3dh.handshake.v2" || !packet.handshake || typeof packet.handshake !== "object") {
-      return null;
-    }
-    if (typeof packet.signatureB64 !== "string" || packet.signatureB64.length === 0) {
-      const err = new Error("Introduction response missing signatureB64");
-      err.code = "HANDSHAKE_SIGNATURE_INVALID";
-      throw err;
-    }
-    const handshakeData = cloneJson(packet.handshake);
-    const envelopeVerified = await verifyHandshakeEnvelope({
-      handshake: handshakeData,
-      signatureB64: packet.signatureB64,
-      crypto: this.cryptoProvider,
-    });
-    if (!envelopeVerified) {
-      const err = new Error("Introduction response envelope signature did not verify");
-      err.code = "HANDSHAKE_SIGNATURE_INVALID";
-      throw err;
-    }
-    const senderBinding = handshakeData.senderAccountBinding;
-    if (!senderBinding || typeof senderBinding !== "object") {
-      const err = new Error("Introduction response missing senderAccountBinding");
-      err.code = "HANDSHAKE_AUTH_FAILED";
-      throw err;
-    }
-    if (nonEmpty(senderBinding.x3dhIdentityPublicKeyB64) !== nonEmpty(handshakeData.senderIdentitySigningPubKeyB64)) {
-      const err = new Error("Introduction response account binding does not cover the X3DH identity that signed the envelope");
-      err.code = "HANDSHAKE_AUTH_FAILED";
-      throw err;
-    }
-    const remote = deriveAccountIdFromPublicKey(base64ToBytes(nonEmpty(senderBinding.accountIdentityPublicKeyB64)));
-    await this._verifyInviteX3dhBinding({
-      ownerAccountId: remote,
-      inviteBinding: {
-        x3dh: {
-          accountIdentityPublicKeyB64: nonEmpty(senderBinding.accountIdentityPublicKeyB64),
-          accountBindingSigB64: nonEmpty(senderBinding.accountBindingSigB64),
-          identitySigningPublicKeyB64: nonEmpty(senderBinding.x3dhIdentityPublicKeyB64),
-          accountBindingExpiresAtMs: Number(senderBinding.expiresAtMs),
-          accountBindingIssuedAtMs: Number(senderBinding.issuedAtMs),
-        },
-      },
-    });
-    const introductionId = requireId(handshakeData.introductionId, "introductionId");
-
-    // Look up the stored pre-key state for this introduction.
-    const preKeyStorageKey = "peer-link:introduction-prekey:" + owner + ":" + introductionId;
-    const preKeyStateJson = await this.kv.get(preKeyStorageKey);
-    if (!preKeyStateJson) {
-      // Unknown introduction ID — may be stale or already completed.
-      return null;
-    }
-    const preKeyState = JSON.parse(preKeyStateJson);
-
-    const peerLinkRecord = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
-    if (!peerLinkRecord) {
-      return null;
-    }
-    // A duplicate/late response after we already established is a no-op.
-    if (peerLinkRecord.state === PEER_LINK_STATE.SESSION_ESTABLISHED) {
-      await this.kv.delete(preKeyStorageKey);
-      return {
-        snapshot: await this._buildSnapshot(peerLinkRecord),
-        event: null,
-      };
-    }
-
-    // Act as X3DH responder using our stored pre-key state, then persist the
-    // established session through the single #commitSession writer.
-    const { secureChannelManager } = await this.#establishAsResponder({
-      ownerAccountId: owner,
-      preKeyState,
-      handshakeData,
-      peerId: remote,
-    });
-    const nowMs = this.clock();
-    const existingSession = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, peerLinkRecord.peerLinkId);
-    const commit = await this.#commitSession({
-      ownerAccountId: owner,
-      peerLinkRecord,
-      peerAccountId: remote,
-      secureChannelManager,
-      sessionStatus: SESSION_STATUS.ACTIVE,
-      peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
-      existingSession,
-      resetSessionCreatedAt: true,
-      eventType: "introduction_response_completed",
-      eventSummary: "Introduction response processed — session established",
-      eventDetails: { introductionId },
-      atMs: nowMs,
-    });
-
-    // Clean up the stored pre-key state.
-    await this.kv.delete(preKeyStorageKey);
-
-    return {
-      snapshot: commit.snapshot,
-      event: commit.event,
-    };
-  }
 }

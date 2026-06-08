@@ -66,7 +66,6 @@ export {
   E2eeDeliveryAckV1,
   E2eeHandshakeAckV1,
   E2eeHandshakeRejectV1,
-  E2eeRehandshakeRequestV1,
 } from "../e2ee/index.js";
 export { REZ_CONTRACT_TYPES } from "../contracts/index.js";
 export {
