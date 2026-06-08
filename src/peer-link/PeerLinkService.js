@@ -4,6 +4,7 @@ import {
   E2eeHandshakeRejectV1,
   E2eePacketCodec,
   E2eeRehandshakeRequestV1,
+  E2eeIntroductionRequestV1,
   SecureChannelManager,
   X3DHKeyExchange,
   base64ToBytes,
@@ -2428,6 +2429,378 @@ export class PeerLinkService {
       eventType: "rehandshake_response_completed",
       eventSummary: "Re-handshake response processed — session re-established",
       eventDetails: { requestId },
+      atMs: nowMs,
+    });
+
+    // Clean up the stored pre-key state.
+    await this.kv.delete(preKeyStorageKey);
+
+    return {
+      snapshot: commit.snapshot,
+      event: commit.event,
+    };
+  }
+
+  /**
+   * Request a peer-link INTRODUCTION with a co-member we have no link to yet.
+   *
+   * Unlike requestRehandshake (which needs an existing, desynced link), this is
+   * the bootstrap for two group members who never invited each other: it creates
+   * the local peer-link record if absent, generates a fresh X3DH pre-key bundle,
+   * and returns an E2eeIntroductionRequestV1 to be sent UNSEALED to the peer's
+   * inbox. The peer — after a co-membership authorization check applied at the
+   * chat-server layer — acts as the X3DH initiator and sends a standard handshake
+   * back, which we complete via handleIntroductionResponse. Same X3DH/establish
+   * machinery as rehandshake; only the trigger and trust model differ.
+   *
+   * Idempotent: if an established session already exists, returns it and emits
+   * no request packet (alreadyLinked=true, introductionRecord=null).
+   *
+   * @param {{ ownerAccountId?: string, peerAccountId: string, peerInboxId: string, senderInboxId: string }} opts
+   * @returns {{ introductionId: string|null, introductionRecord: object|null, snapshot: object, event: object|null, alreadyLinked: boolean }}
+   */
+  async requestPeerLinkIntroduction({
+    ownerAccountId = this.ownerAccountId,
+    peerAccountId,
+    peerInboxId,
+    senderInboxId,
+  } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const remote = requireId(peerAccountId, "peerAccountId");
+    const resolvedPeerInboxId = requireId(peerInboxId, "peerInboxId");
+    const resolvedSenderInboxId = requireId(senderInboxId, "senderInboxId");
+
+    const existing = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
+    if (existing && existing.state === PEER_LINK_STATE.SESSION_ESTABLISHED) {
+      // Already meshed with this peer — nothing to do.
+      return {
+        introductionId: null,
+        introductionRecord: null,
+        snapshot: await this._buildSnapshot(existing),
+        event: null,
+        alreadyLinked: true,
+      };
+    }
+
+    // Generate a fresh pre-key bundle (identical machinery to requestRehandshake).
+    const secureChannelManager = this._createSecureChannelManager();
+    const x3dh = new X3DHKeyExchange({ secureChannelManager });
+    const { keyPair: identityKeyPair, identityDhKeyPair, accountBinding } = await this._requireBoundX3dhIdentity(owner);
+    const inviteBindingState = await x3dh.prepareInviteBinding({
+      accountId: owner,
+      identityKeyPair,
+      identityDhKeyPair,
+      accountBinding,
+      existingBinding: {},
+    });
+
+    // Persist the pre-key state so handleIntroductionResponse can complete X3DH.
+    const introductionId = randomUUID();
+    const preKeyStorageKey = "peer-link:introduction-prekey:" + owner + ":" + introductionId;
+    await this.kv.set(preKeyStorageKey, JSON.stringify(inviteBindingState.preKeyState));
+
+    const bundleJson = inviteBindingState.binding.x3dh;
+    const request = new E2eeIntroductionRequestV1({
+      introductionId,
+      senderAccountId: owner,
+      senderInboxId: resolvedSenderInboxId,
+      bundleJson,
+    });
+
+    // Create (or move) the peer-link record into the awaiting-response state.
+    // REHANDSHAKE_REQUESTED is reused deliberately: it is the "bundle sent, await
+    // handshake back" pending state and (unlike handshake_sent) carries no 5-min
+    // auto-expiry, which matches the introduction request/response mechanism.
+    const nowMs = this.clock();
+    let pendingRecord;
+    if (existing) {
+      this.#checkPeerLinkTransition(existing.state, PEER_LINK_STATE.REHANDSHAKE_REQUESTED, existing.peerLinkId);
+      pendingRecord = await this.peerLinkStorage.peerLinks.update({
+        ...existing,
+        state: PEER_LINK_STATE.REHANDSHAKE_REQUESTED,
+        peerInboxId: nonEmpty(resolvedPeerInboxId) || existing.peerInboxId,
+        lastStateChangeAtMs: nowMs,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+      }, existing.version);
+    } else {
+      pendingRecord = await this.peerLinkStorage.peerLinks.create({
+        peerLinkId: stableId("pl"),
+        localAccountId: owner,
+        peerAccountId: remote,
+        state: PEER_LINK_STATE.REHANDSHAKE_REQUESTED,
+        activeInviteId: null,
+        activeSessionId: null,
+        peerInboxId: resolvedPeerInboxId,
+        lastStateChangeAtMs: nowMs,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+        version: 1,
+      });
+    }
+
+    const eventRecord = await this._appendPeerLinkEvent({
+      ownerAccountId: owner,
+      peerLinkId: pendingRecord.peerLinkId,
+      type: "introduction_requested",
+      summary: "Peer-link introduction requested — co-member mesh bootstrap",
+      details: {
+        introductionId,
+        peerAccountId: remote,
+      },
+      atMs: nowMs,
+    });
+
+    return {
+      introductionId,
+      introductionRecord: request,
+      snapshot: await this._buildSnapshot(pendingRecord),
+      event: eventRecord,
+      alreadyLinked: false,
+    };
+  }
+
+  /**
+   * Handle an incoming peer-link introduction from a co-member we may have no
+   * link to. Mirrors handleIncomingRehandshake (acts as X3DH initiator off the
+   * sender's bundle and returns a handshake to send back) but CREATES the local
+   * peer-link record when none exists, since the two members never invited each
+   * other. The handshake response is tagged with `introductionId` so the
+   * originator routes it to handleIntroductionResponse.
+   *
+   * Co-membership authorization is enforced by the caller (chat-server) BEFORE
+   * invoking this method — the SDK stays crypto-only and group-unaware.
+   *
+   * @param {{ ownerAccountId?: string, ownerInboxId?: string, introductionId: string, senderAccountId: string, senderInboxId: string, bundleJson: object }} opts
+   * @returns {{ snapshot: object, event: object|null, handshakePacket: Uint8Array, deliverInboxId: string }|null}
+   */
+  async handleIncomingIntroduction({
+    ownerAccountId = this.ownerAccountId,
+    ownerInboxId,
+    introductionId,
+    senderAccountId,
+    senderInboxId,
+    bundleJson,
+  } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const remote = requireId(senderAccountId, "senderAccountId");
+    requireId(introductionId, "introductionId");
+    requireId(senderInboxId, "senderInboxId");
+    if (!bundleJson || typeof bundleJson !== "object") {
+      throw new Error("handleIncomingIntroduction requires bundleJson object");
+    }
+
+    // Idempotency: a duplicate/late introduction must not tear down a live
+    // session — if we are already established with this peer, ignore it.
+    const existing = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
+    if (existing && existing.state === PEER_LINK_STATE.SESSION_ESTABLISHED) {
+      return null;
+    }
+
+    // Act as X3DH initiator using the sender's fresh pre-key bundle.
+    const secureChannelManager = this._createSecureChannelManager();
+    const x3dh = new X3DHKeyExchange({ secureChannelManager });
+    const bundle = X3DHKeyExchange.deserializeBundle(bundleJson);
+    const {
+      keyPair: ownerSigningKeyPair,
+      identityDhKeyPair: ownerIdentityDhKeyPair,
+      identityDhSignature: ownerIdentityDhSignature,
+      accountBinding: ownerAccountBinding,
+    } = await this._requireBoundX3dhIdentity(owner);
+    const { handshakeData } = await secureChannelManager.establishInitiatorSession({
+      peerId: remote,
+      receiverBundle: bundle,
+      initiatorIdentityKeyPair: ownerSigningKeyPair,
+      initiatorIdentityDhKeyPair: ownerIdentityDhKeyPair,
+      initiatorIdentityDhSignature: ownerIdentityDhSignature,
+    });
+
+    const nowMs = this.clock();
+    let peerLinkRecord = existing;
+    if (!peerLinkRecord) {
+      peerLinkRecord = await this.peerLinkStorage.peerLinks.create({
+        peerLinkId: stableId("pl"),
+        localAccountId: owner,
+        peerAccountId: remote,
+        state: PEER_LINK_STATE.HANDSHAKE_RECEIVED,
+        activeInviteId: null,
+        activeSessionId: null,
+        peerInboxId: senderInboxId,
+        lastStateChangeAtMs: nowMs,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+        version: 1,
+      });
+    }
+    const existingSession = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, peerLinkRecord.peerLinkId);
+    const commit = await this.#commitSession({
+      ownerAccountId: owner,
+      peerLinkRecord,
+      peerAccountId: remote,
+      secureChannelManager,
+      sessionStatus: SESSION_STATUS.ACTIVE,
+      peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
+      existingSession,
+      resetSessionCreatedAt: true,
+      // Write-once routing: keep an already-recorded inbox over the introduction's
+      // declared one (same no-hijack guard as the handshake path).
+      peerInboxId: nonEmpty(peerLinkRecord.peerInboxId) || senderInboxId,
+      eventType: "introduction_received",
+      eventSummary: "Introduction received and session established",
+      eventDetails: { introductionId },
+      atMs: nowMs,
+    });
+    const updatedRecord = commit.peerLinkRecord;
+    const eventRecord = commit.event;
+
+    // Build the handshake packet to send back, tagged with introductionId. Unlike
+    // the rehandshake path we set senderInboxId to OUR OWN inbox (provided by the
+    // chat-server) so the originator records correct routing for us.
+    const introHandshakeData = {
+      ...handshakeData,
+      inviteId: introductionId,
+      senderInboxId: nonEmpty(ownerInboxId) || nonEmpty(updatedRecord.peerInboxId) || null,
+      senderAccountBinding: ownerAccountBinding ? cloneJson(ownerAccountBinding) : null,
+      ackNonce: randomUUID(),
+      introductionId,
+      createdAtMs: nowMs,
+    };
+    if (!introHandshakeData.senderAccountBinding) {
+      const err = new Error("introduction responder missing accountBinding");
+      err.code = "REAUTH_REQUIRED";
+      throw err;
+    }
+    const introSignatureB64 = await signHandshakeEnvelope({
+      handshake: introHandshakeData,
+      crypto: this.cryptoProvider,
+      signingPrivateKey: ownerSigningKeyPair.privateKey,
+    });
+    const handshakePacket = E2eePacketCodec.createHandshakePacket({
+      handshakeData: introHandshakeData,
+      signatureB64: introSignatureB64,
+    });
+
+    return {
+      snapshot: await this._buildSnapshot(updatedRecord),
+      event: eventRecord,
+      handshakePacket,
+      deliverInboxId: senderInboxId,
+    };
+  }
+
+  /**
+   * Handle the handshake response to an introduction we initiated. Called when we
+   * receive a handshake packet whose handshakeData contains an `introductionId`
+   * matching one of our pending introductions. Mirrors handleRehandshakeResponse:
+   * verifies the envelope + account binding, derives peerAccountId from the
+   * verified key, and completes X3DH as responder using our stored pre-key.
+   *
+   * @param {{ ownerAccountId?: string, packetBytes: Uint8Array }} opts
+   * @returns {{ snapshot: object, event: object|null }|null}
+   */
+  async handleIntroductionResponse({
+    ownerAccountId = this.ownerAccountId,
+    packetBytes,
+  } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    if (!(packetBytes instanceof Uint8Array) || packetBytes.length === 0) {
+      throw new Error("handleIntroductionResponse requires packetBytes Uint8Array");
+    }
+    const packetText = new TextDecoder().decode(packetBytes);
+    const packet = JSON.parse(packetText);
+    if (!packet || typeof packet !== "object" || Array.isArray(packet)
+      || Object.hasOwn(packet, "__proto__") || Object.hasOwn(packet, "constructor") || Object.hasOwn(packet, "prototype")) {
+      return null;
+    }
+    if (packet.e2ee !== 1 || packet.type !== "x3dh.handshake.v2" || !packet.handshake || typeof packet.handshake !== "object") {
+      return null;
+    }
+    if (typeof packet.signatureB64 !== "string" || packet.signatureB64.length === 0) {
+      const err = new Error("Introduction response missing signatureB64");
+      err.code = "HANDSHAKE_SIGNATURE_INVALID";
+      throw err;
+    }
+    const handshakeData = cloneJson(packet.handshake);
+    const envelopeVerified = await verifyHandshakeEnvelope({
+      handshake: handshakeData,
+      signatureB64: packet.signatureB64,
+      crypto: this.cryptoProvider,
+    });
+    if (!envelopeVerified) {
+      const err = new Error("Introduction response envelope signature did not verify");
+      err.code = "HANDSHAKE_SIGNATURE_INVALID";
+      throw err;
+    }
+    const senderBinding = handshakeData.senderAccountBinding;
+    if (!senderBinding || typeof senderBinding !== "object") {
+      const err = new Error("Introduction response missing senderAccountBinding");
+      err.code = "HANDSHAKE_AUTH_FAILED";
+      throw err;
+    }
+    if (nonEmpty(senderBinding.x3dhIdentityPublicKeyB64) !== nonEmpty(handshakeData.senderIdentitySigningPubKeyB64)) {
+      const err = new Error("Introduction response account binding does not cover the X3DH identity that signed the envelope");
+      err.code = "HANDSHAKE_AUTH_FAILED";
+      throw err;
+    }
+    const remote = deriveAccountIdFromPublicKey(base64ToBytes(nonEmpty(senderBinding.accountIdentityPublicKeyB64)));
+    await this._verifyInviteX3dhBinding({
+      ownerAccountId: remote,
+      inviteBinding: {
+        x3dh: {
+          accountIdentityPublicKeyB64: nonEmpty(senderBinding.accountIdentityPublicKeyB64),
+          accountBindingSigB64: nonEmpty(senderBinding.accountBindingSigB64),
+          identitySigningPublicKeyB64: nonEmpty(senderBinding.x3dhIdentityPublicKeyB64),
+          accountBindingExpiresAtMs: Number(senderBinding.expiresAtMs),
+          accountBindingIssuedAtMs: Number(senderBinding.issuedAtMs),
+        },
+      },
+    });
+    const introductionId = requireId(handshakeData.introductionId, "introductionId");
+
+    // Look up the stored pre-key state for this introduction.
+    const preKeyStorageKey = "peer-link:introduction-prekey:" + owner + ":" + introductionId;
+    const preKeyStateJson = await this.kv.get(preKeyStorageKey);
+    if (!preKeyStateJson) {
+      // Unknown introduction ID — may be stale or already completed.
+      return null;
+    }
+    const preKeyState = JSON.parse(preKeyStateJson);
+
+    const peerLinkRecord = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
+    if (!peerLinkRecord) {
+      return null;
+    }
+    // A duplicate/late response after we already established is a no-op.
+    if (peerLinkRecord.state === PEER_LINK_STATE.SESSION_ESTABLISHED) {
+      await this.kv.delete(preKeyStorageKey);
+      return {
+        snapshot: await this._buildSnapshot(peerLinkRecord),
+        event: null,
+      };
+    }
+
+    // Act as X3DH responder using our stored pre-key state, then persist the
+    // established session through the single #commitSession writer.
+    const { secureChannelManager } = await this.#establishAsResponder({
+      ownerAccountId: owner,
+      preKeyState,
+      handshakeData,
+      peerId: remote,
+    });
+    const nowMs = this.clock();
+    const existingSession = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, peerLinkRecord.peerLinkId);
+    const commit = await this.#commitSession({
+      ownerAccountId: owner,
+      peerLinkRecord,
+      peerAccountId: remote,
+      secureChannelManager,
+      sessionStatus: SESSION_STATUS.ACTIVE,
+      peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
+      existingSession,
+      resetSessionCreatedAt: true,
+      eventType: "introduction_response_completed",
+      eventSummary: "Introduction response processed — session established",
+      eventDetails: { introductionId },
       atMs: nowMs,
     });
 

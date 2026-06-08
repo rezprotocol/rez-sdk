@@ -7,5 +7,6 @@ export {
   E2eeHandshakeAckV1,
   E2eeHandshakeRejectV1,
   E2eeRehandshakeRequestV1,
+  E2eeIntroductionRequestV1,
 } from "@rezprotocol/core";
 export { BrowserCryptoProvider } from "./BrowserCryptoProvider.js";
