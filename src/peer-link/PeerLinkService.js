@@ -1310,6 +1310,18 @@ export class PeerLinkService {
       throw err;
     }
 
+    // REZ-1 (verify-before-teardown): validate the inviter's X3DH account-binding
+    // BEFORE any peer-link state mutation. A `forceReestablish` recovery re-keys
+    // an EXISTING established link — the reattempt branch below nulls
+    // `activeSessionId` in place. If a forged/expired binding were only caught at
+    // the later derivation step, that teardown would already have destroyed a live
+    // session and the catch path would leave it dead. Verifying here means a
+    // junk-binding recovery invite is rejected with the session still intact.
+    await this._verifyInviteX3dhBinding({
+      ownerAccountId: inviterAccountId,
+      inviteBinding: envelope.binding,
+    });
+
     const existing = await this.peerLinkStorage.peerLinks.getByPair(acceptor, inviterAccountId);
     // A peer-link in a terminal dead state (the inviter rejected the handshake,
     // or a prior handshake send failed) carries no usable session. The store
@@ -1467,10 +1479,7 @@ export class PeerLinkService {
     });
     const secureChannelManager = this._createSecureChannelManager();
     const x3dh = new X3DHKeyExchange({ secureChannelManager });
-    await this._verifyInviteX3dhBinding({
-      ownerAccountId: inviterAccountId,
-      inviteBinding: envelope.binding,
-    });
+    // (X3DH account-binding already verified above, before any link mutation — REZ-1.)
     const {
       keyPair: acceptorIdentityKeyPair,
       identityDhKeyPair: acceptorIdentityDhKeyPair,
@@ -1765,6 +1774,7 @@ export class PeerLinkService {
     // record we cannot enforce, so we proceed and fall back to the old
     // delete-on-first-handshake behaviour.
     let inviteExhausted = !inviteRecord;
+    let alreadyAccepted = false;
     if (inviteRecord) {
       const verdict = await withLock(`${owner}:${inviteId}`, async () => {
         const fresh = await this._getInviteRecord(owner, inviteId);
@@ -1773,7 +1783,7 @@ export class PeerLinkService {
         if (at >= fresh.expiresAtMs) return { action: "reject", reason: "INVITE_EXPIRED" };
         const accepted = Array.isArray(fresh.acceptedAcceptors) ? fresh.acceptedAcceptors : [];
         if (accepted.includes(peerAccountId)) {
-          return { action: "proceed", exhausted: accepted.length >= fresh.maxUses };
+          return { action: "proceed", exhausted: accepted.length >= fresh.maxUses, alreadyAccepted: true };
         }
         if (accepted.length >= fresh.maxUses) return { action: "reject", reason: "INVITE_USED_UP" };
         const nextAccepted = [...accepted, peerAccountId];
@@ -1794,6 +1804,7 @@ export class PeerLinkService {
         };
       }
       inviteExhausted = Boolean(verdict.exhausted);
+      alreadyAccepted = Boolean(verdict.alreadyAccepted);
     }
 
     const preKeyState = await this.peerLinkStorage.keys.getInvitePreKey(owner, inviteId);
@@ -1805,6 +1816,22 @@ export class PeerLinkService {
 
     const nowMs = this.clock();
     const existing = await this.peerLinkStorage.peerLinks.getByPair(owner, peerAccountId);
+    // REZ-6 (handshake-replay guard): a re-delivered handshake from an acceptor we
+    // already accounted for, against a link that is ALREADY session_established, is
+    // a replay — e.g. a relay re-injecting an old handshake deposit. Re-running
+    // X3DH here would reset the live ratchet and desync in-flight messages.
+    // Re-send the ack for convergence but do NOT re-establish. Genuine recovery
+    // always mints a FRESH single-use invite (new inviteId/ackNonce), so a real
+    // recovery handshake never matches this guard.
+    if (alreadyAccepted && existing && existing.state === "session_established") {
+      return {
+        snapshot: await this._buildSnapshot(existing),
+        event: null,
+        ackNonce: nonEmpty(handshakeData.ackNonce) || null,
+        remoteDisplayName,
+        localDisplayName,
+      };
+    }
     let peerLinkRecord = existing;
     if (!peerLinkRecord) {
       peerLinkRecord = await this.peerLinkStorage.peerLinks.create({
