@@ -53,6 +53,15 @@ Canonical lifecycle events are `start`, `ready`, `connect`, `disconnect`, `stop`
 - **Mailbox**: wire/protocol family name; SDK docs should prefer Inbox for app-facing APIs.
 - **Channel**: reserved for `channel.*` protocol contracts.
 
+## Capabilities
+
+Higher-level features are exposed as capabilities on the client facade:
+
+- **WalletCapability** — Service Credit balances and settlement receipts for paid services. The wallet account is the account identity key, stored under its derived `rez:acct:*` form.
+- **HandlesCapability** — claiming and renewing paid `@handles`.
+
+Core messaging is free; paid services settle against Service Credits (off-chain during beta). The REZ token economy these capabilities are structured around is documented in [`rez-contracts`](https://github.com/rezprotocol/rez-contracts).
+
 ## Notes
 
 - Protocol/crypto primitive ownership remains in `@rezprotocol/core`.
@@ -66,6 +75,7 @@ Canonical lifecycle events are `start`, `ready`, `connect`, `disconnect`, `stop`
 - [**rez-node**](https://github.com/rezprotocol/rez-node) — relay node runtime that the SDK connects to
 - [**rez-ui**](https://github.com/rezprotocol/rez-ui) — shared UI framework
 - [**rez-chat**](https://github.com/rezprotocol/rez-chat) — reference desktop chat application
+- [**rez-contracts**](https://github.com/rezprotocol/rez-contracts) — Solidity contract suite for the REZ token economy
 
 For protocol-level documentation (capability model, identifiers, wire contracts, message lifecycle), see [`rez-core/docs/`](https://github.com/rezprotocol/rez-core/tree/main/docs).
 
