@@ -73,4 +73,24 @@ export class MailboxCapability {
     });
     return response && typeof response.body === "object" ? response.body : {};
   }
+
+  /**
+   * Advance this device's durable cursor on the home log (S2). Used ONLY against
+   * a durable-capable node (the `durableInbox` capability is advertised in
+   * `session.ready`); against legacy/fs nodes the client keeps using `ack`
+   * (delete). The cursor advances only when the chat pipeline reports the
+   * deposit `consumed` (decrypt/apply or dedup-hit) — never on receive.
+   */
+  async cursorAck({ mailboxId, deviceId, throughSeq, capChain } = {}) {
+    const body = { mailboxId, deviceId, throughSeq };
+    if (Array.isArray(capChain) && capChain.length > 0) {
+      body.capChain = capChain;
+    }
+    const response = await this.#pool.sendRequest({
+      type: T.MAILBOX_CURSOR_ACK,
+      body,
+      expectedResponseType: T.MAILBOX_CURSOR_ACK_RES,
+    });
+    return response && typeof response.body === "object" ? response.body : {};
+  }
 }
