@@ -80,9 +80,12 @@ export class MailboxCapability {
    * `session.ready`); against legacy/fs nodes the client keeps using `ack`
    * (delete). The cursor advances only when the chat pipeline reports the
    * deposit `consumed` (decrypt/apply or dedup-hit) — never on receive.
+   *
+   * No `deviceId` arg: the cursor's device is the authenticated session, bound
+   * server-side. The response echoes the resolved `deviceId`.
    */
-  async cursorAck({ mailboxId, deviceId, throughSeq, capChain } = {}) {
-    const body = { mailboxId, deviceId, throughSeq };
+  async cursorAck({ mailboxId, throughSeq, capChain } = {}) {
+    const body = { mailboxId, throughSeq };
     if (Array.isArray(capChain) && capChain.length > 0) {
       body.capChain = capChain;
     }
