@@ -180,6 +180,11 @@ class KeyValueSecureSessionStore {
     this.keyValueStore = keyValueStore;
     this.recordPrefix = "peer-link:sessions:";
     this.peerLinkIndexPrefix = "peer-link:sessions:by-peer-link:";
+    // S2.5: per-device session index. A legacy (single-device) session is stored
+    // under the by-peer-link index above; a per-device session (record carries
+    // peerDeviceId) is stored under this index instead, so a peer-link can hold
+    // one session PER peer device without the two clobbering each other.
+    this.peerLinkDeviceIndexPrefix = "peer-link:sessions:by-peer-link-device:";
   }
 
   _recordKey(ownerAccountId, sessionId) {
@@ -192,6 +197,13 @@ class KeyValueSecureSessionStore {
     const owner = assertNonEmptyString(ownerAccountId, "ownerAccountId");
     const normalized = assertNonEmptyString(peerLinkId, "peerLinkId");
     return `${this.peerLinkIndexPrefix}${owner}::${normalized}`;
+  }
+
+  _deviceIndexKey(ownerAccountId, peerLinkId, peerDeviceId) {
+    const owner = assertNonEmptyString(ownerAccountId, "ownerAccountId");
+    const link = assertNonEmptyString(peerLinkId, "peerLinkId");
+    const device = assertNonEmptyString(peerDeviceId, "peerDeviceId");
+    return `${this.peerLinkDeviceIndexPrefix}${owner}::${link}::${device}`;
   }
 
   async getById(ownerAccountId, sessionId) {
@@ -207,11 +219,51 @@ class KeyValueSecureSessionStore {
     return this.getById(ownerAccountId, sessionId);
   }
 
+  // S2.5: resolve the per-device session for (owner, peerLinkId, peerDeviceId).
+  async getByPeerLinkAndDevice(ownerAccountId, peerLinkId, peerDeviceId) {
+    const sessionId = await this.keyValueStore.get(this._deviceIndexKey(ownerAccountId, peerLinkId, peerDeviceId));
+    if (typeof sessionId !== "string" || !sessionId) {
+      return undefined;
+    }
+    return this.getById(ownerAccountId, sessionId);
+  }
+
+  // S2.5: every per-device session under one peer-link, for fan-out trial-decrypt
+  // and the no-cross-advance checks. Scans records (mirrors listRecoverable) and
+  // filters to this owner+link that carry a peerDeviceId. Excludes the legacy
+  // single-device session (no peerDeviceId), which is reached via getByPeerLinkId.
+  async listByPeerLink(ownerAccountId, peerLinkId) {
+    const owner = assertNonEmptyString(ownerAccountId, "ownerAccountId");
+    const link = assertNonEmptyString(peerLinkId, "peerLinkId");
+    const keys = await this.keyValueStore.keys(this.recordPrefix);
+    const out = [];
+    for (const key of keys) {
+      const record = await this.keyValueStore.get(key);
+      if (!record || typeof record !== "object") {
+        continue;
+      }
+      if (record.localAccountId !== owner) {
+        continue;
+      }
+      if (record.peerLinkId !== link) {
+        continue;
+      }
+      const peerDeviceId = typeof record.peerDeviceId === "string" ? record.peerDeviceId.trim() : "";
+      if (!peerDeviceId) {
+        continue;
+      }
+      out.push(cloneJsonValue(record));
+    }
+    out.sort((left, right) => String(left.peerDeviceId || "").localeCompare(String(right.peerDeviceId || "")));
+    return out;
+  }
+
   async put(record) {
     assertRecord(record, "secureSessionRecord");
     const sessionId = assertNonEmptyString(record.sessionId, "sessionId");
     const ownerAccountId = assertNonEmptyString(record.localAccountId, "localAccountId");
     const peerLinkId = assertNonEmptyString(record.peerLinkId, "peerLinkId");
+    const peerDeviceId = typeof record.peerDeviceId === "string" ? record.peerDeviceId.trim() : "";
     const existing = await this.keyValueStore.get(this._recordKey(ownerAccountId, sessionId));
     const nextRecord = cloneJsonValue(record);
     if (existing && typeof existing === "object") {
@@ -220,7 +272,13 @@ class KeyValueSecureSessionStore {
       nextRecord.version = normalizeVersion(record);
     }
     await this.keyValueStore.set(this._recordKey(ownerAccountId, sessionId), nextRecord);
-    await this.keyValueStore.set(this._indexKey(ownerAccountId, peerLinkId), sessionId);
+    if (peerDeviceId) {
+      // Per-device session: index by (peerLinkId, peerDeviceId). Do NOT touch the
+      // legacy by-peer-link index — multiple devices would clobber its single slot.
+      await this.keyValueStore.set(this._deviceIndexKey(ownerAccountId, peerLinkId, peerDeviceId), sessionId);
+    } else {
+      await this.keyValueStore.set(this._indexKey(ownerAccountId, peerLinkId), sessionId);
+    }
     return cloneJsonValue(nextRecord);
   }
 
@@ -233,10 +291,19 @@ class KeyValueSecureSessionStore {
       return false;
     }
     if (existing && typeof existing === "object" && typeof existing.peerLinkId === "string" && existing.peerLinkId) {
-      const indexKey = this._indexKey(owner, existing.peerLinkId);
-      const indexedSessionId = await this.keyValueStore.get(indexKey);
-      if (indexedSessionId === normalizedSessionId) {
-        await this.keyValueStore.delete(indexKey);
+      const existingPeerDeviceId = typeof existing.peerDeviceId === "string" ? existing.peerDeviceId.trim() : "";
+      if (existingPeerDeviceId) {
+        const deviceIndexKey = this._deviceIndexKey(owner, existing.peerLinkId, existingPeerDeviceId);
+        const indexedSessionId = await this.keyValueStore.get(deviceIndexKey);
+        if (indexedSessionId === normalizedSessionId) {
+          await this.keyValueStore.delete(deviceIndexKey);
+        }
+      } else {
+        const indexKey = this._indexKey(owner, existing.peerLinkId);
+        const indexedSessionId = await this.keyValueStore.get(indexKey);
+        if (indexedSessionId === normalizedSessionId) {
+          await this.keyValueStore.delete(indexKey);
+        }
       }
     }
     return true;
