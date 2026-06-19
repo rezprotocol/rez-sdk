@@ -19,6 +19,17 @@ const SESSION_STATUS_ACTIVE = "active";
  * persisting + account-chaining the per-device X3DH identity, and DISCOVERING a
  * peer's device bundles. The per-device X3DH identity keypairs (signing + DH)
  * are passed in by the caller — each bound to a device key per S2.5 decision D-a.
+ *
+ * Record policy (audit P2): this layer invents NO new wire shapes. The
+ * WIRE-bound objects it returns/consumes — the prekey `bundleJson`, the X3DH
+ * `handshakeData`, the responder `preKeyState` — are produced verbatim by the
+ * rez-core `X3DHKeyExchange` primitives (the established, canonical shapes). The
+ * persisted session record reuses the EXISTING secure-session record shape (plus
+ * the additive `peerDeviceId` field). Method returns (`{ sessionId }`,
+ * `{ encryptedPacket }`, `{ plaintextBytes }`, `{ peerDeviceId, ... }`) are
+ * internal SDK call results, never serialized to the wire — so no RRecord is
+ * required for them. When discovery (Slice 3) introduces genuinely NEW wire
+ * shapes (DeviceSetRecordV1 / DevicePrekeyBundleV1), THOSE land as records.
  */
 export class DevicePeerSessions {
   #cryptoProvider;

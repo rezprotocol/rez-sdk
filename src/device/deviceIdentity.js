@@ -3,6 +3,7 @@ import {
   bytesToBase64,
   DeviceRegistrationV1,
   DEVICE_REGISTRATION_VERSION,
+  DEVICE_REGISTRATION_PURPOSE,
   verifyDeviceRegistrationV1,
 } from "@rezprotocol/core";
 import { signPayload } from "../auth/signing.js";
@@ -78,6 +79,7 @@ export async function buildSignedDeviceRegistration({ account, devicePublicKeyB6
   const expiresAtMs = issuedAtMs + ttlMs;
   const body = {
     v: DEVICE_REGISTRATION_VERSION,
+    purpose: DEVICE_REGISTRATION_PURPOSE,
     accountIdentityPublicKeyB64: account.publicKeyB64,
     devicePublicKeyB64,
     deviceId: DeviceRegistrationV1.deviceIdFor(devicePublicKeyB64),
