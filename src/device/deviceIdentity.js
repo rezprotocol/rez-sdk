@@ -107,15 +107,28 @@ const webCryptoVerifier = {
 };
 
 /**
- * Verify a DeviceRegistrationV1 using the SDK's WebCrypto provider. Delegates
- * the deviceId-match + signature + window logic to the single rez-core verifier
- * (SSOT) — this only supplies the spki-importing crypto.
+ * Verify a DeviceRegistrationV1 against an EXPECTED account, using the SDK's
+ * WebCrypto provider. Delegates the trust-anchor + deviceId-match + signature +
+ * window logic to the single rez-core verifier (SSOT); this only supplies the
+ * spki-importing crypto and a safe default clock.
+ *
+ * `expectedAccountIdentityPublicKeyB64` is REQUIRED — a signature-valid
+ * registration for the WRONG (attacker) account must not be accepted as a device
+ * of the account you expect. `nowMs` defaults to the current time so expiry is
+ * never silently skipped.
  *
  * @param {object} opts
  * @param {object} opts.registration — DeviceRegistrationV1 instance or its toJSON()
- * @param {number} [opts.nowMs] — when finite, enforce the issued/expires window
+ * @param {string} opts.expectedAccountIdentityPublicKeyB64 — REQUIRED trust anchor
+ * @param {number} [opts.nowMs] — epoch ms; defaults to Date.now()
  * @returns {Promise<{ ok: boolean, reason?: string, deviceId?: string }>}
  */
-export async function verifyDeviceRegistration({ registration, nowMs } = {}) {
-  return verifyDeviceRegistrationV1({ registration, crypto: webCryptoVerifier, nowMs });
+export async function verifyDeviceRegistration({ registration, expectedAccountIdentityPublicKeyB64, nowMs } = {}) {
+  const effectiveNowMs = typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : Date.now();
+  return verifyDeviceRegistrationV1({
+    registration,
+    expectedAccountIdentityPublicKeyB64,
+    crypto: webCryptoVerifier,
+    nowMs: effectiveNowMs,
+  });
 }
