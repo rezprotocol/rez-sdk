@@ -238,6 +238,34 @@ test("P2: re-establishing a device reuses its session record (no stale-session a
   assert.equal(list[0].sessionId, firstId, "sessionId is reused, old ratchet not left dangling");
 });
 
+test("P2 (over-serialization): a held lock on device A does NOT block an op on device B", async () => {
+  const { mine, mineStorage, makePeerDevice, establish } = await makeWorld();
+  const devA = await makePeerDevice(A_LINK);
+  const devB = await makePeerDevice(B_LINK);
+  await establish(devA, DEV_A);
+  await establish(devB, DEV_B);
+
+  // Gate device A's next put so its per-device lock stays held open. If locks
+  // were keyed by peer link (the bug), device B's send would queue behind it.
+  let releaseA;
+  const aGate = new Promise((res) => { releaseA = res; });
+  const realPut = mineStorage.sessions.put.bind(mineStorage.sessions);
+  mineStorage.sessions.put = async (record) => {
+    if (record.peerDeviceId === DEV_A && record.ratchetSnapshot) await aGate;
+    return realPut(record);
+  };
+
+  const aPromise = mine.encryptForDevice({ ownerAccountId: OWNER, peerAccountId: PEER, peerLinkId: MY_LINK, peerDeviceId: DEV_A, plaintextBytes: enc("a") });
+  let bDone = false;
+  const bPromise = mine.encryptForDevice({ ownerAccountId: OWNER, peerAccountId: PEER, peerLinkId: MY_LINK, peerDeviceId: DEV_B, plaintextBytes: enc("b") })
+    .then((r) => { bDone = true; return r; });
+
+  await bPromise;
+  assert.equal(bDone, true, "device B completes while device A's lock is held open (independent per-device locks)");
+  releaseA();
+  await aPromise;
+});
+
 test("P2: a malformed packet surfaces (throws) instead of being silently dropped as no-match", async () => {
   const { makePeerDevice, mine, establish } = await makeWorld();
   const devA = await makePeerDevice(A_LINK);

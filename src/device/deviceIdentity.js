@@ -1,5 +1,4 @@
 import {
-  base64ToBytes,
   bytesToBase64,
   DeviceRegistrationV1,
   DEVICE_REGISTRATION_VERSION,
@@ -87,7 +86,7 @@ export async function buildSignedDeviceRegistration({ account, devicePublicKeyB6
     expiresAtMs,
   };
   const sigB64 = await signPayload({ privateKeyB64: account.privateKeyB64, payload: body });
-  return new DeviceRegistrationV1({ ...body, sig: { alg: "ed25519", sig: base64ToBytes(sigB64) } });
+  return new DeviceRegistrationV1({ ...body, sig: { alg: "ed25519", sigB64 } });
 }
 
 // WebCrypto (spki) verify adapter for the rez-core verifier. The SDK's account

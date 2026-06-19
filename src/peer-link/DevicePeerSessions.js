@@ -35,12 +35,16 @@ export class DevicePeerSessions {
   #cryptoProvider;
   #peerLinkStorage;
   #clock;
-  // Per-(owner, peerLink) async mutex: serializes each load→advance→put so two
-  // concurrent ops on the same ratchet can't both advance off one snapshot and
-  // clobber each other — the session store is last-write-wins, so an unserialized
-  // race would lose a ratchet step (one ciphertext becomes undecryptable / the
-  // chains desync). These are CLIENT-side sessions (one process = one instance),
-  // so an in-memory mutex is sufficient.
+  // Per-(owner, peerLink, peerDevice) async mutex: serializes each
+  // load→advance→put so two concurrent ops on the SAME device session can't both
+  // advance off one snapshot and clobber each other — the session store is
+  // last-write-wins, so an unserialized race would lose a ratchet step (one
+  // ciphertext becomes undecryptable / the chains desync). Keyed by DEVICE (audit
+  // P2): independent device sessions of one peer link no longer needlessly
+  // serialize, so an N-device fan-out runs concurrently. Entries are GC'd once
+  // their chain drains (#withLock), so the map tracks only actively-contended
+  // sessions instead of growing with peer-link cardinality. Client-side (one
+  // process = one instance), so an in-memory mutex is sufficient.
   #locks = new Map();
 
   constructor({ cryptoProvider, peerLinkStorage, clock } = {}) {
@@ -63,17 +67,25 @@ export class DevicePeerSessions {
     return manager;
   }
 
-  #lockKey(ownerAccountId, peerLinkId) {
-    return String(ownerAccountId) + "::" + String(peerLinkId);
+  #lockKey(ownerAccountId, peerLinkId, peerDeviceId) {
+    return String(ownerAccountId) + "::" + String(peerLinkId) + "::" + String(peerDeviceId);
   }
 
   // Chain `fn` after the current tail for `key` (runs whether the prior op
   // resolved or rejected); the stored tail never rejects so one failure can't
   // poison the chain. Callers get fn's real result/error via the returned run.
+  // Once this tail drains, GC the entry IF nothing newer chained after it (a
+  // later #withLock replaces the map value) — bounds the map to live contention.
   #withLock(key, fn) {
     const prev = this.#locks.get(key) || Promise.resolve();
     const run = prev.then(fn, fn);
-    this.#locks.set(key, run.then(() => undefined, () => undefined));
+    const tail = run.then(() => undefined, () => undefined);
+    this.#locks.set(key, tail);
+    tail.then(() => {
+      if (this.#locks.get(key) === tail) {
+        this.#locks.delete(key);
+      }
+    });
     return run;
   }
 
@@ -131,7 +143,7 @@ export class DevicePeerSessions {
       initiatorIdentityDhKeyPair: identityDhKeyPair,
       initiatorIdentityDhSignature,
     });
-    const sessionId = await this.#withLock(this.#lockKey(ownerAccountId, peerLinkId), () => this.#persistDeviceSession({
+    const sessionId = await this.#withLock(this.#lockKey(ownerAccountId, peerLinkId, peerDeviceId), () => this.#persistDeviceSession({
       ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, snapshot: scm.exportSnapshot(),
     }));
     return { handshakeData, sessionId };
@@ -162,7 +174,7 @@ export class DevicePeerSessions {
       handshakeData,
       peerId: peerAccountId,
     });
-    const sessionId = await this.#withLock(this.#lockKey(ownerAccountId, peerLinkId), () => this.#persistDeviceSession({
+    const sessionId = await this.#withLock(this.#lockKey(ownerAccountId, peerLinkId, peerDeviceId), () => this.#persistDeviceSession({
       ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, snapshot: scm.exportSnapshot(),
     }));
     return { sessionId };
@@ -180,7 +192,7 @@ export class DevicePeerSessions {
     if (!(plaintextBytes instanceof Uint8Array) || plaintextBytes.length === 0) {
       throw new Error("encryptForDevice requires non-empty plaintextBytes");
     }
-    return this.#withLock(this.#lockKey(ownerAccountId, peerLinkId), async () => {
+    return this.#withLock(this.#lockKey(ownerAccountId, peerLinkId, peerDeviceId), async () => {
       const sessionRecord = await this.#requireDeviceSession(ownerAccountId, peerLinkId, peerDeviceId);
       const scm = this.#scm(sessionRecord.ratchetSnapshot);
       const codec = new E2eePacketCodec({ secureChannelManager: scm });
@@ -200,16 +212,16 @@ export class DevicePeerSessions {
     requireNonEmpty(ownerAccountId, "ownerAccountId");
     requireNonEmpty(peerLinkId, "peerLinkId");
     requireNonEmpty(peerDeviceId, "peerDeviceId");
-    return this.#withLock(this.#lockKey(ownerAccountId, peerLinkId), async () => {
-      const sessionRecord = await this.#requireDeviceSession(ownerAccountId, peerLinkId, peerDeviceId);
-      const result = await this.#tryDecrypt(sessionRecord, peerAccountId || sessionRecord.peerAccountId, packetBytes);
-      if (!result.ok) {
-        const err = new Error("E2EE decryption failed for device " + peerDeviceId);
-        err.code = "DECRYPT_FAILED";
-        throw err;
-      }
-      return { plaintextBytes: result.plaintextBytes, sessionId: sessionRecord.sessionId };
-    });
+    // require:true ⇒ a missing session throws THREAD_NOT_READY; a present session
+    // that cannot decrypt returns null here → DECRYPT_FAILED (the two distinct
+    // failure modes the callers depend on).
+    const result = await this.#attemptDeviceDecrypt(ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, packetBytes, { require: true });
+    if (!result) {
+      const err = new Error("E2EE decryption failed for device " + peerDeviceId);
+      err.code = "DECRYPT_FAILED";
+      throw err;
+    }
+    return { plaintextBytes: result.plaintextBytes, sessionId: result.sessionId };
   }
 
   /**
@@ -222,23 +234,46 @@ export class DevicePeerSessions {
   async trialDecryptAcrossDevices({ ownerAccountId, peerAccountId, peerLinkId, packetBytes } = {}) {
     requireNonEmpty(ownerAccountId, "ownerAccountId");
     requireNonEmpty(peerLinkId, "peerLinkId");
-    return this.#withLock(this.#lockKey(ownerAccountId, peerLinkId), async () => {
-      const sessions = await this.#peerLinkStorage.sessions.listByPeerLink(ownerAccountId, peerLinkId);
-      for (const sessionRecord of sessions) {
-        const result = await this.#tryDecrypt(sessionRecord, peerAccountId || sessionRecord.peerAccountId, packetBytes);
-        if (result.ok) {
-          return {
-            peerDeviceId: sessionRecord.peerDeviceId,
-            plaintextBytes: result.plaintextBytes,
-            sessionId: sessionRecord.sessionId,
-          };
-        }
+    // Snapshot the candidate device set (a read, not under any single device's
+    // lock — keying the whole trial on one coarse peer-link lock is exactly the
+    // over-serialization audit P2 flagged). Each attempt then takes ONLY that
+    // device's lock and RE-READS the record inside it, so it acts on a fresh
+    // snapshot and serializes correctly against a concurrent send to that device.
+    const sessions = await this.#peerLinkStorage.sessions.listByPeerLink(ownerAccountId, peerLinkId);
+    for (const sessionRecord of sessions) {
+      const peerDeviceId = sessionRecord && sessionRecord.peerDeviceId ? sessionRecord.peerDeviceId : null;
+      if (!peerDeviceId) continue;
+      const result = await this.#attemptDeviceDecrypt(ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, packetBytes, { require: false });
+      if (result) {
+        return { peerDeviceId, plaintextBytes: result.plaintextBytes, sessionId: result.sessionId };
       }
-      return null;
-    });
+    }
+    return null;
   }
 
   // --- internals ---
+
+  // Decrypt a packet against ONE device session, holding only that device's lock
+  // and reloading the record inside it. Returns { plaintextBytes, sessionId } on
+  // success, null on a present-but-non-matching session. With require:true a
+  // missing session throws THREAD_NOT_READY; with require:false it returns null
+  // (so trial-decrypt can skip to the next device).
+  async #attemptDeviceDecrypt(ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, packetBytes, { require }) {
+    return this.#withLock(this.#lockKey(ownerAccountId, peerLinkId, peerDeviceId), async () => {
+      const sessionRecord = await this.#peerLinkStorage.sessions.getByPeerLinkAndDevice(ownerAccountId, peerLinkId, peerDeviceId);
+      if (!sessionRecord || typeof sessionRecord !== "object") {
+        if (require) {
+          const err = new Error("No secure session for device " + peerDeviceId);
+          err.code = "THREAD_NOT_READY";
+          throw err;
+        }
+        return null;
+      }
+      const result = await this.#tryDecrypt(sessionRecord, peerAccountId || sessionRecord.peerAccountId, packetBytes);
+      if (!result.ok) return null;
+      return { plaintextBytes: result.plaintextBytes, sessionId: sessionRecord.sessionId };
+    });
+  }
 
   async #tryDecrypt(sessionRecord, expectedPeerAccountId, packetBytes) {
     if (!(packetBytes instanceof Uint8Array) || packetBytes.length === 0) {
