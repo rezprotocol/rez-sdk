@@ -203,3 +203,50 @@ test("decryptFromDevice round-trips and rejects a foreign packet with DECRYPT_FA
     (err) => err && err.code === "DECRYPT_FAILED",
   );
 });
+
+test("P1.4: concurrent encryptForDevice on one device session never clobbers the ratchet", async () => {
+  const { mine, makePeerDevice, establish } = await makeWorld();
+  const devA = await makePeerDevice(A_LINK);
+  await establish(devA, DEV_A);
+
+  // Two sends fired CONCURRENTLY for the SAME device session. Without the
+  // per-session lock both would advance off the same snapshot (same ratchet
+  // step → key/nonce reuse, and last-write-wins drops one advance).
+  const [r1, r2] = await Promise.all([
+    mine.encryptForDevice({ ownerAccountId: OWNER, peerAccountId: PEER, peerLinkId: MY_LINK, peerDeviceId: DEV_A, plaintextBytes: enc("first") }),
+    mine.encryptForDevice({ ownerAccountId: OWNER, peerAccountId: PEER, peerLinkId: MY_LINK, peerDeviceId: DEV_A, plaintextBytes: enc("second") }),
+  ]);
+
+  // BOTH ciphertexts must independently decrypt on the peer (distinct steps).
+  const got1 = await devA.sessions.trialDecryptAcrossDevices({ ownerAccountId: PEER, peerAccountId: OWNER, peerLinkId: A_LINK, packetBytes: r1.encryptedPacket.toBytes() });
+  const got2 = await devA.sessions.trialDecryptAcrossDevices({ ownerAccountId: PEER, peerAccountId: OWNER, peerLinkId: A_LINK, packetBytes: r2.encryptedPacket.toBytes() });
+  assert.ok(got1 && got2, "both concurrent sends decrypt");
+  assert.deepEqual([dec(got1.plaintextBytes), dec(got2.plaintextBytes)].sort(), ["first", "second"]);
+});
+
+test("P2: re-establishing a device reuses its session record (no stale-session accumulation)", async () => {
+  const { mine, mineStorage, makePeerDevice, establish } = await makeWorld();
+  const devA = await makePeerDevice(A_LINK);
+  await establish(devA, DEV_A);
+  const firstId = (await mineStorage.sessions.getByPeerLinkAndDevice(OWNER, MY_LINK, DEV_A)).sessionId;
+
+  // Peer rotates its bundle / link recovers → re-establish the same device.
+  await establish(devA, DEV_A);
+
+  const list = await mineStorage.sessions.listByPeerLink(OWNER, MY_LINK);
+  assert.equal(list.length, 1, "exactly one session record per device after re-establish");
+  assert.equal(list[0].sessionId, firstId, "sessionId is reused, old ratchet not left dangling");
+});
+
+test("P2: a malformed packet surfaces (throws) instead of being silently dropped as no-match", async () => {
+  const { makePeerDevice, mine, establish } = await makeWorld();
+  const devA = await makePeerDevice(A_LINK);
+  await establish(devA, DEV_A);
+  // Structurally-corrupt encrypted packet (truthy non-string payload) — the
+  // codec's record parse throws; the device layer must NOT swallow it as a
+  // benign "wrong device" non-match.
+  const malformed = enc(JSON.stringify({ e2ee: 1, v: 1, payload: 123 }));
+  await assert.rejects(() => devA.sessions.trialDecryptAcrossDevices({
+    ownerAccountId: PEER, peerAccountId: OWNER, peerLinkId: A_LINK, packetBytes: malformed,
+  }));
+});
