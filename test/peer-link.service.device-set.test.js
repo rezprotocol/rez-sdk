@@ -265,3 +265,60 @@ test("responder-complete fails loud when no pre-key was retained for the peer", 
     (err) => err && err.code === "PEER_LINK_DEVICE_PREKEY_MISSING",
   );
 });
+
+test("Audit R2 #2: re-ingesting an UNCHANGED device set is idempotent — no session churn, no new establishment", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
+
+  const { record } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
+
+  // First ingest establishes the initiator session.
+  const first = await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record });
+  assert.equal(first.established.length, 1, "first ingest establishes one device session");
+  const sid1 = await bob.sp.peerLinkStorage.sessions.getByPeerLinkAndDevice(bob.accountId, "pl_bob_alice", alice.deviceId);
+  assert.ok(sid1, "session stored after first ingest");
+
+  // Complete the responder so a real round-trip is possible, then send once to
+  // advance the ratchet.
+  await alice.svc.completeDeviceSetResponder({ peerAccountId: bob.accountId, peerDeviceId: bob.deviceId, handshakeData: first.established[0].handshakeData });
+  const { encryptedPacket: m1 } = await bob.svc.encryptDirectMessageForDevice({
+    peerAccountId: alice.accountId, peerLinkId: "pl_bob_alice", peerDeviceId: alice.deviceId, plaintextBytes: enc("one"),
+  });
+  assert.equal(dec((await alice.svc.decryptFromDevice({ peerAccountId: bob.accountId, peerLinkId: "pl_alice_bob", peerDeviceId: bob.deviceId, packetBytes: m1.toBytes() })).plaintextBytes), "one");
+
+  // Re-ingest the SAME record (the old code would re-establish a fresh session
+  // here, desyncing the responder). Now it is a no-op for the existing device.
+  const sessionBefore = await bob.sp.peerLinkStorage.sessions.getByPeerLinkAndDevice(bob.accountId, "pl_bob_alice", alice.deviceId);
+  const second = await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record });
+  assert.equal(second.established.length, 0, "no NEW establishment on an unchanged re-ingest");
+  assert.equal(second.reused.length, 1, "the existing device session is reused");
+  const sessionAfter = await bob.sp.peerLinkStorage.sessions.getByPeerLinkAndDevice(bob.accountId, "pl_bob_alice", alice.deviceId);
+  assert.deepEqual(sessionAfter, sessionBefore, "the stored session is byte-unchanged across re-ingest (no churn)");
+
+  // The SAME session still round-trips after re-ingest — not reset.
+  const { encryptedPacket: m2 } = await bob.svc.encryptDirectMessageForDevice({
+    peerAccountId: alice.accountId, peerLinkId: "pl_bob_alice", peerDeviceId: alice.deviceId, plaintextBytes: enc("two"),
+  });
+  assert.equal(dec((await alice.svc.decryptFromDevice({ peerAccountId: bob.accountId, peerLinkId: "pl_alice_bob", peerDeviceId: bob.deviceId, packetBytes: m2.toBytes() })).plaintextBytes), "two");
+});
+
+test("Audit R2 #2: ingest rejects a device set whose revision rolls back below a known revision", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
+
+  const { record } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
+  // The built set is revision 1; ingesting it while we already accepted a higher
+  // revision (minRevision: 5) is a rollback and must be refused fail-loud.
+  await assert.rejects(
+    () => bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record, minRevision: 5 }),
+    (err) => err && err.code === "DEVICE_SET_STALE_REVISION" && err.revision === 1 && err.knownRevision === 5,
+  );
+  // An equal-or-higher floor is accepted (revision 1, minRevision 1).
+  const ok = await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record, minRevision: 1 });
+  assert.equal(ok.revision, 1);
+  assert.equal(ok.established.length, 1);
+});

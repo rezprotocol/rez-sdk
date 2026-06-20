@@ -576,7 +576,7 @@ export class PeerLinkService {
    * handshakeData the peer device needs to complete its responder session (the
    * caller delivers it via the per-device fan-out, Slice 5). NO network here.
    */
-  async ingestPeerDeviceSet({ ownerAccountId = this.ownerAccountId, peerAccountId, record, nowMs, maxDevices = DEVICE_SET_MAX_DEVICES } = {}) {
+  async ingestPeerDeviceSet({ ownerAccountId = this.ownerAccountId, peerAccountId, record, nowMs, maxDevices = DEVICE_SET_MAX_DEVICES, minRevision = 0 } = {}) {
     this.#requireDeviceSessions();
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const peer = requireId(peerAccountId, "peerAccountId");
@@ -594,8 +594,38 @@ export class PeerLinkService {
       maxDevices,
     });
 
+    // Rollback protection (Audit R2 #2): the device-set `revision` is a signed
+    // MONOTONIC counter — peers honor the highest and treat a lower one as stale.
+    // Refuse a set whose revision regresses below one we already ingested so a
+    // replayed old set can't resurrect a since-removed device's session.
+    const floor = Number.isInteger(minRevision) && minRevision > 0 ? minRevision : 0;
+    if (floor > 0 && deviceSetRecord.revision < floor) {
+      const err = new Error(
+        "ingestPeerDeviceSet: stale device-set revision " + deviceSetRecord.revision
+        + " < known " + floor + " for peer " + peer,
+      );
+      err.code = "DEVICE_SET_STALE_REVISION";
+      err.revision = deviceSetRecord.revision;
+      err.knownRevision = floor;
+      throw err;
+    }
+
+    // Per-device IDEMPOTENT establishment (Audit R2 #2): a session is keyed on the
+    // peer's self-cert deviceId (= sha256 of its device key), so an existing
+    // device's session is unchanged across set revisions (the set changes when
+    // OTHER devices are added/removed). Re-establishing on every refresh minted a
+    // fresh initiator session each time while the responder kept the old one ⇒
+    // desync. So establish ONLY for a device with no existing session; reuse the
+    // rest. `established` therefore carries only the NEW (first-contact) devices —
+    // exactly the ones whose handshake the sender must carry in-band.
     const established = [];
+    const reused = [];
     for (const bundle of prekeyBundleRecords) {
+      const existing = await this.peerLinkStorage.sessions.getByPeerLinkAndDevice(owner, peerLinkId, bundle.deviceId);
+      if (existing != null) {
+        reused.push({ peerDeviceId: bundle.deviceId });
+        continue;
+      }
       const { handshakeData, sessionId } = await this.establishInitiatorDeviceSession({
         ownerAccountId: owner,
         peerAccountId: peer,
@@ -605,7 +635,7 @@ export class PeerLinkService {
       });
       established.push({ peerDeviceId: bundle.deviceId, handshakeData, sessionId });
     }
-    return { deviceSetRecord, prekeyBundleRecords, established };
+    return { deviceSetRecord, prekeyBundleRecords, established, reused, revision: deviceSetRecord.revision };
   }
 
   /**
