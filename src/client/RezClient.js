@@ -7,6 +7,7 @@ import { NodeCapability } from "../capabilities/NodeCapability.js";
 import { SubscriptionCapability } from "../capabilities/SubscriptionCapability.js";
 import { ConnectivityCapability } from "../capabilities/ConnectivityCapability.js";
 import { IdentityCapability } from "../capabilities/IdentityCapability.js";
+import { DevicesCapability } from "../capabilities/DevicesCapability.js";
 import { MeshCapability } from "../capabilities/MeshCapability.js";
 import { bytesToBase64, base64ToBytes } from "../util/bytes.js";
 import { buildRezClientRuntime } from "./buildRezClientRuntime.js";
@@ -40,6 +41,7 @@ export class RezClient {
   #subscriptions;
   #connectivity;
   #identityCap;
+  #devices;
   #mesh;
   // Local PeerLinkService instance (Shape A). When set, the SDK encrypts
   // outbound messages locally and sends them as plain MAILBOX_DEPOSIT, so the
@@ -87,6 +89,7 @@ export class RezClient {
     this.#subscriptions = new SubscriptionCapability({ pool, eventBus });
     this.#connectivity = new ConnectivityCapability({ pool, eventBus });
     this.#identityCap = new IdentityCapability({ pool, eventBus, identity });
+    this.#devices = new DevicesCapability({ pool });
     // The one mesh-dispatch verb. Delegates to mailbox / durableRecords so the
     // wire op stays single-sourced; apps call rez.mesh.dispatch(object, address).
     this.#mesh = new MeshCapability({ pool, mailbox: this.#mailbox, durableRecords: this.#durableRecords });
@@ -542,6 +545,10 @@ export class RezClient {
 
   get identity() {
     return this.#identityCap;
+  }
+
+  get devices() {
+    return this.#devices;
   }
 
   get mesh() {

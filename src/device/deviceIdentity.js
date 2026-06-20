@@ -3,6 +3,9 @@ import {
   DeviceRegistrationV1,
   DEVICE_REGISTRATION_VERSION,
   DEVICE_REGISTRATION_PURPOSE,
+  DeviceInboxBindingV1,
+  DEVICE_INBOX_BINDING_VERSION,
+  DEVICE_INBOX_BINDING_PURPOSE,
   verifyDeviceRegistrationV1,
 } from "@rezprotocol/core";
 import { signPayload } from "../auth/signing.js";
@@ -87,6 +90,48 @@ export async function buildSignedDeviceRegistration({ account, devicePublicKeyB6
   };
   const sigB64 = await signPayload({ privateKeyB64: account.privateKeyB64, payload: body });
   return new DeviceRegistrationV1({ ...body, sig: { alg: "ed25519", sigB64 } });
+}
+
+/**
+ * Build a DeviceInboxBindingV1 and sign it with the DEVICE key (C) — the device
+ * asserting the inbox it receives at. The device→account chain is established
+ * separately by DeviceRegistrationV1 (account-signed); a verifier that needs the
+ * full chain checks BOTH. `device.deviceId` is self-certifying and re-derived.
+ *
+ * `signPayload` canonicalizes the body with the same `canonicalJSONStringify`
+ * that `DeviceInboxBindingV1.signableBytes` uses, so the signature verifies
+ * against the same bytes the home recomputes — no representation drift.
+ *
+ * @param {object} opts
+ * @param {{ publicKeyB64: string, privateKeyB64: string }} opts.device — this device's keypair (C)
+ * @param {string} opts.inboxId — the inbox this device receives at
+ * @param {number} [opts.nowMs] — issuedAtMs (defaults to Date.now())
+ * @param {number} [opts.ttlMs] — lifetime; expiresAtMs = issuedAtMs + ttlMs
+ * @returns {Promise<DeviceInboxBindingV1>}
+ */
+export async function buildSignedDeviceInboxBinding({ device, inboxId, nowMs, ttlMs = DEFAULT_TTL_MS } = {}) {
+  if (!device || typeof device.publicKeyB64 !== "string" || device.publicKeyB64.length === 0) {
+    throw new Error("buildSignedDeviceInboxBinding requires device.publicKeyB64");
+  }
+  if (typeof device.privateKeyB64 !== "string" || device.privateKeyB64.length === 0) {
+    throw new Error("buildSignedDeviceInboxBinding requires device.privateKeyB64");
+  }
+  if (typeof inboxId !== "string" || inboxId.trim().length === 0) {
+    throw new Error("buildSignedDeviceInboxBinding requires inboxId");
+  }
+  const issuedAtMs = typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : Date.now();
+  const expiresAtMs = issuedAtMs + ttlMs;
+  const body = {
+    v: DEVICE_INBOX_BINDING_VERSION,
+    purpose: DEVICE_INBOX_BINDING_PURPOSE,
+    devicePublicKeyB64: device.publicKeyB64,
+    deviceId: DeviceRegistrationV1.deviceIdFor(device.publicKeyB64),
+    inboxId: inboxId.trim(),
+    issuedAtMs,
+    expiresAtMs,
+  };
+  const sigB64 = await signPayload({ privateKeyB64: device.privateKeyB64, payload: body });
+  return new DeviceInboxBindingV1({ ...body, sig: { alg: "ed25519", sigB64 } });
 }
 
 // WebCrypto (spki) verify adapter for the rez-core verifier. The SDK's account

@@ -1,5 +1,5 @@
 import { SDK_EVENTS } from "../events/SdkEvents.js";
-import { buildSignedDeviceRegistration } from "../device/deviceIdentity.js";
+import { buildSignedDeviceRegistration, buildSignedDeviceInboxBinding } from "../device/deviceIdentity.js";
 
 /**
  * Identity capability — auth state, session info, and identity accessors.
@@ -71,6 +71,35 @@ export class IdentityCapability {
     return buildSignedDeviceRegistration({
       account: { publicKeyB64: id.publicKeyB64, privateKeyB64: id.privateKeyB64 },
       devicePublicKeyB64: dk.publicKeyB64,
+      nowMs,
+      ttlMs,
+    });
+  }
+
+  /**
+   * Produce a DeviceInboxBindingV1 signed by THIS device's key (C), asserting it
+   * receives at `inboxId`. Paired with buildDeviceRegistration() (account-signed),
+   * this is the proof a `device.bind` presents to the home. Fails loud if the
+   * device keypair is absent (legacy keystore) or inboxId is missing.
+   *
+   * @param {object} opts
+   * @param {string} opts.inboxId — the inbox this device receives at (its claimed inbox)
+   * @param {number} [opts.nowMs] — issuedAtMs (defaults to Date.now())
+   * @param {number} [opts.ttlMs] — lifetime; expiresAtMs = issuedAtMs + ttlMs
+   * @returns {Promise<import("@rezprotocol/core").DeviceInboxBindingV1>}
+   */
+  async buildDeviceInboxBinding({ inboxId, nowMs, ttlMs } = {}) {
+    const dk = this.#deviceKey();
+    if (!dk || typeof dk.publicKeyB64 !== "string" || dk.publicKeyB64.length === 0
+        || typeof dk.privateKeyB64 !== "string" || dk.privateKeyB64.length === 0) {
+      throw new Error("IdentityCapability.buildDeviceInboxBinding: identity has no device keypair (keystore predates device-key persistence)");
+    }
+    if (typeof inboxId !== "string" || inboxId.trim().length === 0) {
+      throw new Error("IdentityCapability.buildDeviceInboxBinding: inboxId is required");
+    }
+    return buildSignedDeviceInboxBinding({
+      device: { publicKeyB64: dk.publicKeyB64, privateKeyB64: dk.privateKeyB64 },
+      inboxId,
       nowMs,
       ttlMs,
     });
