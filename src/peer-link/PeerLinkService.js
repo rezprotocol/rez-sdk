@@ -1571,6 +1571,15 @@ export class PeerLinkService {
       err.code = "INVITE_SIGNATURE_INVALID";
       throw err;
     }
+    // Persist the inviter's stable account-level X3DH identity-DH PUBLIC key
+    // (the long-term X25519 key, distinct from the signed pre-key). It is the
+    // peer half of the static-static agreement that derives the peer-scoped
+    // seal used to publish/resolve encrypted device sets (S2.5 Slice 3). X3DH
+    // already requires it (`processAcceptedInvite` reads it from the bundle),
+    // so a valid invite always carries it; we simply record it for later.
+    const inviterIdentityDhPubKeyB64 = nonEmpty(
+      envelope.binding && envelope.binding.x3dh ? envelope.binding.x3dh.identityDhPublicKeyB64 : null,
+    );
     const peerInboxIdForLink = envelope.binding && typeof envelope.binding === "object" ? nonEmpty(envelope.binding.capabilityId) : null;
     let peerLinkRecord;
     if (reattempt) {
@@ -1582,6 +1591,7 @@ export class PeerLinkService {
       peerLinkRecord = await this.peerLinkStorage.peerLinks.update({
         ...existing,
         remoteIdentitySigningPublicKeyB64: inviterIdentitySigningPubKeyB64,
+        remoteIdentityDhPublicKeyB64: inviterIdentityDhPubKeyB64,
         state: "accept_committed",
         activeInviteId: requireId(envelope.inviteId, "inviteId"),
         activeSessionId: null,
@@ -1596,6 +1606,7 @@ export class PeerLinkService {
         localAccountId: acceptor,
         peerAccountId: inviterAccountId,
         remoteIdentitySigningPublicKeyB64: inviterIdentitySigningPubKeyB64,
+        remoteIdentityDhPublicKeyB64: inviterIdentityDhPubKeyB64,
         state: "accept_committed",
         activeInviteId: requireId(envelope.inviteId, "inviteId"),
         activeSessionId: null,
@@ -2009,12 +2020,19 @@ export class PeerLinkService {
         localDisplayName,
       };
     }
+    // The acceptor's handshake carries its stable account-level X3DH identity-DH
+    // PUBLIC key (X3DH's `establishResponderSession` consumes it for DH2), which
+    // is the peer half of the static-static agreement behind the peer-scoped
+    // device-set seal (S2.5 Slice 3). Record it so this side can later derive
+    // that key. A re-establishment that re-learns it refreshes the stored value.
+    const peerIdentityDhPubKeyB64 = nonEmpty(handshakeData.senderIdentityDhPubKeyB64);
     let peerLinkRecord = existing;
     if (!peerLinkRecord) {
       peerLinkRecord = await this.peerLinkStorage.peerLinks.create({
         peerLinkId: stableId("pl"),
         localAccountId: owner,
         peerAccountId,
+        remoteIdentityDhPublicKeyB64: peerIdentityDhPubKeyB64,
         state: "handshake_received",
         activeInviteId: inviteId,
         activeSessionId: null,
@@ -2024,6 +2042,10 @@ export class PeerLinkService {
         lastErrorMessage: null,
         version: 1,
       });
+    } else if (peerIdentityDhPubKeyB64 && existing.remoteIdentityDhPublicKeyB64 !== peerIdentityDhPubKeyB64) {
+      // Carry the (possibly newly-learned) peer identity-DH pubkey onto the
+      // in-memory record so #commitSession's spread persists it.
+      peerLinkRecord = { ...existing, remoteIdentityDhPublicKeyB64: peerIdentityDhPubKeyB64 };
     }
     const { secureChannelManager } = await this.#establishAsResponder({
       ownerAccountId: owner,
