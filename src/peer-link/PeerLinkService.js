@@ -16,9 +16,16 @@ import {
   requireId,
   signHandshakeEnvelope,
   verifyHandshakeEnvelope,
+  DeviceSetRecordV1,
+  DEVICE_SET_VERSION,
+  DEVICE_SET_PURPOSE,
+  DevicePrekeyBundleV1,
+  DEVICE_PREKEY_BUNDLE_VERSION,
+  DEVICE_PREKEY_BUNDLE_PURPOSE,
 } from "@rezprotocol/core";
 import { canonicalPayloadBytesV1 } from "./inviteCodeV1.js";
 import { DevicePeerSessions } from "./DevicePeerSessions.js";
+import { buildSealedDeviceSetRecord, openSealedDeviceSetRecord } from "./deviceSetPublish.js";
 import {
   PEER_LINK_STATE,
   SESSION_STATUS,
@@ -39,6 +46,13 @@ const REHANDSHAKE_DECRYPT_FAILURE_THRESHOLD = 3;
 // further bounded by the chat-layer recovery-invite trigger cooldown and the
 // short recovery-invite TTL (a stale/replayed invite auto-expires).
 const HEALTHY_SESSION_DECRYPT_GUARD_MS = 30 * 1000;
+// Lifetime of a published device set / per-device prekey bundle (S2.5 Slice 3).
+// A peer rejects a set whose expiresAtMs has passed (E7 staleness), so an account
+// republishes within this window. 30 days balances churn against staleness.
+const DEVICE_SET_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// E7 sender-side cap: refuse to ingest a peer device set larger than this so a
+// bloated recipient list can't force N encryptions + N deposits per message.
+const DEVICE_SET_MAX_DEVICES = 8;
 
 function asPositiveInt(value, fallback) {
   const num = Number(value);
@@ -376,6 +390,227 @@ export class PeerLinkService {
       ownerAccountId: requireId(ownerAccountId, "ownerAccountId"),
       peerAccountId: requireId(peerAccountId, "peerAccountId"),
       peerLinkId, peerDeviceId, plaintextBytes,
+    });
+  }
+
+  /**
+   * Resolve the established peer-link's persisted peer identity material — the
+   * peer's account-level identity-DH public key (the seal half) and account (B)
+   * public key (the durable publisher key), both recorded at handshake (Slice 3
+   * leaves 2/4). Fails loud if the link is absent or predates that persistence,
+   * because a device set cannot be sealed to / opened from a peer without them.
+   */
+  async _requirePeerDeviceSetContext(ownerAccountId, peerAccountId) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const peer = requireId(peerAccountId, "peerAccountId");
+    const peerLinkRecord = await this.peerLinkStorage.peerLinks.getByPair(owner, peer);
+    if (!peerLinkRecord || typeof peerLinkRecord !== "object") {
+      const err = new Error("no peer link for device-set exchange with " + peer);
+      err.code = "PEER_LINK_NOT_FOUND";
+      throw err;
+    }
+    const peerIdentityDhPublicKeyB64 = nonEmpty(peerLinkRecord.remoteIdentityDhPublicKeyB64);
+    const peerAccountPublicKeyB64 = nonEmpty(peerLinkRecord.remoteAccountIdentityPublicKeyB64);
+    if (!peerIdentityDhPublicKeyB64 || !peerAccountPublicKeyB64) {
+      const err = new Error("peer link is missing the persisted peer identity material for device-set exchange");
+      err.code = "PEER_LINK_DEVICE_SET_UNSUPPORTED";
+      throw err;
+    }
+    return {
+      peerLinkId: nonEmpty(peerLinkRecord.peerLinkId),
+      peerIdentityDhPublicKeyB64,
+      peerAccountPublicKeyB64,
+    };
+  }
+
+  /**
+   * Resolve THIS account's B (chat-server identity) signer + public key. The
+   * account identity key is the invite authority's signing key (production wires
+   * it to the chat-server identity); B both signs DeviceSetRecordV1 and is the
+   * durable-record publisher. Cross-checks the signer pubkey against the verified
+   * account binding and the accountId so a misconfigured authority can't sign a
+   * set the peer would reject.
+   */
+  async _resolveAccountIdentitySigner(ownerAccountId) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const authority = await this._resolveAuthority(owner);
+    const signerRef = authority.signer.getSignerRef();
+    const accountPublicKeyB64 = nonEmpty(signerRef && signerRef.signerPublicKeyB64);
+    if (!accountPublicKeyB64) {
+      throw new Error("account identity signer must expose signerPublicKeyB64 to publish a device set");
+    }
+    if (deriveAccountIdFromPublicKey(base64ToBytes(accountPublicKeyB64)) !== owner) {
+      throw new Error("account identity signer public key does not derive the owner accountId");
+    }
+    const { accountBinding } = await this._requireBoundX3dhIdentity(owner);
+    if (!accountBinding || accountBinding.accountIdentityPublicKeyB64 !== accountPublicKeyB64) {
+      throw new Error("account identity signer public key disagrees with the account binding");
+    }
+    return {
+      accountPublicKeyB64,
+      accountSign: (bytes) => authority.signer.sign(bytes),
+    };
+  }
+
+  // Build this device's account-signed DeviceSetRecordV1 (single device until the
+  // E6 fan-out gate lifts) + this device's C-signed DevicePrekeyBundleV1, plus the
+  // responder preKeyState that must be retained so the peer can establish to us.
+  // The set + bundle content is account/device-level (identical for every peer);
+  // only the seal coordinate (Slice 3 leaf 5) is peer-scoped.
+  async #buildLocalDeviceSetMaterial(owner, accountPublicKeyB64, accountSign, nowMs) {
+    this.#requireDeviceSessions();
+    const inboxId = nonEmpty(this.inviteBinding && this.inviteBinding.mailboxId);
+    if (!inboxId) {
+      throw new Error("PeerLinkService requires inviteBinding.mailboxId to publish a device set (this device's inbox)");
+    }
+    const deviceId = nonEmpty(this.deviceId);
+    const devicePublicKeyB64 = nonEmpty(this.devicePublicKeyB64);
+    if (!deviceId || !devicePublicKeyB64) {
+      throw new Error("PeerLinkService requires a device key to publish a device set");
+    }
+    const expiresAtMs = nowMs + DEVICE_SET_TTL_MS;
+
+    // The account-level device set. revision/prekeyVersion stay 1 while this is
+    // the only device and there is no add/remove ceremony (Slice 6/7) or refresh
+    // (Slice 5) to bump them; the fields ARE versioned, the monotonic bumping
+    // lands with the mutations that warrant it.
+    const setBody = {
+      v: DEVICE_SET_VERSION,
+      purpose: DEVICE_SET_PURPOSE,
+      accountIdentityPublicKeyB64: accountPublicKeyB64,
+      revision: 1,
+      devices: [{ deviceId, devicePublicKeyB64, inboxId }],
+      issuedAtMs: nowMs,
+      expiresAtMs,
+    };
+    const setSig = await accountSign(DeviceSetRecordV1.signableBytes(setBody));
+    const deviceSetRecord = new DeviceSetRecordV1({ ...setBody, sig: { alg: "ed25519", sigB64: bytesToBase64(setSig) } });
+
+    // This device's prekey bundle, signed by the device key C. The responder
+    // preKeyState is retained by the caller (keyed by peer) so a peer that runs
+    // X3DH against this bundle and replies can be completed.
+    const { bundleJson, preKeyState } = await this.buildDevicePreKeyBundle({ ownerAccountId: owner });
+    const bundleBody = {
+      v: DEVICE_PREKEY_BUNDLE_VERSION,
+      purpose: DEVICE_PREKEY_BUNDLE_PURPOSE,
+      accountIdentityPublicKeyB64: accountPublicKeyB64,
+      devicePublicKeyB64,
+      deviceId,
+      inboxId,
+      prekeyVersion: 1,
+      bundleJson,
+      issuedAtMs: nowMs,
+      expiresAtMs,
+    };
+    const bundleSig = await this.cryptoProvider.sign({
+      privateKey: this.#deviceSigningKeyPair.privateKey,
+      msg: DevicePrekeyBundleV1.signableBytes(bundleBody),
+    });
+    const prekeyBundleRecord = new DevicePrekeyBundleV1({ ...bundleBody, sig: { alg: "ed25519", sigB64: bytesToBase64(bundleSig) } });
+
+    return { deviceSetRecord, prekeyBundleRecord, preKeyState };
+  }
+
+  /**
+   * PUBLISH side (S2.5 Slice 3): build this account's device set + this device's
+   * prekey bundle, seal them to one peer (peer-scoped static-static identity-DH),
+   * and return the signed DurableRecordV1 ready to put on the overlay. NO network:
+   * the caller (rez-chat, Slice 5) drives sdk.durableRecords.put. The responder
+   * preKeyState is retained keyed by the peer so that, when the peer establishes
+   * to us against this bundle, completeDeviceSetResponder can finish the handshake.
+   */
+  async buildDeviceSetRecordForPeer({ ownerAccountId = this.ownerAccountId, peerAccountId, nowMs } = {}) {
+    this.#requireDeviceSessions();
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const peer = requireId(peerAccountId, "peerAccountId");
+    const at = asPositiveInt(nowMs, this.clock());
+    const { peerIdentityDhPublicKeyB64 } = await this._requirePeerDeviceSetContext(owner, peer);
+    const { accountPublicKeyB64, accountSign } = await this._resolveAccountIdentitySigner(owner);
+    const { identityDhKeyPair } = await this._requireBoundX3dhIdentity(owner);
+
+    const { deviceSetRecord, prekeyBundleRecord, preKeyState } = await this.#buildLocalDeviceSetMaterial(owner, accountPublicKeyB64, accountSign, at);
+
+    // Retain the responder state for this peer BEFORE handing out the sealed
+    // bundle, so we can never publish a bundle we cannot later answer.
+    await this.peerLinkStorage.keys.putDevicePreKey(owner, peer, preKeyState);
+
+    const { record, slotRecordId } = await buildSealedDeviceSetRecord({
+      cryptoProvider: this.cryptoProvider,
+      accountSign,
+      accountPublicKeyB64,
+      myIdentityDhPrivateKeyB64: bytesToBase64(identityDhKeyPair.privateKey),
+      peerIdentityDhPublicKeyB64,
+      deviceSetRecord,
+      prekeyBundleRecords: [prekeyBundleRecord],
+      nowMs: at,
+      ttlMs: DEVICE_SET_TTL_MS,
+    });
+    return { record, slotRecordId, recordKind: record.recordKind, recordId: record.recordId, publisherPublicKeyB64: record.publisherPublicKeyB64 };
+  }
+
+  /**
+   * RESOLVE side (S2.5 Slice 3): open + fully verify a peer's sealed device-set
+   * DurableRecordV1, then establish an INITIATOR per-device session against every
+   * device in the set. Returns the verified set plus, per peer device, the
+   * handshakeData the peer device needs to complete its responder session (the
+   * caller delivers it via the per-device fan-out, Slice 5). NO network here.
+   */
+  async ingestPeerDeviceSet({ ownerAccountId = this.ownerAccountId, peerAccountId, record, nowMs, maxDevices = DEVICE_SET_MAX_DEVICES } = {}) {
+    this.#requireDeviceSessions();
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const peer = requireId(peerAccountId, "peerAccountId");
+    const at = asPositiveInt(nowMs, this.clock());
+    const { peerLinkId, peerIdentityDhPublicKeyB64, peerAccountPublicKeyB64 } = await this._requirePeerDeviceSetContext(owner, peer);
+    const { identityDhKeyPair } = await this._requireBoundX3dhIdentity(owner);
+
+    const { deviceSetRecord, prekeyBundleRecords } = await openSealedDeviceSetRecord({
+      cryptoProvider: this.cryptoProvider,
+      record,
+      myIdentityDhPrivateKeyB64: bytesToBase64(identityDhKeyPair.privateKey),
+      peerIdentityDhPublicKeyB64,
+      peerAccountPublicKeyB64,
+      nowMs: at,
+      maxDevices,
+    });
+
+    const established = [];
+    for (const bundle of prekeyBundleRecords) {
+      const { handshakeData, sessionId } = await this.establishInitiatorDeviceSession({
+        ownerAccountId: owner,
+        peerAccountId: peer,
+        peerLinkId,
+        peerDeviceId: bundle.deviceId,
+        peerDeviceBundleJson: bundle.bundleJson,
+      });
+      established.push({ peerDeviceId: bundle.deviceId, handshakeData, sessionId });
+    }
+    return { deviceSetRecord, prekeyBundleRecords, established };
+  }
+
+  /**
+   * RESPONDER completion (S2.5 Slice 3): a peer device ran X3DH against the prekey
+   * bundle we published to that peer and sent us its handshakeData. Complete our
+   * responder session to that device using the retained preKeyState. The caller
+   * (Slice 5 inbound) routes the incoming handshake here.
+   */
+  async completeDeviceSetResponder({ ownerAccountId = this.ownerAccountId, peerAccountId, peerDeviceId, handshakeData } = {}) {
+    this.#requireDeviceSessions();
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const peer = requireId(peerAccountId, "peerAccountId");
+    const { peerLinkId } = await this._requirePeerDeviceSetContext(owner, peer);
+    const preKeyState = await this.peerLinkStorage.keys.getDevicePreKey(owner, peer);
+    if (!preKeyState || typeof preKeyState !== "object") {
+      const err = new Error("no retained device pre-key state for peer " + peer);
+      err.code = "PEER_LINK_DEVICE_PREKEY_MISSING";
+      throw err;
+    }
+    return this.establishResponderDeviceSession({
+      ownerAccountId: owner,
+      peerAccountId: peer,
+      peerLinkId,
+      peerDeviceId,
+      preKeyState,
+      handshakeData,
     });
   }
 

@@ -523,6 +523,11 @@ class KeyValueNodeKeyMaterialStore {
     // key + its signature by the device key (C). Keyed by (account, deviceId) so a
     // device's material is distinct from the account-level identity above.
     this.deviceIdentityPrefix = "peer-link:keys:device:";
+    // Retained responder pre-key state for a device prekey bundle we PUBLISHED to
+    // a peer (S2.5 Slice 3). When that peer's device runs X3DH against our bundle
+    // and sends us its handshake, we complete as responder using this retained
+    // state. Keyed by (owner, peerAccountId): one published device bundle per peer.
+    this.devicePreKeyPrefix = "peer-link:keys:device-prekey:";
   }
 
   _identityKey(accountId) {
@@ -540,6 +545,12 @@ class KeyValueNodeKeyMaterialStore {
     const owner = assertNonEmptyString(ownerAccountId, "ownerAccountId");
     const normalized = assertNonEmptyString(inviteId, "inviteId");
     return `${this.invitePreKeyPrefix}${owner}::${normalized}`;
+  }
+
+  _devicePreKey(ownerAccountId, peerAccountId) {
+    const owner = assertNonEmptyString(ownerAccountId, "ownerAccountId");
+    const peer = assertNonEmptyString(peerAccountId, "peerAccountId");
+    return `${this.devicePreKeyPrefix}${owner}::${peer}`;
   }
 
   async getAccountIdentity(accountId) {
@@ -586,6 +597,24 @@ class KeyValueNodeKeyMaterialStore {
 
   async deleteInvitePreKey(ownerAccountId, inviteId) {
     return this.keyValueStore.delete(this._invitePreKey(ownerAccountId, inviteId));
+  }
+
+  async getDevicePreKey(ownerAccountId, peerAccountId) {
+    const stored = await this.keyValueStore.get(this._devicePreKey(ownerAccountId, peerAccountId));
+    return cloneJsonValue(stored);
+  }
+
+  async putDevicePreKey(ownerAccountId, peerAccountId, material) {
+    if (material === undefined) {
+      throw new Error("material is required");
+    }
+    const nextMaterial = cloneJsonValue(material);
+    await this.keyValueStore.set(this._devicePreKey(ownerAccountId, peerAccountId), nextMaterial);
+    return cloneJsonValue(nextMaterial);
+  }
+
+  async deleteDevicePreKey(ownerAccountId, peerAccountId) {
+    return this.keyValueStore.delete(this._devicePreKey(ownerAccountId, peerAccountId));
   }
 }
 
