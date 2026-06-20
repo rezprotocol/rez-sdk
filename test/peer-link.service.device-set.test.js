@@ -158,6 +158,22 @@ test("device set: publish → ingest → responder-complete → per-device sessi
   assert.equal(dec(gotBob.plaintextBytes), "hi bob");
 });
 
+test("resolve coordinates are commutative: the resolver independently recomputes the publisher's slot + publisher key", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
+
+  // Alice publishes her set sealed to Bob. Bob, WITHOUT being told where, derives
+  // the same fetch coordinates from his own dh-priv + Alice's dh-pub.
+  const published = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
+  const coords = await bob.svc.resolvePeerDeviceSetCoordinates({ peerAccountId: alice.accountId });
+  assert.equal(coords.recordKind, published.recordKind);
+  assert.equal(coords.recordId, published.recordId, "resolver recomputes the publisher's peer-derived slot");
+  assert.equal(coords.publisherPublicKeyB64, alice.accountPubB64, "publisher is Alice's account (B) key");
+  assert.equal(coords.publisherPublicKeyB64, published.publisherPublicKeyB64);
+});
+
 test("device set is sealed to the peer-derived slot under the publisher's account key", async () => {
   const crypto = new BrowserCryptoProvider();
   const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });

@@ -22,10 +22,12 @@ import {
   DevicePrekeyBundleV1,
   DEVICE_PREKEY_BUNDLE_VERSION,
   DEVICE_PREKEY_BUNDLE_PURPOSE,
+  DEVICE_SET_RECORD_KIND,
 } from "@rezprotocol/core";
 import { canonicalPayloadBytesV1 } from "./inviteCodeV1.js";
 import { DevicePeerSessions } from "./DevicePeerSessions.js";
 import { buildSealedDeviceSetRecord, openSealedDeviceSetRecord } from "./deviceSetPublish.js";
+import { derivePeerScopedKey } from "./peerScopedSeal.js";
 import {
   PEER_LINK_STATE,
   SESSION_STATUS,
@@ -612,6 +614,35 @@ export class PeerLinkService {
       preKeyState,
       handshakeData,
     });
+  }
+
+  /**
+   * RESOLVE coordinates (S2.5 Slice 5): where to FETCH a peer's sealed device-set
+   * DurableRecordV1. The peer-scoped seal slot is commutative — the peer sealed
+   * their set to us at `derivePeerScopedKey(theirDhPriv, ourDhPub).slotRecordId`,
+   * which equals `derivePeerScopedKey(ourDhPriv, theirDhPub).slotRecordId` — so we
+   * recompute the same slot from OUR side with zero online exchange. The durable
+   * publisher is the peer's account (B) public key. The caller (rez-chat) feeds
+   * these to `sdk.durableRecords.get` then hands the fetched record to
+   * `ingestPeerDeviceSet`. NO network here.
+   * @returns {Promise<{ recordKind: string, recordId: string, publisherPublicKeyB64: string }>}
+   */
+  async resolvePeerDeviceSetCoordinates({ ownerAccountId = this.ownerAccountId, peerAccountId } = {}) {
+    this.#requireDeviceSessions();
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const peer = requireId(peerAccountId, "peerAccountId");
+    const { peerIdentityDhPublicKeyB64, peerAccountPublicKeyB64 } = await this._requirePeerDeviceSetContext(owner, peer);
+    const { identityDhKeyPair } = await this._requireBoundX3dhIdentity(owner);
+    const { slotRecordId } = await derivePeerScopedKey({
+      cryptoProvider: this.cryptoProvider,
+      myIdentityDhPrivateKeyB64: bytesToBase64(identityDhKeyPair.privateKey),
+      peerIdentityDhPublicKeyB64,
+    });
+    return {
+      recordKind: DEVICE_SET_RECORD_KIND,
+      recordId: slotRecordId,
+      publisherPublicKeyB64: peerAccountPublicKeyB64,
+    };
   }
 
   /**
