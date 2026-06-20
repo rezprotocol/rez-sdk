@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { SecureChannelManager, X3DHKeyExchange, E2eePacketCodec } from "@rezprotocol/core";
+import { SecureChannelManager, X3DHKeyExchange, E2eePacketCodec, DeviceRegistrationV1, bytesToBase64 } from "@rezprotocol/core";
 
 const SESSION_STATUS_ACTIVE = "active";
 
@@ -168,16 +168,38 @@ export class DevicePeerSessions {
     }
     const scm = this.#scm();
     const x3dh = new X3DHKeyExchange({ secureChannelManager: scm });
-    await x3dh.completeInviteHandshake({
+    const { senderIdentitySigningPublicKey } = await x3dh.completeInviteHandshake({
       preKeyState,
       identityDhPrivate: identityDhKeyPair.privateKey,
       handshakeData,
       peerId: peerAccountId,
     });
+    // Bind the claimed peerDeviceId to the AUTHENTICATED initiator device key
+    // (Audit R2 #1). The X3DH responder verified the initiator's device signing
+    // key (the DH-key signature is checked before any secret is derived), and the
+    // self-cert deviceId IS sha256(that key). The caller passes peerDeviceId from
+    // a PLAINTEXT claim (the in-band handshake's senderDeviceId), so without this
+    // check a peer could run a valid handshake with its OWN device key yet claim
+    // ANOTHER device's id, poisoning the session map. Refuse the mismatch and
+    // persist nothing — the forged first-contact never establishes a session.
+    if (!(senderIdentitySigningPublicKey instanceof Uint8Array) || senderIdentitySigningPublicKey.length === 0) {
+      const err = new Error("establishResponderDeviceSession: handshake yielded no authenticated device key");
+      err.code = "DEVICE_HANDSHAKE_UNAUTHENTICATED";
+      throw err;
+    }
+    const authenticatedDeviceId = DeviceRegistrationV1.deviceIdFor(bytesToBase64(senderIdentitySigningPublicKey));
+    if (authenticatedDeviceId !== peerDeviceId) {
+      const err = new Error(
+        "establishResponderDeviceSession: claimed peerDeviceId does not match the authenticated device key"
+        + " (claimed " + peerDeviceId + ", authenticated " + authenticatedDeviceId + ")",
+      );
+      err.code = "DEVICE_ID_MISMATCH";
+      throw err;
+    }
     const sessionId = await this.#withLock(this.#lockKey(ownerAccountId, peerLinkId, peerDeviceId), () => this.#persistDeviceSession({
       ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, snapshot: scm.exportSnapshot(),
     }));
-    return { sessionId };
+    return { sessionId, authenticatedDeviceId };
   }
 
   /**
