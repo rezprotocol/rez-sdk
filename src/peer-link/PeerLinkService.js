@@ -1580,6 +1580,14 @@ export class PeerLinkService {
     const inviterIdentityDhPubKeyB64 = nonEmpty(
       envelope.binding && envelope.binding.x3dh ? envelope.binding.x3dh.identityDhPublicKeyB64 : null,
     );
+    // Persist the inviter's ACCOUNT identity (B) public key. This is the durable-
+    // record PUBLISHER key under which the inviter publishes its sealed device set
+    // (S2.5 Slice 3) — a resolver needs it (alongside the peer-derived slot) to
+    // fetch the peer's device set via durableRecords.get. The accountId derives
+    // from it but is not reversible, so the raw pubkey must be recorded.
+    const inviterAccountIdentityPubKeyB64 = nonEmpty(
+      envelope.binding && envelope.binding.x3dh ? envelope.binding.x3dh.accountIdentityPublicKeyB64 : null,
+    );
     const peerInboxIdForLink = envelope.binding && typeof envelope.binding === "object" ? nonEmpty(envelope.binding.capabilityId) : null;
     let peerLinkRecord;
     if (reattempt) {
@@ -1592,6 +1600,7 @@ export class PeerLinkService {
         ...existing,
         remoteIdentitySigningPublicKeyB64: inviterIdentitySigningPubKeyB64,
         remoteIdentityDhPublicKeyB64: inviterIdentityDhPubKeyB64,
+        remoteAccountIdentityPublicKeyB64: inviterAccountIdentityPubKeyB64,
         state: "accept_committed",
         activeInviteId: requireId(envelope.inviteId, "inviteId"),
         activeSessionId: null,
@@ -1607,6 +1616,7 @@ export class PeerLinkService {
         peerAccountId: inviterAccountId,
         remoteIdentitySigningPublicKeyB64: inviterIdentitySigningPubKeyB64,
         remoteIdentityDhPublicKeyB64: inviterIdentityDhPubKeyB64,
+        remoteAccountIdentityPublicKeyB64: inviterAccountIdentityPubKeyB64,
         state: "accept_committed",
         activeInviteId: requireId(envelope.inviteId, "inviteId"),
         activeSessionId: null,
@@ -2026,6 +2036,11 @@ export class PeerLinkService {
     // device-set seal (S2.5 Slice 3). Record it so this side can later derive
     // that key. A re-establishment that re-learns it refreshes the stored value.
     const peerIdentityDhPubKeyB64 = nonEmpty(handshakeData.senderIdentityDhPubKeyB64);
+    // The acceptor's account binding (verified above) carries its ACCOUNT identity
+    // (B) public key — the durable-record PUBLISHER key under which the acceptor
+    // publishes its sealed device set (S2.5 Slice 3). Persist it so this side can
+    // later fetch the peer's device set via durableRecords.get.
+    const peerAccountIdentityPubKeyB64 = nonEmpty(senderBinding.accountIdentityPublicKeyB64);
     let peerLinkRecord = existing;
     if (!peerLinkRecord) {
       peerLinkRecord = await this.peerLinkStorage.peerLinks.create({
@@ -2033,6 +2048,7 @@ export class PeerLinkService {
         localAccountId: owner,
         peerAccountId,
         remoteIdentityDhPublicKeyB64: peerIdentityDhPubKeyB64,
+        remoteAccountIdentityPublicKeyB64: peerAccountIdentityPubKeyB64,
         state: "handshake_received",
         activeInviteId: inviteId,
         activeSessionId: null,
@@ -2042,10 +2058,17 @@ export class PeerLinkService {
         lastErrorMessage: null,
         version: 1,
       });
-    } else if (peerIdentityDhPubKeyB64 && existing.remoteIdentityDhPublicKeyB64 !== peerIdentityDhPubKeyB64) {
-      // Carry the (possibly newly-learned) peer identity-DH pubkey onto the
+    } else if (
+      (peerIdentityDhPubKeyB64 && existing.remoteIdentityDhPublicKeyB64 !== peerIdentityDhPubKeyB64)
+      || (peerAccountIdentityPubKeyB64 && existing.remoteAccountIdentityPublicKeyB64 !== peerAccountIdentityPubKeyB64)
+    ) {
+      // Carry the (possibly newly-learned) peer identity material onto the
       // in-memory record so #commitSession's spread persists it.
-      peerLinkRecord = { ...existing, remoteIdentityDhPublicKeyB64: peerIdentityDhPubKeyB64 };
+      peerLinkRecord = {
+        ...existing,
+        remoteIdentityDhPublicKeyB64: peerIdentityDhPubKeyB64 || existing.remoteIdentityDhPublicKeyB64,
+        remoteAccountIdentityPublicKeyB64: peerAccountIdentityPubKeyB64 || existing.remoteAccountIdentityPublicKeyB64,
+      };
     }
     const { secureChannelManager } = await this.#establishAsResponder({
       ownerAccountId: owner,
