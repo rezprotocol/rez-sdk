@@ -392,6 +392,85 @@ export class RezClient {
   }
 
   /**
+   * Seal a message for ONE recipient DEVICE (S2.5 Slice 5 per-device fan-out).
+   * Mirrors sealForPeer but uses the per-device session (peerDeviceId) and
+   * delivers to that device's own inbox. The caller (rez-chat fan-out) resolves
+   * the recipient's device set and calls this once per device. `deliverInboxId`
+   * is the device's inbox (from its DeviceSetRecordV1 entry). `deviceHandshakeData`
+   * (when present) is the X3DH initiator output the recipient device needs to
+   * complete its responder session before it can decrypt — carried on first
+   * contact; the inbound pipeline routes it to completeDeviceSetResponder.
+   *
+   * This is the GATED path: it is only called when the E6 fan-out gate is open
+   * (Slice 8). The default send path stays sealForPeer (single-device).
+   */
+  async sealForPeerDevice({ peerAccountId, peerDeviceId, deliverInboxId, plaintextBodyBytes, receiptInboxId, deviceHandshakeData = null } = {}) {
+    if (!(plaintextBodyBytes instanceof Uint8Array)) {
+      throw new Error("sealForPeerDevice requires Uint8Array plaintextBodyBytes");
+    }
+    const remote = typeof peerAccountId === "string" ? peerAccountId.trim() : "";
+    if (!remote) {
+      throw new Error("sealForPeerDevice requires peerAccountId");
+    }
+    const device = typeof peerDeviceId === "string" ? peerDeviceId.trim() : "";
+    if (!device) {
+      throw new Error("sealForPeerDevice requires peerDeviceId");
+    }
+    const deliver = typeof deliverInboxId === "string" ? deliverInboxId.trim() : "";
+    if (!deliver) {
+      throw new Error("sealForPeerDevice requires deliverInboxId (the recipient device's inbox)");
+    }
+    const peerLinkService = this.#peerLinkService;
+    if (!peerLinkService || typeof peerLinkService.encryptDirectMessageForDevice !== "function") {
+      throw new Error("sealForPeerDevice requires a peerLinkService with per-device sessions");
+    }
+
+    let peerLinkRecord = null;
+    if (peerLinkService.peerLinkStorage && peerLinkService.ownerAccountId) {
+      peerLinkRecord = await peerLinkService.peerLinkStorage.peerLinks.getByPair(
+        peerLinkService.ownerAccountId, remote,
+      );
+    }
+    const peerLinkId = peerLinkRecord && typeof peerLinkRecord.peerLinkId === "string" && peerLinkRecord.peerLinkId.trim().length > 0
+      ? peerLinkRecord.peerLinkId.trim()
+      : null;
+
+    const encResult = await peerLinkService.encryptDirectMessageForDevice({
+      peerAccountId: remote,
+      peerLinkId,
+      peerDeviceId: device,
+      plaintextBytes: plaintextBodyBytes,
+    });
+    if (!encResult || !encResult.encryptedPacket) {
+      throw new Error("sealForPeerDevice: encryptDirectMessageForDevice returned no packet");
+    }
+    const ciphertextBytes = encResult.encryptedPacket.toBytes();
+
+    let capChain = null;
+    if (peerLinkRecord && peerLinkRecord.peerLinkId && typeof peerLinkService.getPostCapForPeerLink === "function") {
+      const cap = await peerLinkService.getPostCapForPeerLink(peerLinkService.ownerAccountId, peerLinkRecord.peerLinkId);
+      if (cap) capChain = [cap];
+    }
+
+    const metadata = { peerDeviceId: device };
+    if (typeof receiptInboxId === "string" && receiptInboxId.trim().length > 0) {
+      metadata.receiptInboxId = receiptInboxId.trim();
+    }
+    if (deviceHandshakeData != null) {
+      metadata.deviceHandshakeData = deviceHandshakeData;
+    }
+
+    return {
+      object: {
+        payloadBytes: ciphertextBytes,
+        metadata,
+        capChain: Array.isArray(capChain) && capChain.length > 0 ? capChain : null,
+      },
+      address: buildInboxAddress({ inboxId: deliver }),
+    };
+  }
+
+  /**
    * Trigger and return the latest mesh status from the node. Mirrors the
    * in-process `nodeRuntime.refreshMesh()`. Notifies any subscribers
    * registered via onMeshStatusChanged.

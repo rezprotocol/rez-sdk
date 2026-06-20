@@ -190,3 +190,94 @@ test("propagates an encryption failure — fails closed, never produces an objec
   );
   assert.equal(pool.sent.length, 0);
 });
+
+// --- sealForPeerDevice (S2.5 Slice 5 per-device fan-out; the GATED path) ---
+// Same "build the object" contract as sealForPeer, but device-targeted: it uses
+// encryptDirectMessageForDevice + delivers to the recipient DEVICE's own inbox
+// and carries the per-device session handshake on first contact. The crypto
+// round-trip is proven un-mocked in the device-session/device-set tests; these
+// pin the envelope glue (the SDK's job), mirroring the sealForPeer tests above.
+
+test("sealForPeerDevice targets the recipient device's inbox + tags the session device", async () => {
+  const pool = makeFakePool();
+  const seen = [];
+  const peerLinkService = {
+    ownerAccountId: "rez:acct:owner",
+    peerLinkStorage: { peerLinks: { getByPair: async () => ({ peerInboxId: "inbox:legacy", peerLinkId: "pl_dev" }) } },
+    encryptDirectMessageForDevice: async (args) => { seen.push(args); return { encryptedPacket: { toBytes: () => new Uint8Array([0xBE, 0xEF]) } }; },
+  };
+  const client = makeClient({ pool, peerLinkService });
+
+  const sealed = await client.sealForPeerDevice({
+    peerAccountId: "rez:acct:peer",
+    peerDeviceId: "rez:dev:abc",
+    deliverInboxId: "inbox:peer-device-abc",
+    plaintextBodyBytes: new Uint8Array([1, 2, 3]),
+    receiptInboxId: "inbox:mine",
+  });
+
+  // Encryption ran on the per-device session, with the resolved peerLinkId.
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].peerDeviceId, "rez:dev:abc");
+  assert.equal(seen[0].peerLinkId, "pl_dev");
+  // Address is the DEVICE's inbox, not the legacy peer inbox.
+  assert.equal(sealed.address.kind, MESH_ADDRESS_KINDS.INBOX);
+  assert.equal(sealed.address.inboxId, "inbox:peer-device-abc");
+  assert.deepEqual([...sealed.object.payloadBytes], [0xBE, 0xEF]);
+  assert.equal(sealed.object.metadata.peerDeviceId, "rez:dev:abc");
+  assert.equal(sealed.object.metadata.receiptInboxId, "inbox:mine");
+  // Pure build — nothing on the wire.
+  assert.equal(pool.sent.length, 0);
+});
+
+test("sealForPeerDevice carries the device handshake on first contact", async () => {
+  const pool = makeFakePool();
+  const peerLinkService = {
+    encryptDirectMessageForDevice: async () => ({ encryptedPacket: { toBytes: () => new Uint8Array([7]) } }),
+  };
+  const client = makeClient({ pool, peerLinkService });
+
+  const sealed = await client.sealForPeerDevice({
+    peerAccountId: "rez:acct:peer",
+    peerDeviceId: "rez:dev:abc",
+    deliverInboxId: "inbox:peer-device-abc",
+    plaintextBodyBytes: new Uint8Array([1]),
+    deviceHandshakeData: { x3dh: "initiator-output" },
+  });
+  assert.deepEqual(sealed.object.metadata.deviceHandshakeData, { x3dh: "initiator-output" });
+});
+
+test("sealForPeerDevice folds the peer-link post-cap into capChain", async () => {
+  const pool = makeFakePool();
+  const peerLinkService = {
+    ownerAccountId: "rez:acct:owner",
+    peerLinkStorage: { peerLinks: { getByPair: async () => ({ peerLinkId: "pl_dev" }) } },
+    encryptDirectMessageForDevice: async () => ({ encryptedPacket: { toBytes: () => new Uint8Array([1]) } }),
+    getPostCapForPeerLink: async () => ({ cap: "signed-post-cap" }),
+  };
+  const client = makeClient({ pool, peerLinkService });
+  const sealed = await client.sealForPeerDevice({
+    peerAccountId: "rez:acct:peer",
+    peerDeviceId: "rez:dev:abc",
+    deliverInboxId: "inbox:peer-device-abc",
+    plaintextBodyBytes: new Uint8Array([1]),
+  });
+  assert.deepEqual(sealed.object.capChain, [{ cap: "signed-post-cap" }]);
+});
+
+test("sealForPeerDevice fails closed without a peerDeviceId or deliverInboxId", async () => {
+  const pool = makeFakePool();
+  const peerLinkService = {
+    encryptDirectMessageForDevice: async () => ({ encryptedPacket: { toBytes: () => new Uint8Array([1]) } }),
+  };
+  const client = makeClient({ pool, peerLinkService });
+  await assert.rejects(
+    () => client.sealForPeerDevice({ peerAccountId: "rez:acct:peer", deliverInboxId: "inbox:x", plaintextBodyBytes: new Uint8Array([1]) }),
+    /peerDeviceId/,
+  );
+  await assert.rejects(
+    () => client.sealForPeerDevice({ peerAccountId: "rez:acct:peer", peerDeviceId: "rez:dev:abc", plaintextBodyBytes: new Uint8Array([1]) }),
+    /deliverInboxId/,
+  );
+  assert.equal(pool.sent.length, 0);
+});
