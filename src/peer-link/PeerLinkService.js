@@ -213,6 +213,11 @@ export class PeerLinkService {
   // (legacy single-device construction) — the per-device methods then fail loud.
   #deviceSigningKeyPair;
   #devicePeerSessions;
+  // Seed-derived account-level identity-DH (X25519) keypair, when supplied.
+  // Authoritative over any locally-generated DH key so every device of an
+  // account shares ONE identity-DH key — the requirement for the peer-scoped
+  // device-set seal (peerScopedSeal) to be openable by all of a peer's devices.
+  #accountIdentityDhKeyPair;
 
   constructor({
     storageProvider,
@@ -227,6 +232,7 @@ export class PeerLinkService {
     strictTransitions = false,
     deviceKeyPair = null,
     deviceId = null,
+    accountIdentityDhKeyPair = null,
   } = {}) {
     if (!storageProvider || typeof storageProvider.getPeerLinkStorage !== "function") {
       throw new Error("PeerLinkService requires storageProvider.getPeerLinkStorage()");
@@ -285,6 +291,19 @@ export class PeerLinkService {
         privateKey: base64ToBytes(deviceKeyPair.privateKeyB64),
       };
       this.#devicePeerSessions = new DevicePeerSessions({ cryptoProvider, peerLinkStorage: this.peerLinkStorage, clock });
+    }
+
+    // Seed-derived account identity-DH key (X25519 SPKI/PKCS8 base64). When the
+    // keystore supplies it, it is the SAME on every device of the account, so
+    // the device-set peer-scoped seal a peer publishes is openable by all of
+    // this account's devices. Validated for shape here; consumed authoritatively
+    // in _loadAccountKeyRecord.
+    this.#accountIdentityDhKeyPair = null;
+    if (accountIdentityDhKeyPair && accountIdentityDhKeyPair.publicKeyB64 && accountIdentityDhKeyPair.privateKeyB64) {
+      this.#accountIdentityDhKeyPair = {
+        publicKeyB64: nonEmpty(accountIdentityDhKeyPair.publicKeyB64),
+        privateKeyB64: nonEmpty(accountIdentityDhKeyPair.privateKeyB64),
+      };
     }
   }
 
@@ -936,10 +955,21 @@ export class PeerLinkService {
     const owner = requireId(accountId, "accountId");
     const stored = await this.peerLinkStorage.keys.getAccountIdentity(owner);
     const normalized = this._normalizeStoredAccountKeyRecord(stored);
+    const injectedDh = this.#accountIdentityDhKeyPair;
     const hasSigning = normalized.x3dhKeyMaterial.publicKeyB64 && normalized.x3dhKeyMaterial.privateKeyB64;
+    // A seed-derived account identity-DH key, when supplied, is AUTHORITATIVE:
+    // a stored DH key is only valid if it matches it. A legacy vault that
+    // generated a random DH key (or a fresh device) is rebuilt + re-persisted to
+    // the seed-derived key so every device of the account shares ONE identity-DH
+    // key (the peer-scoped seal requirement). Without an injected key, any stored
+    // DH key is accepted (unchanged legacy behaviour).
+    const storedDhMatchesInjected = !injectedDh
+      || (normalized.x3dhIdentityDhKeyMaterial.publicKeyB64 === injectedDh.publicKeyB64
+        && normalized.x3dhIdentityDhKeyMaterial.privateKeyB64 === injectedDh.privateKeyB64);
     const hasDh = normalized.x3dhIdentityDhKeyMaterial.publicKeyB64
       && normalized.x3dhIdentityDhKeyMaterial.privateKeyB64
-      && normalized.identityDhSignatureB64;
+      && normalized.identityDhSignatureB64
+      && storedDhMatchesInjected;
     if (hasSigning && hasDh) {
       const persistMissing = !stored
         || !stored.x3dhKeyMaterial
@@ -964,18 +994,28 @@ export class PeerLinkService {
       signingPublicKeyB64 = bytesToBase64(generated.publicKey);
       signingPrivateKeyB64 = bytesToBase64(generated.privateKey);
     }
-    // Generate the long-term identity DH key (X25519) and sign its pubkey with
-    // the X3DH identity signing key. This binds the DH key to the identity so
-    // that DH1 in X3DH cryptographically requires possession of the identity
-    // signing privkey — closing the impersonation gap from SECURITY_AUDIT.md
-    // CRITICAL-1.
-    const dhPair = await this.cryptoProvider.dhGenerateKeyPair();
-    if (!dhPair || !(dhPair.publicKey instanceof Uint8Array) || !(dhPair.privateKey instanceof Uint8Array)) {
-      throw new Error("cryptoProvider.dhGenerateKeyPair() returned invalid key pair");
+    // The long-term identity-DH key (X25519): use the seed-derived account key
+    // when supplied (same on every device → the peer-scoped seal opens on all of
+    // them), else generate a device-local random one (legacy single-device).
+    // Either way, sign its pubkey with the X3DH identity signing key so that
+    // DH1 in X3DH cryptographically requires possession of the identity signing
+    // privkey — closing the impersonation gap from SECURITY_AUDIT.md CRITICAL-1.
+    let dhPublicKeyB64;
+    let dhPrivateKeyB64;
+    if (injectedDh) {
+      dhPublicKeyB64 = injectedDh.publicKeyB64;
+      dhPrivateKeyB64 = injectedDh.privateKeyB64;
+    } else {
+      const dhPair = await this.cryptoProvider.dhGenerateKeyPair();
+      if (!dhPair || !(dhPair.publicKey instanceof Uint8Array) || !(dhPair.privateKey instanceof Uint8Array)) {
+        throw new Error("cryptoProvider.dhGenerateKeyPair() returned invalid key pair");
+      }
+      dhPublicKeyB64 = bytesToBase64(dhPair.publicKey);
+      dhPrivateKeyB64 = bytesToBase64(dhPair.privateKey);
     }
     const identityDhSignature = await this.cryptoProvider.sign({
       privateKey: base64ToBytes(signingPrivateKeyB64),
-      msg: dhPair.publicKey,
+      msg: base64ToBytes(dhPublicKeyB64),
     });
     if (!(identityDhSignature instanceof Uint8Array)) {
       throw new Error("cryptoProvider.sign() returned invalid signature");
@@ -986,8 +1026,8 @@ export class PeerLinkService {
         privateKeyB64: signingPrivateKeyB64,
       },
       x3dhIdentityDhKeyMaterial: {
-        publicKeyB64: bytesToBase64(dhPair.publicKey),
-        privateKeyB64: bytesToBase64(dhPair.privateKey),
+        publicKeyB64: dhPublicKeyB64,
+        privateKeyB64: dhPrivateKeyB64,
       },
       identityDhSignatureB64: bytesToBase64(identityDhSignature),
       accountBinding: hasSigning && stored && stored.accountBinding ? stored.accountBinding : null,
