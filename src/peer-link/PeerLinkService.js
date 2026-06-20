@@ -191,6 +191,14 @@ function _postCapKey(ownerAccountId, peerLinkId) {
   return "peer-link:post-cap:" + ownerAccountId + ":" + peerLinkId;
 }
 
+// The highest device-set revision ever accepted from a peer. Persisted so the
+// rollback floor survives a sender restart (Audit R3 #5) — the chat-side resolve
+// cache resets to 0 on restart, which would otherwise let a replayed old set
+// through and resurrect a since-removed device's session.
+function _deviceSetFloorKey(ownerAccountId, peerAccountId) {
+  return "peer-link:device-set-floor:" + ownerAccountId + ":" + peerAccountId;
+}
+
 export class PeerLinkService {
   #decryptFailureCounts;
   // Per-(owner:peer) count of any-peer trial-decrypt total misses. Unlike
@@ -598,7 +606,15 @@ export class PeerLinkService {
     // MONOTONIC counter — peers honor the highest and treat a lower one as stale.
     // Refuse a set whose revision regresses below one we already ingested so a
     // replayed old set can't resurrect a since-removed device's session.
-    const floor = Number.isInteger(minRevision) && minRevision > 0 ? minRevision : 0;
+    //
+    // The floor is DURABLE (Audit R3 #5): we persist the highest revision ever
+    // accepted from this peer and take max(caller minRevision, persisted floor).
+    // The caller's minRevision came from a volatile cache that resets to 0 on
+    // restart; the persisted floor is what actually defends a rolled-back set
+    // after a restart, intrinsic to the mechanism rather than hand-passed.
+    const persistedFloor = await this.#loadDeviceSetFloor(owner, peer);
+    const passedFloor = Number.isInteger(minRevision) && minRevision > 0 ? minRevision : 0;
+    const floor = Math.max(persistedFloor, passedFloor);
     if (floor > 0 && deviceSetRecord.revision < floor) {
       const err = new Error(
         "ingestPeerDeviceSet: stale device-set revision " + deviceSetRecord.revision
@@ -635,7 +651,23 @@ export class PeerLinkService {
       });
       established.push({ peerDeviceId: bundle.deviceId, handshakeData, sessionId });
     }
+    // Advance the durable floor AFTER establishment succeeds, so a later replay of
+    // an older set is rejected even across a restart. Only bump (never lower).
+    if (deviceSetRecord.revision > persistedFloor) {
+      await this.#saveDeviceSetFloor(owner, peer, deviceSetRecord.revision);
+    }
     return { deviceSetRecord, prekeyBundleRecords, established, reused, revision: deviceSetRecord.revision };
+  }
+
+  // The persisted rollback floor for a peer's device set (Audit R3 #5).
+  async #loadDeviceSetFloor(ownerAccountId, peerAccountId) {
+    const stored = await this.kv.get(_deviceSetFloorKey(ownerAccountId, peerAccountId));
+    const rev = stored && typeof stored === "object" ? stored.revision : stored;
+    return Number.isInteger(rev) && rev > 0 ? rev : 0;
+  }
+
+  async #saveDeviceSetFloor(ownerAccountId, peerAccountId, revision) {
+    await this.kv.set(_deviceSetFloorKey(ownerAccountId, peerAccountId), { revision });
   }
 
   /**

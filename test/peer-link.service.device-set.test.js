@@ -322,3 +322,36 @@ test("Audit R2 #2: ingest rejects a device set whose revision rolls back below a
   assert.equal(ok.revision, 1);
   assert.equal(ok.established.length, 1);
 });
+
+test("Audit R3 #5: a successful ingest persists the revision floor durably", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
+  const { record } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
+
+  await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record });
+  const floorKey = "peer-link:device-set-floor:" + bob.accountId + ":" + alice.accountId;
+  assert.deepEqual(await bob.sp.getKeyValueStore().get(floorKey), { revision: 1 },
+    "the highest accepted revision is persisted so the floor survives a restart");
+});
+
+test("Audit R3 #5: the DURABLE floor rejects a rolled-back set even when the caller passes minRevision 0 (sender restart)", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
+  const { record } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
+
+  // Simulate a PRIOR acceptance of a higher revision (5). The chat-side resolve
+  // cache that supplies minRevision resets to 0 on restart — but the durable
+  // floor persists, so a replayed revision-1 set must still be refused.
+  const floorKey = "peer-link:device-set-floor:" + bob.accountId + ":" + alice.accountId;
+  await bob.sp.getKeyValueStore().set(floorKey, { revision: 5 });
+
+  await assert.rejects(
+    // Note: minRevision omitted (defaults 0) — the post-restart caller.
+    () => bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record }),
+    (err) => err && err.code === "DEVICE_SET_STALE_REVISION" && err.revision === 1 && err.knownRevision === 5,
+  );
+});

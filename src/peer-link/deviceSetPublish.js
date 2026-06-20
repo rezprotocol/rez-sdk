@@ -220,9 +220,21 @@ export async function openSealedDeviceSetRecord({
   }
 
   const rawBundles = Array.isArray(inner.prekeyBundles) ? inner.prekeyBundles : [];
+  // E7 amplification bound (Audit P2): cap the bundle array and admit at most ONE
+  // bundle per deviceId. The device cap bounds `devices.length`, but the bundle
+  // array was unbounded — N DUPLICATE valid bundles for one device would each
+  // drive a session establishment in the caller. Bound the count, then dedup.
+  if (rawBundles.length > maxDevices) {
+    throw new Error("openSealedDeviceSetRecord: prekey bundle array exceeds maxDevices (" + rawBundles.length + " > " + maxDevices + ")");
+  }
   const prekeyBundleRecords = [];
+  const seenBundleDeviceIds = new Set();
   for (const rawBundle of rawBundles) {
     const bundle = DevicePrekeyBundleV1.fromJSON(rawBundle);
+    if (seenBundleDeviceIds.has(bundle.deviceId)) {
+      throw new Error("openSealedDeviceSetRecord: duplicate prekey bundle for device (" + bundle.deviceId + ")");
+    }
+    seenBundleDeviceIds.add(bundle.deviceId);
     // Every bundle MUST correspond to a device the account vouches for, with
     // matching key + inbox — the account-signed set is the authority over which
     // (device, inbox) pairs exist; the bundle only adds the device-signed prekeys.
