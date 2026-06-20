@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { bytesToBase64, base64ToBytes, deriveAccountIdFromPublicKey, DeviceRegistrationV1 } from "@rezprotocol/core";
+import { bytesToBase64, deriveAccountIdFromPublicKey, DeviceRegistrationV1 } from "@rezprotocol/core";
 import { SeedKeys } from "@rezprotocol/core/src/crypto/seedDerivation.js";
 import { createKeyValueBackedPeerLinkStorage } from "../src/peer-link/createKeyValueBackedPeerLinkStorage.js";
 import { PeerLinkService } from "../src/peer-link/PeerLinkService.js";
@@ -111,7 +111,7 @@ test("without an injected key the legacy path still generates a (device-local ra
   assert.notEqual(a.identityDhPubB64, c.identityDhPubB64, "legacy device-local keys differ");
 });
 
-test("an injected key is AUTHORITATIVE: it replaces a previously-stored random DH key", async () => {
+test("no in-place migration (Audit R2 #3): an injected key that mismatches a stored random DH key fails loud, not silently replaces it", async () => {
   const crypto = new BrowserCryptoProvider();
   const b = await crypto.generateSigningKeyPair();
   const accountPubB64 = bytesToBase64(b.publicKey);
@@ -119,7 +119,10 @@ test("an injected key is AUTHORITATIVE: it replaces a previously-stored random D
 
   // First materialize WITHOUT an injected key (a legacy vault persists a random
   // DH key), then construct again over the SAME storage WITH the seed-derived
-  // key — the stored random key must be rebuilt to the injected one.
+  // key. Silently rebuilding to the injected key would rotate the account's
+  // long-term DH key out from under already-linked peers (who hold the OLD pubkey
+  // and would compute a different device-set slot) — so it must fail loud, not
+  // migrate. A fresh account seed-derives at creation and never hits this.
   const sp = makeStorageProvider();
   const authority = {
     signer: {
@@ -152,15 +155,13 @@ test("an injected key is AUTHORITATIVE: it replaces a previously-stored random D
   assert.notEqual(randomDhPub, seededDh.publicKeyB64, "precondition: stored random key differs from the seed key");
 
   const upgraded = new PeerLinkService({ ...common, accountIdentityDhKeyPair: seededDh });
-  const upgradedDhPub = bytesToBase64((await upgraded._requireBoundX3dhIdentity(accountId)).identityDhKeyPair.publicKey);
-  assert.equal(upgradedDhPub, seededDh.publicKeyB64, "the injected seed-derived key replaced the stored random one");
+  await assert.rejects(
+    () => upgraded._requireBoundX3dhIdentity(accountId),
+    (err) => err && err.code === "ACCOUNT_IDENTITY_DH_MISMATCH",
+  );
 
-  // And the persisted identity-DH signature still verifies over the NEW key.
+  // The stored random key is left untouched (no silent rotation that would break
+  // already-linked peers): the persisted DH pub is still the original random one.
   const rec = await sp.peerLinkStorage.keys.getAccountIdentity(accountId);
-  const ok = await crypto.verify({
-    publicKey: base64ToBytes(rec.x3dhKeyMaterial.publicKeyB64),
-    msg: base64ToBytes(rec.x3dhIdentityDhKeyMaterial.publicKeyB64),
-    sig: base64ToBytes(rec.identityDhSignatureB64),
-  });
-  assert.equal(ok, true, "identityDhSignature re-signed over the seed-derived DH pub");
+  assert.equal(rec.x3dhIdentityDhKeyMaterial.publicKeyB64, randomDhPub, "the stored DH key was NOT silently replaced");
 });

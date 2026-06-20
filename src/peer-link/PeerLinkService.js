@@ -1012,13 +1012,30 @@ export class PeerLinkService {
     // the seed-derived key so every device of the account shares ONE identity-DH
     // key (the peer-scoped seal requirement). Without an injected key, any stored
     // DH key is accepted (unchanged legacy behaviour).
+    const storedHasDh = Boolean(normalized.x3dhIdentityDhKeyMaterial.publicKeyB64
+      && normalized.x3dhIdentityDhKeyMaterial.privateKeyB64
+      && normalized.identityDhSignatureB64);
     const storedDhMatchesInjected = !injectedDh
       || (normalized.x3dhIdentityDhKeyMaterial.publicKeyB64 === injectedDh.publicKeyB64
         && normalized.x3dhIdentityDhKeyMaterial.privateKeyB64 === injectedDh.privateKeyB64);
-    const hasDh = normalized.x3dhIdentityDhKeyMaterial.publicKeyB64
-      && normalized.x3dhIdentityDhKeyMaterial.privateKeyB64
-      && normalized.identityDhSignatureB64
-      && storedDhMatchesInjected;
+    // No in-place key migration (Audit R2 #3). The seed-derived identity-DH key is
+    // intrinsic from account creation, so a fresh account persists it on first
+    // load and thereafter stored === injected. A stored key that DIFFERS from the
+    // injected seed key means this account predates seed-derivation. The prior
+    // behaviour silently REPLACED it — rotating the account's long-term DH key out
+    // from under already-linked peers, who still hold the old pubkey and would
+    // compute a different device-set slot (a silent half-migration). Refuse
+    // fail-loud instead: the account must be re-created / re-linked to adopt the
+    // seed-derived key.
+    if (storedHasDh && injectedDh && !storedDhMatchesInjected) {
+      const err = new Error(
+        "PeerLinkService: persisted account identity-DH key does not match the seed-derived key "
+        + "(this account predates seed-derived identity-DH — no in-place migration; re-create/re-link to adopt it)",
+      );
+      err.code = "ACCOUNT_IDENTITY_DH_MISMATCH";
+      throw err;
+    }
+    const hasDh = storedHasDh && storedDhMatchesInjected;
     if (hasSigning && hasDh) {
       const persistMissing = !stored
         || !stored.x3dhKeyMaterial
