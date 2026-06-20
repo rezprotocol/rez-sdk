@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { DeviceRegistrationV1, bytesToBase64 } from "@rezprotocol/core";
 import { createKeyValueBackedPeerLinkStorage } from "../src/peer-link/createKeyValueBackedPeerLinkStorage.js";
 import { DevicePeerSessions } from "../src/peer-link/DevicePeerSessions.js";
 // REAL crypto (Ed25519 / X25519 / AES-256-GCM via WebCrypto). The cross-device
@@ -26,7 +27,6 @@ function makeKvStore() {
 
 const OWNER = "rez:acct:owner";
 const PEER = "rez:acct:peer";
-const MY_DEVICE_ID = "rez:dev:me";
 const DEV_A = "rez:dev:a";
 const DEV_B = "rez:dev:b";
 const MY_LINK = "pl_owner_to_peer";
@@ -47,8 +47,11 @@ async function makeWorld() {
   });
   const mineStorage = createKeyValueBackedPeerLinkStorage({ keyValueStore: makeKvStore() });
   const mine = new DevicePeerSessions({ cryptoProvider: crypto, peerLinkStorage: mineStorage });
-  // My device's own per-device X3DH identity (D-a).
+  // My device's own per-device X3DH identity (D-a). My self-cert deviceId is the
+  // sha256 of my device signing key — the responder authenticates this (Audit R2
+  // #1), so the claimed id must be the real one, not an arbitrary label.
   const myIdentity = await makeIdentity();
+  const myDeviceId = DeviceRegistrationV1.deviceIdFor(bytesToBase64(myIdentity.signing.publicKey));
 
   // Each peer DEVICE is its own client (own storage), same peer account.
   async function makePeerDevice(deviceLink) {
@@ -85,18 +88,18 @@ async function makeWorld() {
       ownerAccountId: PEER,
       peerAccountId: OWNER,
       peerLinkId: peerDevice.deviceLink,
-      peerDeviceId: MY_DEVICE_ID,
+      peerDeviceId: myDeviceId,
       identityDhKeyPair: peerDevice.dh,
       preKeyState,
       handshakeData,
     });
   }
 
-  return { crypto, mine, mineStorage, makePeerDevice, establish };
+  return { crypto, mine, mineStorage, makePeerDevice, establish, myDeviceId };
 }
 
 test("each peer device establishes an independent session and decrypts its OWN ciphertext", async () => {
-  const { mine, makePeerDevice, establish } = await makeWorld();
+  const { mine, makePeerDevice, establish, myDeviceId } = await makeWorld();
   const devA = await makePeerDevice(A_LINK);
   const devB = await makePeerDevice(B_LINK);
   await establish(devA, DEV_A);
@@ -110,7 +113,7 @@ test("each peer device establishes an independent session and decrypts its OWN c
   });
   assert.ok(gotA, "device A decrypts its own packet");
   assert.equal(dec(gotA.plaintextBytes), "for A");
-  assert.equal(gotA.peerDeviceId, MY_DEVICE_ID, "trial routing identifies the sender device");
+  assert.equal(gotA.peerDeviceId, myDeviceId, "trial routing identifies the sender device");
 
   const { encryptedPacket: pktB } = await mine.encryptForDevice({
     ownerAccountId: OWNER, peerAccountId: PEER, peerLinkId: MY_LINK, peerDeviceId: DEV_B, plaintextBytes: enc("for B"),
@@ -123,7 +126,7 @@ test("each peer device establishes an independent session and decrypts its OWN c
 });
 
 test("a packet for device A does NOT decrypt on device B (distinct ratchets)", async () => {
-  const { mine, makePeerDevice, establish } = await makeWorld();
+  const { mine, makePeerDevice, establish, myDeviceId } = await makeWorld();
   const devA = await makePeerDevice(A_LINK);
   const devB = await makePeerDevice(B_LINK);
   await establish(devA, DEV_A);
@@ -157,7 +160,7 @@ test("HEADLINE (no cross-advance): encrypting for device A leaves device B's sna
 });
 
 test("a failed trial-decrypt leaves the receiver's session byte-unchanged (no corruption)", async () => {
-  const { mine, makePeerDevice, establish } = await makeWorld();
+  const { mine, makePeerDevice, establish, myDeviceId } = await makeWorld();
   const devA = await makePeerDevice(A_LINK);
   const devB = await makePeerDevice(B_LINK);
   await establish(devA, DEV_A);
@@ -179,7 +182,7 @@ test("a failed trial-decrypt leaves the receiver's session byte-unchanged (no co
 });
 
 test("decryptFromDevice round-trips and rejects a foreign packet with DECRYPT_FAILED", async () => {
-  const { mine, makePeerDevice, establish } = await makeWorld();
+  const { mine, makePeerDevice, establish, myDeviceId } = await makeWorld();
   const devA = await makePeerDevice(A_LINK);
   const devB = await makePeerDevice(B_LINK);
   await establish(devA, DEV_A);
@@ -189,7 +192,7 @@ test("decryptFromDevice round-trips and rejects a foreign packet with DECRYPT_FA
     ownerAccountId: OWNER, peerAccountId: PEER, peerLinkId: MY_LINK, peerDeviceId: DEV_A, plaintextBytes: enc("hi A"),
   });
   const got = await devA.sessions.decryptFromDevice({
-    ownerAccountId: PEER, peerAccountId: OWNER, peerLinkId: A_LINK, peerDeviceId: MY_DEVICE_ID, packetBytes: pktA.toBytes(),
+    ownerAccountId: PEER, peerAccountId: OWNER, peerLinkId: A_LINK, peerDeviceId: myDeviceId, packetBytes: pktA.toBytes(),
   });
   assert.equal(dec(got.plaintextBytes), "hi A");
 
@@ -198,14 +201,14 @@ test("decryptFromDevice round-trips and rejects a foreign packet with DECRYPT_FA
   });
   await assert.rejects(
     () => devB.sessions.decryptFromDevice({
-      ownerAccountId: PEER, peerAccountId: OWNER, peerLinkId: B_LINK, peerDeviceId: MY_DEVICE_ID, packetBytes: pktA2.toBytes(),
+      ownerAccountId: PEER, peerAccountId: OWNER, peerLinkId: B_LINK, peerDeviceId: myDeviceId, packetBytes: pktA2.toBytes(),
     }),
     (err) => err && err.code === "DECRYPT_FAILED",
   );
 });
 
 test("P1.4: concurrent encryptForDevice on one device session never clobbers the ratchet", async () => {
-  const { mine, makePeerDevice, establish } = await makeWorld();
+  const { mine, makePeerDevice, establish, myDeviceId } = await makeWorld();
   const devA = await makePeerDevice(A_LINK);
   await establish(devA, DEV_A);
 
