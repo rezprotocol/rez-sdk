@@ -447,7 +447,26 @@ export class RezClient {
     if (!encResult || !encResult.encryptedPacket) {
       throw new Error("sealForPeerDevice: encryptDirectMessageForDevice returned no packet");
     }
-    const ciphertextBytes = encResult.encryptedPacket.toBytes();
+    let payloadBytes = encResult.encryptedPacket.toBytes();
+
+    // First-contact device handshake — carried IN-BAND in the deposit envelope,
+    // NOT in the wire metadata (Audit P1). The envelope IS the stored outer-packet
+    // body; the durable home log persists ONLY those bytes and drops metadata, and
+    // the receiver only ever parses the envelope (never metadata). So the responder
+    // material must ride inside the envelope to survive the store AND reach the
+    // receiver on both live-push and reconnect catch-up. It is bound to the SENDER's
+    // identity so the receiver can complete the responder device session against us
+    // (peerAccountId = our account, peerDeviceId = our device) before decrypting.
+    if (deviceHandshakeData != null) {
+      const senderAccountId = typeof peerLinkService.ownerAccountId === "string" ? peerLinkService.ownerAccountId.trim() : "";
+      const senderDeviceId = typeof peerLinkService.deviceId === "string" ? peerLinkService.deviceId.trim() : "";
+      if (!senderAccountId || !senderDeviceId) {
+        throw new Error("sealForPeerDevice: a device handshake requires the sender's ownerAccountId + deviceId");
+      }
+      const env = JSON.parse(new TextDecoder().decode(payloadBytes));
+      env.deviceHandshake = { senderAccountId, senderDeviceId, handshakeData: deviceHandshakeData };
+      payloadBytes = new TextEncoder().encode(JSON.stringify(env));
+    }
 
     let capChain = null;
     if (peerLinkRecord && peerLinkRecord.peerLinkId && typeof peerLinkService.getPostCapForPeerLink === "function") {
@@ -459,13 +478,10 @@ export class RezClient {
     if (typeof receiptInboxId === "string" && receiptInboxId.trim().length > 0) {
       metadata.receiptInboxId = receiptInboxId.trim();
     }
-    if (deviceHandshakeData != null) {
-      metadata.deviceHandshakeData = deviceHandshakeData;
-    }
 
     return {
       object: {
-        payloadBytes: ciphertextBytes,
+        payloadBytes,
         metadata,
         capChain: Array.isArray(capChain) && capChain.length > 0 ? capChain : null,
       },

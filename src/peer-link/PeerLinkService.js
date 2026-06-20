@@ -636,6 +636,25 @@ export class PeerLinkService {
   }
 
   /**
+   * True iff a per-device ratchet session already exists for (this account,
+   * peerAccountId, peerDeviceId). Makes first-contact responder establishment
+   * idempotent: a re-delivered first message must NOT re-run the handshake, which
+   * would re-import the initial snapshot and clobber an already-advanced ratchet.
+   * Returns false when there is no device key, no peer-link, or no device session.
+   */
+  async hasDeviceSession({ peerAccountId, peerDeviceId } = {}) {
+    if (!this.hasDeviceSessions()) return false;
+    const owner = this.ownerAccountId;
+    const peer = typeof peerAccountId === "string" ? peerAccountId.trim() : "";
+    const dev = typeof peerDeviceId === "string" ? peerDeviceId.trim() : "";
+    if (!owner || !peer || !dev) return false;
+    const peerLinkRecord = await this.peerLinkStorage.peerLinks.getByPair(owner, peer);
+    if (!peerLinkRecord || !peerLinkRecord.peerLinkId) return false;
+    const sess = await this.peerLinkStorage.sessions.getByPeerLinkAndDevice(owner, peerLinkRecord.peerLinkId, dev);
+    return sess != null;
+  }
+
+  /**
    * RESOLVE coordinates (S2.5 Slice 5): where to FETCH a peer's sealed device-set
    * DurableRecordV1. The peer-scoped seal slot is commutative — the peer sealed
    * their set to us at `derivePeerScopedKey(theirDhPriv, ourDhPub).slotRecordId`,

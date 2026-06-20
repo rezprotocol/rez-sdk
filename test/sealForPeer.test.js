@@ -230,10 +230,17 @@ test("sealForPeerDevice targets the recipient device's inbox + tags the session 
   assert.equal(pool.sent.length, 0);
 });
 
-test("sealForPeerDevice carries the device handshake on first contact", async () => {
+test("sealForPeerDevice carries the device handshake IN-BAND in the envelope, bound to the sender (Audit P1)", async () => {
   const pool = makeFakePool();
+  // The encrypted packet is the JSON deposit envelope {e2ee,v,payload} the
+  // receiver parses (E2eePacketCodec). The in-band handshake is folded into it.
+  const envelope = { e2ee: 1, v: 1, payload: "ciphertext-b64" };
   const peerLinkService = {
-    encryptDirectMessageForDevice: async () => ({ encryptedPacket: { toBytes: () => new Uint8Array([7]) } }),
+    ownerAccountId: "rez:acct:owner",
+    deviceId: "rez:dev:owner1",
+    encryptDirectMessageForDevice: async () => ({
+      encryptedPacket: { toBytes: () => new TextEncoder().encode(JSON.stringify(envelope)) },
+    }),
   };
   const client = makeClient({ pool, peerLinkService });
 
@@ -244,7 +251,39 @@ test("sealForPeerDevice carries the device handshake on first contact", async ()
     plaintextBodyBytes: new Uint8Array([1]),
     deviceHandshakeData: { x3dh: "initiator-output" },
   });
-  assert.deepEqual(sealed.object.metadata.deviceHandshakeData, { x3dh: "initiator-output" });
+
+  // The handshake is in the STORED body (payloadBytes), NOT the transient
+  // metadata (which the durable home log drops and the receiver never reads).
+  const env = JSON.parse(new TextDecoder().decode(sealed.object.payloadBytes));
+  assert.equal(env.e2ee, 1, "the e2ee envelope is preserved (decrypt path unaffected)");
+  assert.equal(env.payload, "ciphertext-b64");
+  assert.deepEqual(env.deviceHandshake, {
+    senderAccountId: "rez:acct:owner",
+    senderDeviceId: "rez:dev:owner1",
+    handshakeData: { x3dh: "initiator-output" },
+  });
+  assert.equal(sealed.object.metadata.deviceHandshakeData, undefined, "no longer in metadata");
+});
+
+test("sealForPeerDevice with a handshake fails closed without the sender's ownerAccountId + deviceId", async () => {
+  const pool = makeFakePool();
+  const peerLinkService = {
+    // missing ownerAccountId / deviceId
+    encryptDirectMessageForDevice: async () => ({
+      encryptedPacket: { toBytes: () => new TextEncoder().encode(JSON.stringify({ e2ee: 1, v: 1, payload: "x" })) },
+    }),
+  };
+  const client = makeClient({ pool, peerLinkService });
+  await assert.rejects(
+    () => client.sealForPeerDevice({
+      peerAccountId: "rez:acct:peer",
+      peerDeviceId: "rez:dev:abc",
+      deliverInboxId: "inbox:peer-device-abc",
+      plaintextBodyBytes: new Uint8Array([1]),
+      deviceHandshakeData: { x3dh: "initiator-output" },
+    }),
+    /requires the sender's ownerAccountId \+ deviceId/,
+  );
 });
 
 test("sealForPeerDevice folds the peer-link post-cap into capChain", async () => {

@@ -158,6 +158,43 @@ test("device set: publish → ingest → responder-complete → per-device sessi
   assert.equal(dec(gotBob.plaintextBytes), "hi bob");
 });
 
+test("first-contact: the device handshake rides IN-BAND in the message envelope; receiver establishes the responder from it, then decrypts (Audit P1)", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
+
+  // Alice publishes; Bob ingests → Bob holds an initiator session to Alice's
+  // device PLUS the handshakeData Alice needs to complete the responder.
+  const { record } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
+  const ingested = await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record });
+  const handshakeData = ingested.established[0].handshakeData;
+
+  // Bob sends his FIRST device message to Alice with the handshake embedded
+  // IN-BAND in the envelope (exactly what sealForPeerDevice does) — NOT in
+  // metadata, which the durable home log drops and the receiver never reads.
+  const { encryptedPacket } = await bob.svc.encryptDirectMessageForDevice({
+    peerAccountId: alice.accountId, peerLinkId: "pl_bob_alice", peerDeviceId: alice.deviceId, plaintextBytes: enc("first contact"),
+  });
+  const env = JSON.parse(new TextDecoder().decode(encryptedPacket.toBytes()));
+  env.deviceHandshake = { senderAccountId: bob.accountId, senderDeviceId: bob.deviceId, handshakeData };
+  const inbandBytes = new TextEncoder().encode(JSON.stringify(env));
+
+  // Alice has NOT pre-established the responder. She reads the in-band handshake,
+  // completes the responder against Bob, THEN decrypts the SAME envelope.
+  assert.equal(await alice.svc.hasDeviceSession({ peerAccountId: bob.accountId, peerDeviceId: bob.deviceId }), false, "no device session before first contact");
+  const dh = env.deviceHandshake;
+  await alice.svc.completeDeviceSetResponder({ peerAccountId: dh.senderAccountId, peerDeviceId: dh.senderDeviceId, handshakeData: dh.handshakeData });
+  assert.equal(await alice.svc.hasDeviceSession({ peerAccountId: bob.accountId, peerDeviceId: bob.deviceId }), true, "responder session established from the in-band handshake");
+
+  // The inner ciphertext decrypts over the now-established session — the extra
+  // deviceHandshake field in the envelope is ignored by the decrypt.
+  const got = await alice.svc.decryptFromDevice({
+    peerAccountId: bob.accountId, peerLinkId: "pl_alice_bob", peerDeviceId: bob.deviceId, packetBytes: inbandBytes,
+  });
+  assert.equal(dec(got.plaintextBytes), "first contact");
+});
+
 test("resolve coordinates are commutative: the resolver independently recomputes the publisher's slot + publisher key", async () => {
   const crypto = new BrowserCryptoProvider();
   const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
