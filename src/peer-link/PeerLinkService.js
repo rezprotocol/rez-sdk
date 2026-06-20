@@ -18,6 +18,7 @@ import {
   verifyHandshakeEnvelope,
 } from "@rezprotocol/core";
 import { canonicalPayloadBytesV1 } from "./inviteCodeV1.js";
+import { DevicePeerSessions } from "./DevicePeerSessions.js";
 import {
   PEER_LINK_STATE,
   SESSION_STATUS,
@@ -190,6 +191,12 @@ export class PeerLinkService {
   // logged-and-allowed. Default false (observe-only) for this ship; flip once
   // the transition table is proven against production telemetry.
   #strictTransitions;
+  // S2.5: this device's key (C) as the per-device X3DH SIGNING identity, in the
+  // {publicKey,privateKey} Uint8Array form the cryptoProvider/X3DH expect, plus
+  // the device-aware session machinery. Null when no device key was supplied
+  // (legacy single-device construction) — the per-device methods then fail loud.
+  #deviceSigningKeyPair;
+  #devicePeerSessions;
 
   constructor({
     storageProvider,
@@ -202,6 +209,8 @@ export class PeerLinkService {
     cryptoProvider = null,
     inboxClaimantSigner = null,
     strictTransitions = false,
+    deviceKeyPair = null,
+    deviceId = null,
   } = {}) {
     if (!storageProvider || typeof storageProvider.getPeerLinkStorage !== "function") {
       throw new Error("PeerLinkService requires storageProvider.getPeerLinkStorage()");
@@ -239,6 +248,147 @@ export class PeerLinkService {
     this.#anyPeerMissCounts = new Map();
     this.#anyPeerLastSuccessAt = new Map();
     this.#strictTransitions = strictTransitions === true;
+
+    // S2.5 per-device E2EE: the device key (C) is THIS device's X3DH signing
+    // identity (rooted in the chat-server identity B via DeviceRegistrationV1).
+    // Keystore-supplied as SPKI/PKCS8 base64 — the exact format the cryptoProvider
+    // sign/verify expect, so it plugs straight in with no conversion.
+    this.deviceId = deviceId ? nonEmpty(deviceId) : null;
+    this.devicePublicKeyB64 = deviceKeyPair && deviceKeyPair.publicKeyB64 ? nonEmpty(deviceKeyPair.publicKeyB64) : null;
+    this.#deviceSigningKeyPair = null;
+    this.#devicePeerSessions = null;
+    if (deviceKeyPair && deviceKeyPair.publicKeyB64 && deviceKeyPair.privateKeyB64) {
+      if (!this.deviceId) {
+        throw new Error("PeerLinkService requires deviceId when deviceKeyPair is supplied");
+      }
+      if (!cryptoProvider) {
+        throw new Error("PeerLinkService requires cryptoProvider for per-device sessions");
+      }
+      this.#deviceSigningKeyPair = {
+        publicKey: base64ToBytes(deviceKeyPair.publicKeyB64),
+        privateKey: base64ToBytes(deviceKeyPair.privateKeyB64),
+      };
+      this.#devicePeerSessions = new DevicePeerSessions({ cryptoProvider, peerLinkStorage: this.peerLinkStorage, clock });
+    }
+  }
+
+  // True when this service was constructed with a device key and can run
+  // per-device sessions. The legacy single-device path works regardless.
+  hasDeviceSessions() {
+    return this.#devicePeerSessions != null;
+  }
+
+  #requireDeviceSessions() {
+    if (!this.#devicePeerSessions || !this.#deviceSigningKeyPair) {
+      throw new Error("PeerLinkService has no device key (construct with deviceKeyPair for per-device sessions)");
+    }
+    return this.#devicePeerSessions;
+  }
+
+  // Load (or first-time generate + persist) THIS device's per-device X3DH
+  // identity: the signing identity is the device key C itself; the long-term
+  // identity-DH key (X25519) is generated once and persisted so the responder
+  // prekey + identity stay stable across sessions. Returns the {publicKey,
+  // privateKey} pairs DevicePeerSessions consumes (it recomputes the DH-binding
+  // signature itself from these at establish/bundle time).
+  async _loadDeviceIdentity() {
+    this.#requireDeviceSessions();
+    const owner = this.ownerAccountId;
+    const deviceId = this.deviceId;
+    const stored = await this.peerLinkStorage.keys.getDeviceIdentity(owner, deviceId);
+    const dh = stored && typeof stored === "object" && stored.x3dhIdentityDhKeyMaterial && typeof stored.x3dhIdentityDhKeyMaterial === "object"
+      ? stored.x3dhIdentityDhKeyMaterial
+      : null;
+    if (dh && nonEmpty(dh.publicKeyB64) && nonEmpty(dh.privateKeyB64)) {
+      return {
+        identityKeyPair: this.#deviceSigningKeyPair,
+        identityDhKeyPair: { publicKey: base64ToBytes(dh.publicKeyB64), privateKey: base64ToBytes(dh.privateKeyB64) },
+      };
+    }
+    if (typeof this.cryptoProvider.dhGenerateKeyPair !== "function") {
+      throw new Error("PeerLinkService cryptoProvider.dhGenerateKeyPair() required for per-device sessions");
+    }
+    const dhPair = await this.cryptoProvider.dhGenerateKeyPair();
+    if (!dhPair || !(dhPair.publicKey instanceof Uint8Array) || !(dhPair.privateKey instanceof Uint8Array)) {
+      throw new Error("cryptoProvider.dhGenerateKeyPair() returned invalid key pair");
+    }
+    await this.peerLinkStorage.keys.putDeviceIdentity(owner, deviceId, {
+      deviceId,
+      devicePublicKeyB64: this.devicePublicKeyB64,
+      x3dhIdentityDhKeyMaterial: {
+        publicKeyB64: bytesToBase64(dhPair.publicKey),
+        privateKeyB64: bytesToBase64(dhPair.privateKey),
+      },
+    });
+    return {
+      identityKeyPair: this.#deviceSigningKeyPair,
+      identityDhKeyPair: { publicKey: dhPair.publicKey, privateKey: dhPair.privateKey },
+    };
+  }
+
+  /**
+   * RESPONDER: build this device's per-device prekey bundle for a peer device to
+   * run X3DH against. Returns { bundleJson, preKeyState } — preKeyState is
+   * retained to complete the handshake (establishResponderDeviceSession).
+   */
+  async buildDevicePreKeyBundle({ ownerAccountId = this.ownerAccountId } = {}) {
+    const sessions = this.#requireDeviceSessions();
+    const { identityKeyPair, identityDhKeyPair } = await this._loadDeviceIdentity();
+    return sessions.buildDevicePreKeyBundle({ ownerAccountId: requireId(ownerAccountId, "ownerAccountId"), identityKeyPair, identityDhKeyPair });
+  }
+
+  /**
+   * INITIATOR: establish this device's session against a peer device's bundle,
+   * persisted under (owner, peerLinkId, peerDeviceId). Returns the handshakeData
+   * the peer device needs to complete its responder session.
+   */
+  async establishInitiatorDeviceSession({ ownerAccountId = this.ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, peerDeviceBundleJson } = {}) {
+    const sessions = this.#requireDeviceSessions();
+    const { identityKeyPair, identityDhKeyPair } = await this._loadDeviceIdentity();
+    return sessions.establishInitiatorDeviceSession({
+      ownerAccountId: requireId(ownerAccountId, "ownerAccountId"),
+      peerAccountId: requireId(peerAccountId, "peerAccountId"),
+      peerLinkId, peerDeviceId, peerDeviceBundleJson, identityKeyPair, identityDhKeyPair,
+    });
+  }
+
+  /**
+   * RESPONDER completion: given the initiator's handshakeData + our retained
+   * preKeyState, establish + persist our per-device session to that initiator.
+   */
+  async establishResponderDeviceSession({ ownerAccountId = this.ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, preKeyState, handshakeData } = {}) {
+    const sessions = this.#requireDeviceSessions();
+    const { identityDhKeyPair } = await this._loadDeviceIdentity();
+    return sessions.establishResponderDeviceSession({
+      ownerAccountId: requireId(ownerAccountId, "ownerAccountId"),
+      peerAccountId: requireId(peerAccountId, "peerAccountId"),
+      peerLinkId, peerDeviceId, identityDhKeyPair, preKeyState, handshakeData,
+    });
+  }
+
+  /**
+   * Encrypt for ONE peer device — advances only that device's ratchet (the
+   * per-device fan-out primitive Slice 5 calls once per recipient device).
+   */
+  async encryptDirectMessageForDevice({ ownerAccountId = this.ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, plaintextBytes } = {}) {
+    const sessions = this.#requireDeviceSessions();
+    return sessions.encryptForDevice({
+      ownerAccountId: requireId(ownerAccountId, "ownerAccountId"),
+      peerAccountId: requireId(peerAccountId, "peerAccountId"),
+      peerLinkId, peerDeviceId, plaintextBytes,
+    });
+  }
+
+  /**
+   * Decrypt a packet known to be from a specific peer device.
+   */
+  async decryptFromDevice({ ownerAccountId = this.ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, packetBytes } = {}) {
+    const sessions = this.#requireDeviceSessions();
+    return sessions.decryptFromDevice({
+      ownerAccountId: requireId(ownerAccountId, "ownerAccountId"),
+      peerAccountId: requireId(peerAccountId, "peerAccountId"),
+      peerLinkId, peerDeviceId, packetBytes,
+    });
   }
 
   /**
@@ -945,6 +1095,33 @@ export class PeerLinkService {
 
     for (const row of rows) {
       if (!row || !row.peerAccountId) continue;
+
+      // S2.5: trial-decrypt this peer's PER-DEVICE sessions first (additive). A
+      // device session only exists once established, so on a single-device peer
+      // this is a no-op (listByPeerLink yields no device rows) and we fall through
+      // to the legacy session below — the legacy path is byte-for-byte unchanged.
+      if (this.#devicePeerSessions) {
+        const deviceHit = await this.#devicePeerSessions.trialDecryptAcrossDevices({
+          ownerAccountId: owner,
+          peerAccountId: row.peerAccountId,
+          peerLinkId: row.peerLinkId,
+          packetBytes,
+        });
+        if (deviceHit) {
+          const deviceSuccessKey = owner + ":" + row.peerAccountId;
+          this.#decryptFailureCounts.delete(deviceSuccessKey);
+          this.#anyPeerMissCounts.delete(deviceSuccessKey);
+          this.#anyPeerLastSuccessAt.set(deviceSuccessKey, this.clock());
+          return {
+            plaintextBytes: deviceHit.plaintextBytes,
+            encrypted: true,
+            snapshot: await this._buildSnapshot(row),
+            event: null,
+            peerDeviceId: deviceHit.peerDeviceId,
+          };
+        }
+      }
+
       const sessionRecord = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, row.peerLinkId);
       if (!sessionRecord || typeof sessionRecord !== "object") {
         if (trace) tried.push(row.peerAccountId + ":no-session");

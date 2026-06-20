@@ -519,11 +519,21 @@ class KeyValueNodeKeyMaterialStore {
     this.keyValueStore = keyValueStore;
     this.identityPrefix = "peer-link:keys:identity:";
     this.invitePreKeyPrefix = "peer-link:keys:invite:";
+    // Per-device X3DH identity material (S2.5): the device's X25519 identity-DH
+    // key + its signature by the device key (C). Keyed by (account, deviceId) so a
+    // device's material is distinct from the account-level identity above.
+    this.deviceIdentityPrefix = "peer-link:keys:device:";
   }
 
   _identityKey(accountId) {
     const normalized = assertNonEmptyString(accountId, "accountId");
     return `${this.identityPrefix}${normalized}`;
+  }
+
+  _deviceIdentityKey(accountId, deviceId) {
+    const owner = assertNonEmptyString(accountId, "accountId");
+    const device = assertNonEmptyString(deviceId, "deviceId");
+    return `${this.deviceIdentityPrefix}${owner}::${device}`;
   }
 
   _invitePreKey(ownerAccountId, inviteId) {
@@ -543,6 +553,20 @@ class KeyValueNodeKeyMaterialStore {
     }
     const nextMaterial = cloneJsonValue(material);
     await this.keyValueStore.set(this._identityKey(accountId), nextMaterial);
+    return cloneJsonValue(nextMaterial);
+  }
+
+  async getDeviceIdentity(accountId, deviceId) {
+    const stored = await this.keyValueStore.get(this._deviceIdentityKey(accountId, deviceId));
+    return cloneJsonValue(stored);
+  }
+
+  async putDeviceIdentity(accountId, deviceId, material) {
+    if (material === undefined) {
+      throw new Error("material is required");
+    }
+    const nextMaterial = cloneJsonValue(material);
+    await this.keyValueStore.set(this._deviceIdentityKey(accountId, deviceId), nextMaterial);
     return cloneJsonValue(nextMaterial);
   }
 
