@@ -602,72 +602,105 @@ export class PeerLinkService {
       maxDevices,
     });
 
-    // Rollback protection (Audit R2 #2): the device-set `revision` is a signed
-    // MONOTONIC counter — peers honor the highest and treat a lower one as stale.
-    // Refuse a set whose revision regresses below one we already ingested so a
-    // replayed old set can't resurrect a since-removed device's session.
-    //
-    // The floor is DURABLE (Audit R3 #5): we persist the highest revision ever
-    // accepted from this peer and take max(caller minRevision, persisted floor).
-    // The caller's minRevision came from a volatile cache that resets to 0 on
-    // restart; the persisted floor is what actually defends a rolled-back set
-    // after a restart, intrinsic to the mechanism rather than hand-passed.
-    const persistedFloor = await this.#loadDeviceSetFloor(owner, peer);
+    // Rollback protection (Audit R2 #2 / R3 #5 / R4 #3): the device-set `revision`
+    // is a signed MONOTONIC counter — peers honor the highest and treat a lower
+    // one as stale. The floor (highest revision ever accepted) is DURABLE so it
+    // survives a restart, and the read→check→establish→save runs under a
+    // per-(owner,peer) lock with a monotonic-only write: the R3 fix read the
+    // floor and saved it across an await without serialization, so two concurrent
+    // ingests (rev 5 + rev 6) could persist 5 last and regress the floor (R4 #3).
+    // The lock closes that TOCTOU; the floor now also records the accepted set's
+    // signature so a SAME-revision set with DIFFERENT content (equivocation) is
+    // rejected rather than silently re-establishing a divergent device list.
     const passedFloor = Number.isInteger(minRevision) && minRevision > 0 ? minRevision : 0;
-    const floor = Math.max(persistedFloor, passedFloor);
-    if (floor > 0 && deviceSetRecord.revision < floor) {
-      const err = new Error(
-        "ingestPeerDeviceSet: stale device-set revision " + deviceSetRecord.revision
-        + " < known " + floor + " for peer " + peer,
-      );
-      err.code = "DEVICE_SET_STALE_REVISION";
-      err.revision = deviceSetRecord.revision;
-      err.knownRevision = floor;
-      throw err;
-    }
-
-    // Per-device IDEMPOTENT establishment (Audit R2 #2): a session is keyed on the
-    // peer's self-cert deviceId (= sha256 of its device key), so an existing
-    // device's session is unchanged across set revisions (the set changes when
-    // OTHER devices are added/removed). Re-establishing on every refresh minted a
-    // fresh initiator session each time while the responder kept the old one ⇒
-    // desync. So establish ONLY for a device with no existing session; reuse the
-    // rest. `established` therefore carries only the NEW (first-contact) devices —
-    // exactly the ones whose handshake the sender must carry in-band.
-    const established = [];
-    const reused = [];
-    for (const bundle of prekeyBundleRecords) {
-      const existing = await this.peerLinkStorage.sessions.getByPeerLinkAndDevice(owner, peerLinkId, bundle.deviceId);
-      if (existing != null) {
-        reused.push({ peerDeviceId: bundle.deviceId });
-        continue;
+    const incomingSigB64 = deviceSetRecord.sig && typeof deviceSetRecord.sig.sigB64 === "string"
+      ? deviceSetRecord.sig.sigB64
+      : "";
+    return withLock(`device-set-ingest:${owner}:${peer}`, async () => {
+      const floorRec = await this.#loadDeviceSetFloor(owner, peer);
+      const persistedFloor = floorRec.revision;
+      const floor = Math.max(persistedFloor, passedFloor);
+      if (floor > 0 && deviceSetRecord.revision < floor) {
+        const err = new Error(
+          "ingestPeerDeviceSet: stale device-set revision " + deviceSetRecord.revision
+          + " < known " + floor + " for peer " + peer,
+        );
+        err.code = "DEVICE_SET_STALE_REVISION";
+        err.revision = deviceSetRecord.revision;
+        err.knownRevision = floor;
+        throw err;
       }
-      const { handshakeData, sessionId } = await this.establishInitiatorDeviceSession({
-        ownerAccountId: owner,
-        peerAccountId: peer,
-        peerLinkId,
-        peerDeviceId: bundle.deviceId,
-        peerDeviceBundleJson: bundle.bundleJson,
-      });
-      established.push({ peerDeviceId: bundle.deviceId, handshakeData, sessionId });
-    }
-    // Advance the durable floor AFTER establishment succeeds, so a later replay of
-    // an older set is rejected even across a restart. Only bump (never lower).
-    if (deviceSetRecord.revision > persistedFloor) {
-      await this.#saveDeviceSetFloor(owner, peer, deviceSetRecord.revision);
-    }
-    return { deviceSetRecord, prekeyBundleRecords, established, reused, revision: deviceSetRecord.revision };
+      // Equivocation: the same revision we already accepted, but a different
+      // account signature ⇒ a second, conflicting set published at one revision
+      // (peer key compromise or a tampered replay). Only an idempotent re-present
+      // of the IDENTICAL set is allowed at an already-accepted revision.
+      if (deviceSetRecord.revision === persistedFloor
+        && floorRec.sigB64
+        && incomingSigB64
+        && incomingSigB64 !== floorRec.sigB64) {
+        const err = new Error(
+          "ingestPeerDeviceSet: conflicting device set at revision " + deviceSetRecord.revision
+          + " for peer " + peer + " (equivocation)",
+        );
+        err.code = "DEVICE_SET_REVISION_EQUIVOCATION";
+        err.revision = deviceSetRecord.revision;
+        throw err;
+      }
+
+      // Per-device IDEMPOTENT establishment (Audit R2 #2): a session is keyed on the
+      // peer's self-cert deviceId (= sha256 of its device key), so an existing
+      // device's session is unchanged across set revisions (the set changes when
+      // OTHER devices are added/removed). Re-establishing on every refresh minted a
+      // fresh initiator session each time while the responder kept the old one ⇒
+      // desync. So establish ONLY for a device with no existing session; reuse the
+      // rest. `established` therefore carries only the NEW (first-contact) devices —
+      // exactly the ones whose handshake the sender must carry in-band.
+      const established = [];
+      const reused = [];
+      for (const bundle of prekeyBundleRecords) {
+        const existing = await this.peerLinkStorage.sessions.getByPeerLinkAndDevice(owner, peerLinkId, bundle.deviceId);
+        if (existing != null) {
+          reused.push({ peerDeviceId: bundle.deviceId });
+          continue;
+        }
+        const { handshakeData, sessionId } = await this.establishInitiatorDeviceSession({
+          ownerAccountId: owner,
+          peerAccountId: peer,
+          peerLinkId,
+          peerDeviceId: bundle.deviceId,
+          peerDeviceBundleJson: bundle.bundleJson,
+        });
+        established.push({ peerDeviceId: bundle.deviceId, handshakeData, sessionId });
+      }
+      // Advance the durable floor AFTER establishment succeeds — monotonic only
+      // (re-read under the lock, never lower). Records the accepted signature so a
+      // later same-revision equivocation is detectable.
+      if (deviceSetRecord.revision > persistedFloor) {
+        await this.#saveDeviceSetFloor(owner, peer, deviceSetRecord.revision, incomingSigB64);
+      }
+      return { deviceSetRecord, prekeyBundleRecords, established, reused, revision: deviceSetRecord.revision };
+    });
   }
 
-  // The persisted rollback floor for a peer's device set (Audit R3 #5).
+  // The persisted rollback floor for a peer's device set (Audit R3 #5 / R4 #3):
+  // { revision, sigB64 } — the highest accepted revision and the signature of the
+  // set accepted at it (for equivocation detection). Legacy floors stored a bare
+  // { revision } (or a bare number) and read back with sigB64 = null.
   async #loadDeviceSetFloor(ownerAccountId, peerAccountId) {
     const stored = await this.kv.get(_deviceSetFloorKey(ownerAccountId, peerAccountId));
     const rev = stored && typeof stored === "object" ? stored.revision : stored;
-    return Number.isInteger(rev) && rev > 0 ? rev : 0;
+    const sigB64 = stored && typeof stored === "object" && typeof stored.sigB64 === "string" ? stored.sigB64 : null;
+    return {
+      revision: Number.isInteger(rev) && rev > 0 ? rev : 0,
+      sigB64,
+    };
   }
 
-  async #saveDeviceSetFloor(ownerAccountId, peerAccountId, revision) {
-    await this.kv.set(_deviceSetFloorKey(ownerAccountId, peerAccountId), { revision });
+  async #saveDeviceSetFloor(ownerAccountId, peerAccountId, revision, sigB64) {
+    await this.kv.set(_deviceSetFloorKey(ownerAccountId, peerAccountId), {
+      revision,
+      sigB64: typeof sigB64 === "string" && sigB64.length > 0 ? sigB64 : null,
+    });
   }
 
   /**

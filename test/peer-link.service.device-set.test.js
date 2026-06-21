@@ -332,8 +332,50 @@ test("Audit R3 #5: a successful ingest persists the revision floor durably", asy
 
   await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record });
   const floorKey = "peer-link:device-set-floor:" + bob.accountId + ":" + alice.accountId;
-  assert.deepEqual(await bob.sp.getKeyValueStore().get(floorKey), { revision: 1 },
-    "the highest accepted revision is persisted so the floor survives a restart");
+  const storedFloor = await bob.sp.getKeyValueStore().get(floorKey);
+  assert.equal(storedFloor.revision, 1, "the highest accepted revision is persisted so the floor survives a restart");
+  assert.equal(typeof storedFloor.sigB64, "string");
+  assert.ok(storedFloor.sigB64.length > 0, "the accepted set signature is recorded (Audit R4 #3 equivocation detection)");
+});
+
+test("Audit R4 #3: a same-revision device set with a DIFFERENT signature is rejected as equivocation", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
+  const { record } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
+
+  // Accept the revision-1 set once (records its signature in the floor).
+  await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record });
+  // Tamper the recorded floor signature so the SAME revision now appears to have
+  // been accepted with DIFFERENT content — i.e. a second, conflicting set was
+  // published at one revision (peer key compromise / tampered replay).
+  const floorKey = "peer-link:device-set-floor:" + bob.accountId + ":" + alice.accountId;
+  await bob.sp.getKeyValueStore().set(floorKey, { revision: 1, sigB64: "AAAAconflicting" });
+  await assert.rejects(
+    () => bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record }),
+    (err) => err && err.code === "DEVICE_SET_REVISION_EQUIVOCATION" && err.revision === 1,
+  );
+});
+
+test("Audit R4 #3: concurrent ingests of one set serialize — exactly one establishment, floor consistent", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
+  const { record } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
+
+  // Without the per-(owner,peer) lock both ingests would see no existing session
+  // and double-establish (clobbering the first). The lock serializes them.
+  const results = await Promise.all([
+    bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record }),
+    bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record }),
+  ]);
+  const establishedTotal = results.reduce((n, r) => n + r.established.length, 0);
+  assert.equal(establishedTotal, 1, "the device session is established exactly once across concurrent ingests");
+  const floorKey = "peer-link:device-set-floor:" + bob.accountId + ":" + alice.accountId;
+  const storedFloor = await bob.sp.getKeyValueStore().get(floorKey);
+  assert.equal(storedFloor.revision, 1, "the floor settles at the accepted revision with no regression");
 });
 
 test("Audit R3 #5: the DURABLE floor rejects a rolled-back set even when the caller passes minRevision 0 (sender restart)", async () => {
