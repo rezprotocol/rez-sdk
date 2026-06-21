@@ -216,3 +216,86 @@ test("wrong publisher: a record published under a non-peer account is rejected",
     /publisher is not the peer account/,
   );
 });
+
+test("R4 #8 freshness: a device set issued too far in the future is rejected", async () => {
+  const c = new BrowserCryptoProvider();
+  const pub = await makeAccount(c);
+  const peer = await makeAccount(c);
+  const device = await makeDeviceKey(c);
+  const deviceId = DeviceRegistrationV1.deviceIdFor(device.pubB64);
+  const future = NOW + 10 * 60_000; // 10 min ahead, beyond the 5-min skew bound
+  const setBody = {
+    v: 1, purpose: "rez:device-set:v1", accountIdentityPublicKeyB64: pub.pubB64, revision: 1,
+    devices: [{ deviceId, devicePublicKeyB64: device.pubB64, inboxId: "rez:inbox:dev0" }],
+    issuedAtMs: future, expiresAtMs: future + TTL,
+  };
+  const deviceSetRecord = new DeviceSetRecordV1({ ...setBody, sig: await edSig(c, pub.privBytes, DeviceSetRecordV1.signableBytes(setBody)) });
+  const prekeyBundleRecords = (await buildPublisherRecords(c, pub, device)).prekeyBundleRecords;
+  const { record } = await publish(c, pub, peer, { deviceSetRecord, prekeyBundleRecords });
+  await assert.rejects(
+    () => openSealedDeviceSetRecord({ ...resolveOpts(c, peer, pub), record }),
+    /issued too far in the future/,
+  );
+});
+
+test("R4 #8 freshness: an independently-expired prekey bundle is rejected even when the set is fresh", async () => {
+  const c = new BrowserCryptoProvider();
+  const pub = await makeAccount(c);
+  const peer = await makeAccount(c);
+  const device = await makeDeviceKey(c);
+  const deviceId = DeviceRegistrationV1.deviceIdFor(device.pubB64);
+  // The set is fresh (NOW..NOW+TTL) but its bundle expired in the past — a set
+  // can outlive a bundle, and a session must never establish on a dead prekey.
+  const setBody = {
+    v: 1, purpose: "rez:device-set:v1", accountIdentityPublicKeyB64: pub.pubB64, revision: 1,
+    devices: [{ deviceId, devicePublicKeyB64: device.pubB64, inboxId: "rez:inbox:dev0" }],
+    issuedAtMs: NOW, expiresAtMs: NOW + TTL,
+  };
+  const deviceSetRecord = new DeviceSetRecordV1({ ...setBody, sig: await edSig(c, pub.privBytes, DeviceSetRecordV1.signableBytes(setBody)) });
+  const bundleBody = {
+    v: 1, purpose: "rez:device-prekey-bundle:v1", accountIdentityPublicKeyB64: pub.pubB64,
+    devicePublicKeyB64: device.pubB64, deviceId, inboxId: "rez:inbox:dev0", prekeyVersion: 1,
+    bundleJson: {
+      receiverId: "rez:acct:peer", identitySigningPublicKeyB64: device.pubB64,
+      identityDhPublicKeyB64: b64(44), identityDhSignatureB64: b64(64),
+      signedPreKeyPublicB64: b64(44), signedPreKeySignatureB64: b64(64),
+      accountIdentityPublicKeyB64: null, accountBindingSigB64: null,
+      accountBindingIssuedAtMs: null, accountBindingExpiresAtMs: null,
+      oneTimePreKeyPublicB64: b64(44),
+    },
+    issuedAtMs: NOW - 2 * TTL, expiresAtMs: NOW - 1,
+  };
+  const prekeyBundle = new DevicePrekeyBundleV1({ ...bundleBody, sig: await edSig(c, device.privBytes, DevicePrekeyBundleV1.signableBytes(bundleBody)) });
+  const { record } = await publish(c, pub, peer, { deviceSetRecord, prekeyBundleRecords: [prekeyBundle] });
+  await assert.rejects(
+    () => openSealedDeviceSetRecord({ ...resolveOpts(c, peer, pub), record }),
+    /prekey bundle is stale/,
+  );
+});
+
+test("R4 #8 completeness: a set declaring a device with no prekey bundle is rejected", async () => {
+  const c = new BrowserCryptoProvider();
+  const pub = await makeAccount(c);
+  const peer = await makeAccount(c);
+  const device = await makeDeviceKey(c);
+  const d2 = await makeDeviceKey(c);
+  const deviceId1 = DeviceRegistrationV1.deviceIdFor(device.pubB64);
+  const deviceId2 = DeviceRegistrationV1.deviceIdFor(d2.pubB64);
+  // Two declared devices, but only device1 ships a bundle — device2 would be
+  // silently unestablishable. The resolver must fail closed, not fan out partial.
+  const setBody = {
+    v: 1, purpose: "rez:device-set:v1", accountIdentityPublicKeyB64: pub.pubB64, revision: 1,
+    devices: [
+      { deviceId: deviceId1, devicePublicKeyB64: device.pubB64, inboxId: "rez:inbox:a" },
+      { deviceId: deviceId2, devicePublicKeyB64: d2.pubB64, inboxId: "rez:inbox:b" },
+    ],
+    issuedAtMs: NOW, expiresAtMs: NOW + TTL,
+  };
+  const deviceSetRecord = new DeviceSetRecordV1({ ...setBody, sig: await edSig(c, pub.privBytes, DeviceSetRecordV1.signableBytes(setBody)) });
+  const one = (await buildPublisherRecords(c, pub, device, { inboxId: "rez:inbox:a" })).prekeyBundleRecords;
+  const { record } = await publish(c, pub, peer, { deviceSetRecord, prekeyBundleRecords: one });
+  await assert.rejects(
+    () => openSealedDeviceSetRecord({ ...resolveOpts(c, peer, pub), record }),
+    /no prekey bundle/,
+  );
+});

@@ -32,6 +32,12 @@ import { derivePeerScopedKey, sealToPeer, openFromPeer } from "./peerScopedSeal.
 
 const SEAL_AAD = "rez:device-set:v1";
 
+// A self-signed device set / bundle carries an attacker-chosen issuedAtMs. The
+// resolver must not honor one stamped far in the future (it would otherwise win
+// every monotonic ordering against honest later publishes). Bound the lead to a
+// few minutes of honest clock skew — mirrors the node's verifyDurableRecord.
+const DEVICE_SET_MAX_FUTURE_SKEW_MS = 5 * 60_000;
+
 /**
  * Build the signed, sealed DurableRecordV1 carrying an account's device set,
  * addressed to one peer.
@@ -129,6 +135,7 @@ export async function buildSealedDeviceSetRecord({
  * @param {string} args.peerAccountPublicKeyB64 — peer account B pubkey (publisher + set signer)
  * @param {number} args.nowMs
  * @param {number} [args.maxDevices=8] — E7 sender-side cap; reject oversized sets
+ * @param {number} [args.maxFutureSkewMs] — reject sets/bundles issued beyond this lead
  * @returns {Promise<{ deviceSetRecord: DeviceSetRecordV1, prekeyBundleRecords: DevicePrekeyBundleV1[] }>}
  */
 export async function openSealedDeviceSetRecord({
@@ -139,6 +146,7 @@ export async function openSealedDeviceSetRecord({
   peerAccountPublicKeyB64,
   nowMs,
   maxDevices = 8,
+  maxFutureSkewMs = DEVICE_SET_MAX_FUTURE_SKEW_MS,
 } = {}) {
   if (!record || typeof record !== "object") {
     throw new Error("openSealedDeviceSetRecord requires a record");
@@ -213,6 +221,11 @@ export async function openSealedDeviceSetRecord({
   if (deviceSetRecord.expiresAtMs <= nowMs) {
     throw new Error("openSealedDeviceSetRecord: device set is stale (expired)");
   }
+  // Freshness (Audit R4 #8): reject a set issued beyond honest clock skew — a
+  // far-future stamp would win monotonic ordering against legitimate later sets.
+  if (Number.isFinite(maxFutureSkewMs) && deviceSetRecord.issuedAtMs > nowMs + maxFutureSkewMs) {
+    throw new Error("openSealedDeviceSetRecord: device set is issued too far in the future");
+  }
 
   const setByDeviceId = new Map();
   for (const d of deviceSetRecord.devices) {
@@ -251,6 +264,15 @@ export async function openSealedDeviceSetRecord({
     if (bundle.accountIdentityPublicKeyB64 !== peerAccountPublicKeyB64) {
       throw new Error("openSealedDeviceSetRecord: prekey bundle account does not match the peer");
     }
+    // Freshness (Audit R4 #8): each bundle expires INDEPENDENTLY of the set —
+    // a set may be fresh while it still carries a long-stale (or far-future)
+    // bundle. A session must never establish against an expired prekey bundle.
+    if (bundle.expiresAtMs <= nowMs) {
+      throw new Error("openSealedDeviceSetRecord: prekey bundle is stale (expired) for device (" + bundle.deviceId + ")");
+    }
+    if (Number.isFinite(maxFutureSkewMs) && bundle.issuedAtMs > nowMs + maxFutureSkewMs) {
+      throw new Error("openSealedDeviceSetRecord: prekey bundle is issued too far in the future for device (" + bundle.deviceId + ")");
+    }
     const bundleSigOk = await cryptoProvider.verify({
       publicKey: base64ToBytes(bundle.devicePublicKeyB64),
       msg: DevicePrekeyBundleV1.signableBytes(bundle.toJSON()),
@@ -260,6 +282,19 @@ export async function openSealedDeviceSetRecord({
       throw new Error("openSealedDeviceSetRecord: prekey bundle signature failed (" + bundle.deviceId + ")");
     }
     prekeyBundleRecords.push(bundle);
+  }
+
+  // Completeness (Audit R4 #8): the account-signed set is the authority over
+  // which devices exist; every declared device MUST ship a prekey bundle. A set
+  // that declares a device but omits its bundle would otherwise leave that
+  // device silently unestablishable — the sender fans out to a subset and the
+  // missing device never receives mail, with no error. Fail closed instead.
+  if (seenBundleDeviceIds.size !== setByDeviceId.size) {
+    const missing = [];
+    for (const deviceId of setByDeviceId.keys()) {
+      if (!seenBundleDeviceIds.has(deviceId)) missing.push(deviceId);
+    }
+    throw new Error("openSealedDeviceSetRecord: device set declares devices with no prekey bundle (" + missing.join(",") + ")");
   }
 
   return { deviceSetRecord, prekeyBundleRecords };
