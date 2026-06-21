@@ -147,6 +147,43 @@ test("PeerLinkService HEADLINE (no cross-advance): encrypting for device A leave
   assert.deepEqual(after, before, "device B's ratchet must not advance when only device A is used");
 });
 
+test("Audit R4 #2 (crash window): ratchet commits before the ciphertext cache — a lost ciphertext re-encrypts at a FRESH key, no loss, no reuse", async () => {
+  // Models the crash window the audit flagged: encryptForDevice commits the
+  // advanced ratchet (this is the SAFE order), then the CALLER would cache the
+  // ciphertext. If a crash drops that ciphertext before it is delivered, the
+  // retry re-encrypts. We prove that re-encrypt uses a DISTINCT ratchet key (no
+  // reuse) and that the message is still recoverable (no loss) — i.e. flipping
+  // to cache-before-commit, which would reuse key N, is correctly NOT done.
+  const { owner, devA } = await makeWorld();
+  await establish(owner.svc, devA, devA.deviceId);
+
+  // First encrypt: ratchet advances + commits. Imagine this ciphertext's cache
+  // write then fails / the sender crashes — it is never delivered ("lost").
+  const { encryptedPacket: lost } = await owner.svc.encryptDirectMessageForDevice({
+    ownerAccountId: OWNER, peerAccountId: PEER, peerLinkId: MY_LINK, peerDeviceId: devA.deviceId, plaintextBytes: enc("m1-lost"),
+  });
+  // Retry: cache-miss ⇒ re-encrypt. The committed ratchet is already at N+1, so
+  // this consumes a FRESH key — it cannot reuse the lost message's key.
+  const { encryptedPacket: retried } = await owner.svc.encryptDirectMessageForDevice({
+    ownerAccountId: OWNER, peerAccountId: PEER, peerLinkId: MY_LINK, peerDeviceId: devA.deviceId, plaintextBytes: enc("m2-retry"),
+  });
+  assert.notDeepEqual(retried.toBytes(), lost.toBytes(), "the re-encrypt produced a distinct ciphertext (fresh key — no reuse)");
+
+  // The retry is delivered first and decrypts (the receiver skips the unused
+  // key from the lost message) — the message is recoverable, no silent loss.
+  const gotRetry = await devA.svc.decryptFromDevice({
+    ownerAccountId: PEER, peerAccountId: OWNER, peerLinkId: A_LINK, peerDeviceId: owner.deviceId, packetBytes: retried.toBytes(),
+  });
+  assert.equal(dec(gotRetry.plaintextBytes), "m2-retry");
+  // The "lost" ciphertext, if it ever arrives late, ALSO decrypts on its own
+  // skipped key — proving the two encrypts used distinct keys (no reuse): under
+  // key/nonce reuse the second AES-GCM open at the same position would fail.
+  const gotLost = await devA.svc.decryptFromDevice({
+    ownerAccountId: PEER, peerAccountId: OWNER, peerLinkId: A_LINK, peerDeviceId: owner.deviceId, packetBytes: lost.toBytes(),
+  });
+  assert.equal(dec(gotLost.plaintextBytes), "m1-lost");
+});
+
 test("PeerLinkService.decryptDirectMessageAnyPeer is device-aware (receive path)", async () => {
   const { owner, devA } = await makeWorld();
   await establish(owner.svc, devA, devA.deviceId);

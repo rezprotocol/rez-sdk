@@ -219,6 +219,19 @@ export class DevicePeerSessions {
       const scm = this.#scm(sessionRecord.ratchetSnapshot);
       const codec = new E2eePacketCodec({ secureChannelManager: scm });
       const encryptedPacket = await codec.encryptForPeer({ peerId: peerAccountId, plaintextBytes });
+      // ORDERING INVARIANT (Audit R4 #2 — do NOT flip): commit the advanced
+      // ratchet snapshot HERE, BEFORE the caller (ServerMessagesService) persists
+      // the sealed ciphertext to its fan-out cache. This is the SAFE order:
+      //  - crash between this commit and the cache write ⇒ ratchet at N+1, no
+      //    cached ciphertext, nothing dispatched. The retry takes the cache-miss
+      //    path and RE-ENCRYPTS at the next key (N+1) → the message is delivered
+      //    (the receiver simply skips the unused key N). No loss, no reuse.
+      //  - the INVERSE order (cache the ciphertext first, commit the ratchet
+      //    after) is UNSAFE: a crash between would leave the ratchet at N while a
+      //    cached key-N ciphertext exists; the retry replays the cache without
+      //    advancing the ratchet, so the NEXT message reuses key N — catastrophic
+      //    nonce/key reuse. The fan-out cache is a delivery optimization, never
+      //    the ratchet's system of record; the ratchet commit leads.
       await this.#peerLinkStorage.sessions.put({
         ...sessionRecord, ratchetSnapshot: scm.exportSnapshot(), updatedAtMs: this.#clock(),
       });
