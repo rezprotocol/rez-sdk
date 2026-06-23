@@ -677,6 +677,17 @@ export class PeerLinkService {
       // later same-revision equivocation is detectable.
       if (deviceSetRecord.revision > persistedFloor) {
         await this.#saveDeviceSetFloor(owner, peer, deviceSetRecord.revision, incomingSigB64);
+      } else if (deviceSetRecord.revision === persistedFloor && !floorRec.sigB64 && incomingSigB64) {
+        // Legacy-floor signature backfill (review P2). A floor persisted before the
+        // R4 #3 hardening stored only { revision } (sigB64 = null), so at the SAME
+        // revision the equivocation check above is skipped (no recorded sig to
+        // compare) AND this advance never ran (revision is not > persistedFloor) —
+        // leaving the floor permanently unable to detect a same-revision conflict,
+        // so an upgraded client would accept conflicting same-revision sets forever.
+        // Anchor the legacy floor to the first set we accept post-upgrade (monotonic:
+        // same revision, adds only the missing signature) so a later same-revision
+        // set with a DIFFERENT signature is rejected as equivocation.
+        await this.#saveDeviceSetFloor(owner, peer, deviceSetRecord.revision, incomingSigB64);
       }
       return { deviceSetRecord, prekeyBundleRecords, established, reused, revision: deviceSetRecord.revision };
     });

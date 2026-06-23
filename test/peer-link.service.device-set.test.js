@@ -358,6 +358,39 @@ test("Audit R4 #3: a same-revision device set with a DIFFERENT signature is reje
   );
 });
 
+test("review P2: ingesting against a LEGACY (sig-less) floor at the same revision backfills the signature so equivocation becomes detectable", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
+  const { record } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
+
+  const floorKey = "peer-link:device-set-floor:" + bob.accountId + ":" + alice.accountId;
+  // A floor persisted before the R4 #3 hardening stored only { revision } — no
+  // signature. At the SAME revision the equivocation check is skipped (nothing to
+  // compare) AND the advance branch never ran (revision not > persistedFloor), so
+  // the floor could never learn the accepted signature: an upgraded client would
+  // accept conflicting same-revision sets forever.
+  await bob.sp.getKeyValueStore().set(floorKey, { revision: 1 });
+
+  // Ingesting the genuine revision-1 set is accepted, and the missing signature is
+  // backfilled onto the legacy floor (monotonic: same revision, adds only the sig).
+  const ok = await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record });
+  assert.equal(ok.revision, 1);
+  const backfilled = await bob.sp.getKeyValueStore().get(floorKey);
+  assert.equal(backfilled.revision, 1, "floor stays at the same revision (monotonic)");
+  assert.equal(typeof backfilled.sigB64, "string");
+  assert.ok(backfilled.sigB64.length > 0, "the accepted set signature is now anchored on the formerly sig-less floor");
+
+  // With the signature anchored, a conflicting same-revision set is now rejected
+  // (the protection that the sig-less legacy floor could never provide).
+  await bob.sp.getKeyValueStore().set(floorKey, { revision: 1, sigB64: "AAAAconflicting" });
+  await assert.rejects(
+    () => bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record }),
+    (err) => err && err.code === "DEVICE_SET_REVISION_EQUIVOCATION" && err.revision === 1,
+  );
+});
+
 test("Audit R4 #3: concurrent ingests of one set serialize — exactly one establishment, floor consistent", async () => {
   const crypto = new BrowserCryptoProvider();
   const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
