@@ -62,8 +62,23 @@ export class AuthStateMachine {
    *   challenge claims.
    */
   constructor({ identity, eventBus, sessionHello = {}, clientVersion = "rez-sdk/2.0", expectedNodePublicKeyB64 = "" } = {}) {
-    if (!identity || !identity.publicKeyB64 || !identity.privateKeyB64) {
-      throw new Error("AuthStateMachine requires identity with publicKeyB64 and privateKeyB64");
+    if (!identity || !identity.publicKeyB64) {
+      throw new Error("AuthStateMachine requires identity with publicKeyB64");
+    }
+    // Dual-mode (S2.5 S7): a PRIMARY device authenticates with the account root
+    // key (privateKeyB64 = B-sign). A DELEGATED device holds no B-sign private
+    // key — it signs with its per-device key C and presents an account→device
+    // capability chain (identity.deviceKey + identity.certChain). One must exist.
+    const delegationDeviceKey = identity.deviceKey && typeof identity.deviceKey === "object" ? identity.deviceKey : null;
+    const delegationCertChain = Array.isArray(identity.certChain) ? identity.certChain : null;
+    const hasDelegation = Boolean(
+      delegationDeviceKey && delegationDeviceKey.publicKeyB64 && delegationDeviceKey.privateKeyB64
+        && delegationCertChain && delegationCertChain.length > 0,
+    );
+    if (!identity.privateKeyB64 && !hasDelegation) {
+      throw new Error(
+        "AuthStateMachine requires identity.privateKeyB64 (primary) or identity.deviceKey + certChain (delegated)",
+      );
     }
     if (!eventBus) throw new Error("AuthStateMachine requires eventBus");
     this.#identity = identity;
@@ -178,11 +193,17 @@ export class AuthStateMachine {
       // on proxies/path-rewrites without adding meaningful security.
       void sdkWsPath;
 
-      // Step 3: Sign the challenge with the SDK identity key.
+      // Step 3: Sign the challenge. A PRIMARY device signs with the account root
+      // key (B-sign); a DELEGATED device signs with its per-device key C and
+      // presents the capability chain. The signed payload is IDENTICAL in both
+      // modes (it binds the claimed account + deviceId) — only the signing key
+      // and the extra authenticate-body fields differ.
       this.#transition(AUTH_STATES.AUTHENTICATING);
 
+      const delegated = !this.#identity.privateKeyB64;
+      const signingPrivateKeyB64 = delegated ? this.#identity.deviceKey.privateKeyB64 : this.#identity.privateKeyB64;
       const signatureB64 = await signPayload({
-        privateKeyB64: this.#identity.privateKeyB64,
+        privateKeyB64: signingPrivateKeyB64,
         payload: {
           kind: "session-auth",
           challengeId,
@@ -196,13 +217,16 @@ export class AuthStateMachine {
         },
       });
 
+      const authBody = { challengeId, signatureB64 };
+      if (delegated) {
+        authBody.signerPublicKeyB64 = this.#identity.deviceKey.publicKeyB64;
+        authBody.certChain = this.#identity.certChain;
+      }
+
       // Step 4: Send session.authenticate
       const readyResponse = await transport.sendRequest({
         type: SESSION_AUTHENTICATE_TYPE,
-        body: {
-          challengeId,
-          signatureB64,
-        },
+        body: authBody,
         expectedResponseType: this.#sessionHello.responseType || null,
         timeoutMs: 5000,
       });
