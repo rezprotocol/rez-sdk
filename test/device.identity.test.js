@@ -4,8 +4,10 @@ import { bytesToBase64, DeviceRegistrationV1 } from "@rezprotocol/core";
 import {
   generateDeviceKeyPair,
   buildSignedDeviceRegistration,
+  buildSignedDeviceRevoke,
   verifyDeviceRegistration,
 } from "../src/device/index.js";
+import { verifyPayload } from "../src/auth/signing.js";
 
 // Account keypair in the SDK convention (SPKI public / PKCS8 private, base64) —
 // the same export path Identity.generate() uses.
@@ -111,5 +113,44 @@ test("buildSignedDeviceRegistration validates its inputs", async () => {
   await assert.rejects(
     () => buildSignedDeviceRegistration({ account, devicePublicKeyB64: "" }),
     /requires devicePublicKeyB64/,
+  );
+});
+
+// S2.5 S8 L4 — the DeviceRevokeV1 builder (closes the P7 gap so devices.revoke
+// has a real record to send). Account-signed (B-sign) primary path.
+test("account key signs a device revoke that verifies against the account key", async () => {
+  const account = await generateAccountKeyPair();
+  const device = await generateDeviceKeyPair();
+  const revoke = await buildSignedDeviceRevoke({ account, revokedDevicePublicKeyB64: device.publicKeyB64, nowMs: NOW });
+
+  assert.equal(revoke.accountIdentityPublicKeyB64, account.publicKeyB64);
+  assert.equal(revoke.revokedDevicePublicKeyB64, device.publicKeyB64);
+  assert.equal(revoke.revokedDeviceId, DeviceRegistrationV1.deviceIdFor(device.publicKeyB64), "self-certifying revokedDeviceId");
+
+  // The signature verifies against the account key over the canonical body the
+  // home recomputes (DeviceRevokeV1.signableBytes), with no representation drift.
+  const ok = await verifyPayload({
+    publicKeyB64: account.publicKeyB64,
+    signatureB64: revoke.sig.sigB64,
+    payload: {
+      v: revoke.v, purpose: revoke.purpose,
+      accountIdentityPublicKeyB64: revoke.accountIdentityPublicKeyB64,
+      revokedDeviceId: revoke.revokedDeviceId,
+      revokedDevicePublicKeyB64: revoke.revokedDevicePublicKeyB64,
+      issuedAtMs: revoke.issuedAtMs, expiresAtMs: revoke.expiresAtMs,
+    },
+  });
+  assert.equal(ok, true, "revoke signature verifies against the account key");
+});
+
+test("buildSignedDeviceRevoke validates its inputs", async () => {
+  const account = await generateAccountKeyPair();
+  await assert.rejects(
+    () => buildSignedDeviceRevoke({ account: null, revokedDevicePublicKeyB64: "x" }),
+    /requires account.publicKeyB64/,
+  );
+  await assert.rejects(
+    () => buildSignedDeviceRevoke({ account, revokedDevicePublicKeyB64: "" }),
+    /requires revokedDevicePublicKeyB64/,
   );
 });

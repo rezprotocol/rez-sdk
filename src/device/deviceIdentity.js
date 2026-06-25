@@ -6,6 +6,9 @@ import {
   DeviceInboxBindingV1,
   DEVICE_INBOX_BINDING_VERSION,
   DEVICE_INBOX_BINDING_PURPOSE,
+  DeviceRevokeV1,
+  DEVICE_REVOKE_VERSION,
+  DEVICE_REVOKE_PURPOSE,
   verifyDeviceRegistrationV1,
 } from "@rezprotocol/core";
 import { signPayload } from "../auth/signing.js";
@@ -132,6 +135,48 @@ export async function buildSignedDeviceInboxBinding({ device, inboxId, nowMs, tt
   };
   const sigB64 = await signPayload({ privateKeyB64: device.privateKeyB64, payload: body });
   return new DeviceInboxBindingV1({ ...body, sig: { alg: "ed25519", sigB64 } });
+}
+
+/**
+ * Build a DeviceRevokeV1 and sign it with the ACCOUNT identity key (B-sign) — a
+ * PRIMARY device fail-closing one of its own devices at the home. The revoke
+ * NAMES the account and the revoked device; `revokedDeviceId` is self-certifying
+ * from `revokedDevicePublicKeyB64`. A DELEGATED device revokes by signing this
+ * same body with its device key C instead (gated on the `device.revoke`
+ * capability at the home) — that signing variant arrives with the seedless
+ * keystore (S9); this builder closes the primary-path gap so `devices.revoke`
+ * has a real record to send.
+ *
+ * @param {object} opts
+ * @param {{ publicKeyB64: string, privateKeyB64: string }} opts.account — account identity keypair (B-sign)
+ * @param {string} opts.revokedDevicePublicKeyB64 — the device public key being revoked
+ * @param {number} [opts.nowMs] — issuedAtMs (defaults to Date.now())
+ * @param {number} [opts.ttlMs] — lifetime; expiresAtMs = issuedAtMs + ttlMs
+ * @returns {Promise<DeviceRevokeV1>}
+ */
+export async function buildSignedDeviceRevoke({ account, revokedDevicePublicKeyB64, nowMs, ttlMs = DEFAULT_TTL_MS } = {}) {
+  if (!account || typeof account.publicKeyB64 !== "string" || account.publicKeyB64.length === 0) {
+    throw new Error("buildSignedDeviceRevoke requires account.publicKeyB64");
+  }
+  if (typeof account.privateKeyB64 !== "string" || account.privateKeyB64.length === 0) {
+    throw new Error("buildSignedDeviceRevoke requires account.privateKeyB64");
+  }
+  if (typeof revokedDevicePublicKeyB64 !== "string" || revokedDevicePublicKeyB64.length === 0) {
+    throw new Error("buildSignedDeviceRevoke requires revokedDevicePublicKeyB64");
+  }
+  const issuedAtMs = typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : Date.now();
+  const expiresAtMs = issuedAtMs + ttlMs;
+  const body = {
+    v: DEVICE_REVOKE_VERSION,
+    purpose: DEVICE_REVOKE_PURPOSE,
+    accountIdentityPublicKeyB64: account.publicKeyB64,
+    revokedDeviceId: DeviceRegistrationV1.deviceIdFor(revokedDevicePublicKeyB64),
+    revokedDevicePublicKeyB64,
+    issuedAtMs,
+    expiresAtMs,
+  };
+  const sigB64 = await signPayload({ privateKeyB64: account.privateKeyB64, payload: body });
+  return new DeviceRevokeV1({ ...body, sig: { alg: "ed25519", sigB64 } });
 }
 
 // WebCrypto (spki) verify adapter for the rez-core verifier. The SDK's account
