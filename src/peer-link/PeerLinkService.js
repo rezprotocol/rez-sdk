@@ -8,9 +8,12 @@ import {
   base64ToBytes,
   bytesToBase64,
   buildDurableRecordV1,
+  buildDurableRecordV2,
   canonicalJSONStringify,
   deriveAccountIdFromPublicKey,
   durableRecordSignableBytes,
+  durableRecordV2SignableBytes,
+  verifyAccountAuthority,
   nonEmpty,
   PEERLINK_INVITE_RECORD_KIND,
   requireId,
@@ -55,6 +58,11 @@ const DEVICE_SET_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 // E7 sender-side cap: refuse to ingest a peer device set larger than this so a
 // bloated recipient list can't force N encryptions + N deposits per message.
 const DEVICE_SET_MAX_DEVICES = 8;
+// The capability a DELEGATED inviter's cert chain must grant (S2.5 S8 L6).
+// Fixed for the invite record kind — never caller-chosen (confused-deputy
+// guard). This module is both the sole producer and the sole enforcing
+// verifier of invite envelopes; node-side stamping is DoS-hardening only.
+const PEERLINK_INVITE_REQUIRED_CAPABILITY = "peerLink.create";
 
 function asPositiveInt(value, fallback) {
   const num = Number(value);
@@ -173,7 +181,7 @@ function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function x3dhBindingPayload({ accountId, x3dhIdentityPublicKeyB64, issuedAtMs, expiresAtMs } = {}) {
+export function x3dhBindingPayload({ accountId, x3dhIdentityPublicKeyB64, issuedAtMs, expiresAtMs } = {}) {
   return {
     kind: "x3dh-subkey-binding",
     accountId,
@@ -226,6 +234,14 @@ export class PeerLinkService {
   // account shares ONE identity-DH key — the requirement for the peer-scoped
   // device-set seal (peerScopedSeal) to be openable by all of a peer's devices.
   #accountIdentityDhKeyPair;
+  // S2.5 S8 L6: the AccountDeviceCapabilityV1 chain (JSON, B→…→C) that makes
+  // THIS device a DELEGATED inviter — it signs invite envelopes + records with
+  // the device key C instead of the account key B. Null = direct mode (the
+  // shipped path). Production wiring arrives with the seedless keystore (S9).
+  #inviteCertChain;
+  // The account root (B) pubkey the cert chain anchors to — the invite
+  // record's OWNER and the key the invite code commits to, in both modes.
+  #inviteOwnerPublicKeyB64;
 
   constructor({
     storageProvider,
@@ -241,6 +257,7 @@ export class PeerLinkService {
     deviceKeyPair = null,
     deviceId = null,
     accountIdentityDhKeyPair = null,
+    accountCapabilityCertChain = null,
   } = {}) {
     if (!storageProvider || typeof storageProvider.getPeerLinkStorage !== "function") {
       throw new Error("PeerLinkService requires storageProvider.getPeerLinkStorage()");
@@ -312,6 +329,31 @@ export class PeerLinkService {
         publicKeyB64: nonEmpty(accountIdentityDhKeyPair.publicKeyB64),
         privateKeyB64: nonEmpty(accountIdentityDhKeyPair.privateKeyB64),
       };
+    }
+
+    // S2.5 S8 L6: a delegated-inviter cert chain. Intrinsic to construction
+    // (one-constructor rule): when supplied it must be a usable chain AND the
+    // device signing machinery must exist, or we fail loud immediately.
+    this.#inviteCertChain = null;
+    this.#inviteOwnerPublicKeyB64 = null;
+    if (accountCapabilityCertChain !== null) {
+      if (!Array.isArray(accountCapabilityCertChain) || accountCapabilityCertChain.length === 0) {
+        throw new Error("PeerLinkService accountCapabilityCertChain must be a non-empty array of AccountDeviceCapabilityV1");
+      }
+      if (!this.#deviceSigningKeyPair) {
+        throw new Error("PeerLinkService accountCapabilityCertChain requires deviceKeyPair + deviceId + cryptoProvider (the chain's grantee signs)");
+      }
+      const chainJson = accountCapabilityCertChain.map((cert) => (
+        cert && typeof cert.toJSON === "function" ? cert.toJSON() : cloneJson(cert)
+      ));
+      const root = chainJson[0] && typeof chainJson[0] === "object"
+        ? nonEmpty(chainJson[0].accountIdentityPublicKeyB64)
+        : null;
+      if (!root) {
+        throw new Error("PeerLinkService accountCapabilityCertChain root cert must carry accountIdentityPublicKeyB64 (the account anchor)");
+      }
+      this.#inviteCertChain = chainJson;
+      this.#inviteOwnerPublicKeyB64 = root;
     }
   }
 
@@ -1064,6 +1106,12 @@ export class PeerLinkService {
           issuedAtMs: Number.isFinite(Number(stored.accountBinding.issuedAtMs)) ? Number(stored.accountBinding.issuedAtMs) : null,
           expiresAtMs: Number.isFinite(Number(stored.accountBinding.expiresAtMs)) ? Number(stored.accountBinding.expiresAtMs) : null,
           accountBindingSigB64: nonEmpty(stored.accountBinding.accountBindingSigB64),
+          // S8 L6: when the binding was signed by a DELEGATED device key
+          // (instead of the account key), this names that signer. Included
+          // only when present so a direct binding stays byte-identical.
+          ...(nonEmpty(stored.accountBinding.accountBindingSignerPublicKeyB64)
+            ? { accountBindingSignerPublicKeyB64: nonEmpty(stored.accountBinding.accountBindingSignerPublicKeyB64) }
+            : {}),
         }
       : null;
     return {
@@ -1253,7 +1301,15 @@ export class PeerLinkService {
     };
   }
 
-  async _verifyInviteX3dhBinding({ ownerAccountId, inviteBinding } = {}) {
+  // Verifies the account↔x3dh-identity subkey binding. DUAL-MODE (S8 L6): the
+  // binding sig is normally by the account key B; a DELEGATED binding names a
+  // device signer in `x3dh.accountBindingSignerPublicKeyB64` and must come with
+  // a certChain that anchors at B and grants "peerLink.create" to that signer.
+  // The binding travels in TWO contexts (invite envelope AND the handshake's
+  // senderAccountBinding), so it stays independently verifiable here rather
+  // than borrowing an envelope's already-verified signer. Fail-closed: a
+  // delegated signer without a chain is rejected.
+  async _verifyInviteX3dhBinding({ ownerAccountId, inviteBinding, certChain = null } = {}) {
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const x3dh = inviteBinding && inviteBinding.x3dh ? inviteBinding.x3dh : null;
     if (!x3dh || typeof x3dh !== "object") {
@@ -1290,8 +1346,40 @@ export class PeerLinkService {
       err.code = "INVITE_SIGNATURE_INVALID";
       throw err;
     }
+    // Resolve the key the binding sig verifies against: the account key B
+    // (direct, the shipped path), or a delegated device signer whose authority
+    // over B is proven by the supplied cert chain.
+    let bindingVerifyKey = accountIdentityPublicKey;
+    const bindingSignerB64 = nonEmpty(x3dh.accountBindingSignerPublicKeyB64);
+    if (bindingSignerB64 && bindingSignerB64 !== accountIdentityPublicKeyB64) {
+      if (!Array.isArray(certChain) || certChain.length === 0) {
+        const err = new Error("peer-link invite X3DH binding names a delegated signer without a cert chain");
+        err.code = "INVITE_SIGNATURE_INVALID";
+        throw err;
+      }
+      const chainVerdict = await verifyAccountAuthority({
+        expectedAccountIdentityPublicKeyB64: accountIdentityPublicKeyB64,
+        requiredCapability: PEERLINK_INVITE_REQUIRED_CAPABILITY,
+        opSignerPublicKeyB64: bindingSignerB64,
+        certChain,
+        crypto: this.cryptoProvider,
+        nowMs: this.clock(),
+      });
+      if (chainVerdict.ok !== true) {
+        const err = new Error("peer-link invite X3DH binding delegated signer rejected (" + chainVerdict.reason + ")");
+        err.code = "INVITE_SIGNATURE_INVALID";
+        throw err;
+      }
+      try {
+        bindingVerifyKey = base64ToBytes(bindingSignerB64);
+      } catch {
+        const err = new Error("peer-link invite X3DH binding invalid");
+        err.code = "INVITE_SIGNATURE_INVALID";
+        throw err;
+      }
+    }
     const verified = await this.cryptoProvider.verify({
-      publicKey: accountIdentityPublicKey,
+      publicKey: bindingVerifyKey,
       msg: signedPayloadBytes(x3dhBindingPayload({
         accountId: owner,
         x3dhIdentityPublicKeyB64,
@@ -1706,7 +1794,29 @@ export class PeerLinkService {
   } = {}) {
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const nowMs = this.clock();
-    const authority = await this._resolveAuthority(owner);
+    // S8 L6 dual-mode: a DELEGATED inviter (constructed with a cert chain)
+    // signs everything with its device key C — it holds no account (B) key, so
+    // the app invite authority is not consulted for signing. The chain must
+    // anchor to THIS owner account or the invite would misattribute authorship.
+    const delegated = this.#inviteCertChain !== null;
+    let authority = null;
+    if (delegated) {
+      let anchorAccountId;
+      try {
+        anchorAccountId = deriveAccountIdFromPublicKey(base64ToBytes(this.#inviteOwnerPublicKeyB64));
+      } catch (err) {
+        const bad = new Error("createInvite delegated cert chain anchor is not a valid public key: " + (err && err.message ? err.message : "unknown"));
+        bad.code = "INVITE_SIGNATURE_INVALID";
+        throw bad;
+      }
+      if (anchorAccountId !== owner) {
+        const bad = new Error("createInvite delegated cert chain does not anchor to the inviter account");
+        bad.code = "INVITE_SIGNATURE_INVALID";
+        throw bad;
+      }
+    } else {
+      authority = await this._resolveAuthority(owner);
+    }
     const inviteId = stableId("plinv");
     const expires = expiresAtMs == null ? nowMs + 7 * 24 * 60 * 60 * 1000 : asPositiveInt(expiresAtMs, nowMs + 7 * 24 * 60 * 60 * 1000);
     const secureChannelManager = this._createSecureChannelManager();
@@ -1740,6 +1850,15 @@ export class PeerLinkService {
           : {}),
       },
     });
+    // Delegated: the stored account binding may itself be signed by a device
+    // key (S9 producer). prepareInviteBinding copies only the four classic
+    // binding fields into the bundle, so surface the signer explicitly — the
+    // field rides inside the SIGNED envelope, and the accepter verifies the
+    // binding sig against it via the same cert chain.
+    if (delegated && accountBinding && typeof accountBinding === "object"
+      && nonEmpty(accountBinding.accountBindingSignerPublicKeyB64)) {
+      inviteBindingState.binding.x3dh.accountBindingSignerPublicKeyB64 = nonEmpty(accountBinding.accountBindingSignerPublicKeyB64);
+    }
     const resolvedKind = kind === "group" ? "group" : "direct";
     const resolvedGroupId = resolvedKind === "group" && typeof groupId === "string" && groupId.trim().length > 0
       ? groupId.trim() : null;
@@ -1780,10 +1899,18 @@ export class PeerLinkService {
       maxUses: asPositiveInt(maxUses, 1),
       binding: inviteBindingState.binding,
       postCap: postCapJson,
-      signerRef: authority.signer.getSignerRef(),
+      // Delegated signerRef names the device key C but still claims the
+      // inviter ACCOUNT — every accept-side check anchors on creatorAccountId.
+      // The direct envelope gains NO new keys (byte-identical shipped shape).
+      signerRef: delegated
+        ? { accountId: owner, keyId: "invite-ed25519-delegated-v1", alg: "ed25519", signerPublicKeyB64: this.devicePublicKeyB64 }
+        : authority.signer.getSignerRef(),
+      ...(delegated ? { certChain: this.#inviteCertChain } : {}),
     };
     const canonicalPayloadBytes = canonicalPayloadBytesV1(envelope);
-    const signatureBytes = await authority.signer.sign(canonicalPayloadBytes);
+    const signatureBytes = delegated
+      ? await this.cryptoProvider.sign({ privateKey: this.#deviceSigningKeyPair.privateKey, msg: canonicalPayloadBytes })
+      : await authority.signer.sign(canonicalPayloadBytes);
     const signatureB64 = Buffer.from(signatureBytes).toString("base64");
     const tokenHash = createHash("sha256").update(canonicalPayloadBytes).digest("hex");
     await this._saveInviteRecord({
@@ -1805,25 +1932,50 @@ export class PeerLinkService {
     await this.peerLinkStorage.keys.putInvitePreKey(owner, inviteId, inviteBindingState.preKeyState);
 
     // Build + sign the durable record that carries this signed envelope to
-    // the DHT, so an acceptor can fetch it without the inviter online. The
-    // record is signed by the SAME invite authority (so its publisher key
-    // equals the envelope's signer and the v3 invite code's commitment), and
-    // the node verifies it with the same Ed25519/DER-SPKI primitives. The
-    // chat-server layer (which owns the transport) publishes it.
-    const publisherPublicKeyB64 = authority.signer.getSignerRef().signerPublicKeyB64;
+    // the DHT, so an acceptor can fetch it without the inviter online.
+    // DIRECT (the live shipped path) stays a byte-identical DurableRecordV1
+    // signed by the invite authority: publisher key == envelope signer == the
+    // v3 invite code's commitment. DELEGATED emits a DurableRecordV2 whose
+    // OWNER is the account root (B — same slot math, same code commitment,
+    // same rendezvous coordinate) while the device key C signs, carrying the
+    // cert chain the node/accepter verify. The chat-server layer (which owns
+    // the transport) publishes it.
+    const publisherPublicKeyB64 = delegated
+      ? this.#inviteOwnerPublicKeyB64
+      : authority.signer.getSignerRef().signerPublicKeyB64;
     const recordPayloadB64 = bytesToBase64(
       new TextEncoder().encode(JSON.stringify({ envelope, signatureB64 })),
     );
-    const durableRecord = buildDurableRecordV1({
-      recordKind: PEERLINK_INVITE_RECORD_KIND,
-      recordId: inviteId,
-      publisherPublicKeyB64,
-      payloadB64: recordPayloadB64,
-      issuedAtMs: nowMs,
-      expiresAtMs: expires,
-    });
-    const recordSignatureBytes = await authority.signer.sign(durableRecordSignableBytes(durableRecord));
-    durableRecord.sigB64 = bytesToBase64(recordSignatureBytes);
+    let durableRecord;
+    if (delegated) {
+      durableRecord = buildDurableRecordV2({
+        recordKind: PEERLINK_INVITE_RECORD_KIND,
+        recordId: inviteId,
+        ownerPublicKeyB64: publisherPublicKeyB64,
+        signerPublicKeyB64: this.devicePublicKeyB64,
+        certChain: this.#inviteCertChain,
+        requiredCapability: PEERLINK_INVITE_REQUIRED_CAPABILITY,
+        payloadB64: recordPayloadB64,
+        issuedAtMs: nowMs,
+        expiresAtMs: expires,
+      });
+      const recordSignatureBytes = await this.cryptoProvider.sign({
+        privateKey: this.#deviceSigningKeyPair.privateKey,
+        msg: durableRecordV2SignableBytes(durableRecord),
+      });
+      durableRecord.sigB64 = bytesToBase64(recordSignatureBytes);
+    } else {
+      durableRecord = buildDurableRecordV1({
+        recordKind: PEERLINK_INVITE_RECORD_KIND,
+        recordId: inviteId,
+        publisherPublicKeyB64,
+        payloadB64: recordPayloadB64,
+        issuedAtMs: nowMs,
+        expiresAtMs: expires,
+      });
+      const recordSignatureBytes = await authority.signer.sign(durableRecordSignableBytes(durableRecord));
+      durableRecord.sigB64 = bytesToBase64(recordSignatureBytes);
+    }
 
     return {
       peerLinkId: null,
@@ -1922,12 +2074,72 @@ export class PeerLinkService {
     verifyInviteKind(envelope);
     const inviterAccountId = requireId(envelope.creatorAccountId, "creatorAccountId");
     const nowMs = this.clock();
-    const authority = await this._resolveAuthority(inviterAccountId);
-    const verified = await authority.verifier.verify({
-      signerRef: envelope.signerRef,
-      bytes: canonicalPayloadBytes,
-      sigBytes: signatureBytes,
-    });
+    // S8 L6 dual-mode verify. A DELEGATED inviter's envelope carries a
+    // non-empty certChain: the envelope is signed by the device key C named in
+    // signerRef, and trust re-roots at the account key B three ways — the
+    // binding's account key must DERIVE the claimed creatorAccountId, every
+    // cert in the chain anchors to that same B (verifyAccountAuthority), and
+    // the chain must grant "peerLink.create" to exactly the envelope signer.
+    // The chain rides INSIDE the signed envelope, so a chain swap breaks the
+    // signature. The no-chain path is the shipped direct verify, untouched.
+    const envelopeCertChain = Array.isArray(envelope.certChain) && envelope.certChain.length > 0
+      ? envelope.certChain
+      : null;
+    let verified = false;
+    if (envelopeCertChain) {
+      if (!this.cryptoProvider || typeof this.cryptoProvider.verify !== "function") {
+        const err = new Error("delegated invite verification requires a cryptoProvider");
+        err.code = "INVITE_SIGNATURE_INVALID";
+        throw err;
+      }
+      const signerRef = envelope.signerRef && typeof envelope.signerRef === "object" ? envelope.signerRef : null;
+      const signerPublicKeyB64 = signerRef ? nonEmpty(signerRef.signerPublicKeyB64) : null;
+      const signerAccountId = signerRef ? nonEmpty(signerRef.accountId) : null;
+      const anchorPublicKeyB64 = envelope.binding && envelope.binding.x3dh && typeof envelope.binding.x3dh === "object"
+        ? nonEmpty(envelope.binding.x3dh.accountIdentityPublicKeyB64)
+        : null;
+      let delegatedOk = Boolean(signerPublicKeyB64) && Boolean(anchorPublicKeyB64)
+        && signerAccountId === inviterAccountId;
+      if (delegatedOk) {
+        try {
+          delegatedOk = deriveAccountIdFromPublicKey(base64ToBytes(anchorPublicKeyB64)) === inviterAccountId;
+        } catch (err) {
+          // Junk anchor bytes: not the inviter's account key. Reject below.
+          delegatedOk = false;
+        }
+      }
+      if (delegatedOk) {
+        try {
+          delegatedOk = await this.cryptoProvider.verify({
+            publicKey: base64ToBytes(signerPublicKeyB64),
+            msg: canonicalPayloadBytes,
+            sig: signatureBytes,
+          }) === true;
+        } catch (err) {
+          // Junk signer key / signature bytes: verification fails closed.
+          delegatedOk = false;
+        }
+      }
+      if (delegatedOk) {
+        const chainVerdict = await verifyAccountAuthority({
+          expectedAccountIdentityPublicKeyB64: anchorPublicKeyB64,
+          requiredCapability: PEERLINK_INVITE_REQUIRED_CAPABILITY,
+          opSignerPublicKeyB64: signerPublicKeyB64,
+          certChain: envelopeCertChain,
+          crypto: this.cryptoProvider,
+          nowMs,
+        });
+        delegatedOk = chainVerdict.ok === true;
+      }
+      verified = delegatedOk;
+    } else {
+      const authority = await this._resolveAuthority(inviterAccountId);
+      verified = await authority.verifier.verify({
+        signerRef: envelope.signerRef,
+        bytes: canonicalPayloadBytes,
+        sigBytes: signatureBytes,
+      });
+    }
     if (verified !== true) {
       const err = new Error("peer-link invite signature invalid");
       err.code = "INVITE_SIGNATURE_INVALID";
@@ -1949,6 +2161,7 @@ export class PeerLinkService {
     await this._verifyInviteX3dhBinding({
       ownerAccountId: inviterAccountId,
       inviteBinding: envelope.binding,
+      certChain: envelopeCertChain,
     });
 
     const existing = await this.peerLinkStorage.peerLinks.getByPair(acceptor, inviterAccountId);
@@ -2395,8 +2608,17 @@ export class PeerLinkService {
           identitySigningPublicKeyB64: nonEmpty(senderBinding.x3dhIdentityPublicKeyB64),
           accountBindingExpiresAtMs: Number(senderBinding.expiresAtMs),
           accountBindingIssuedAtMs: Number(senderBinding.issuedAtMs),
+          // S8 L6: a delegated ACCEPTER's binding names its device signer; the
+          // dual-mode verifier re-roots it at the account key via the chain
+          // below. Absent today (producer side is S9) ⇒ direct path unchanged.
+          ...(nonEmpty(senderBinding.accountBindingSignerPublicKeyB64)
+            ? { accountBindingSignerPublicKeyB64: nonEmpty(senderBinding.accountBindingSignerPublicKeyB64) }
+            : {}),
         },
       },
+      certChain: Array.isArray(senderBinding.certChain) && senderBinding.certChain.length > 0
+        ? senderBinding.certChain
+        : null,
     });
 
     // Look up the invite (for the inviter's display name + lazy maxUses).

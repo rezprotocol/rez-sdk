@@ -5,6 +5,7 @@ import {
   buildInboxAddress,
   buildRendezvousAddress,
   buildDurableRecordV1,
+  buildDurableRecordV2,
 } from "@rezprotocol/core";
 import { MailboxCapability } from "../src/capabilities/MailboxCapability.js";
 import { DurableRecordsCapability } from "../src/capabilities/DurableRecordsCapability.js";
@@ -129,5 +130,40 @@ describe("mesh.dispatch — aggressive validation before any transport", () => {
       () => mesh.dispatch({}, buildRendezvousAddress({ recordKind: "k", recordId: "x", publisherPublicKeyB64: PUB })),
       /requires object.record/,
     );
+  });
+
+  // S8 L6: a DurableRecordV2's OWNER key occupies the publisher position of
+  // the address coordinate (identical slot math to V1's publisher key).
+  it("rendezvous: a DurableRecordV2 dispatches when its OWNER matches the address publisher", async () => {
+    const { pool, mesh } = buildMesh();
+    const record = buildDurableRecordV2({
+      recordKind: "peerlink-invite", recordId: "plinv_v2", ownerPublicKeyB64: PUB,
+      payloadB64: "AAA", issuedAtMs: 1, expiresAtMs: 2,
+    });
+    record.sigB64 = "sig";
+    const res = await mesh.dispatch(
+      { record },
+      buildRendezvousAddress({ recordKind: "peerlink-invite", recordId: "plinv_v2", publisherPublicKeyB64: PUB }),
+    );
+    assert.equal(pool.calls.length, 1);
+    assert.equal(pool.calls[0].type, T.RECORD_PUT);
+    assert.equal(res.replicas, 3);
+  });
+
+  it("rendezvous: a DurableRecordV2 whose OWNER disagrees with the address is rejected", async () => {
+    const { pool, mesh } = buildMesh();
+    const record = buildDurableRecordV2({
+      recordKind: "peerlink-invite", recordId: "plinv_v2", ownerPublicKeyB64: "SOMEONE_ELSE",
+      payloadB64: "AAA", issuedAtMs: 1, expiresAtMs: 2,
+    });
+    record.sigB64 = "sig";
+    await assert.rejects(
+      () => mesh.dispatch(
+        { record },
+        buildRendezvousAddress({ recordKind: "peerlink-invite", recordId: "plinv_v2", publisherPublicKeyB64: PUB }),
+      ),
+      /coordinate does not match/,
+    );
+    assert.equal(pool.calls.length, 0);
   });
 });

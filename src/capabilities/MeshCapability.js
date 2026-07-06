@@ -90,10 +90,13 @@ export class MeshCapability {
     // The record self-binds to its own coordinate (durableRecords.put derives
     // the slot from the record, not from `address`). Reject a record whose
     // coordinate disagrees with the address it is being dispatched to, so the
-    // address can never be a silent lie about where the object lands.
+    // address can never be a silent lie about where the object lands. A
+    // DurableRecordV2's OWNER key occupies the publisher position of the
+    // coordinate (identical slot math to V1's publisher key).
+    const recordPublisherKeyB64 = o.record.v === 2 ? o.record.ownerPublicKeyB64 : o.record.publisherPublicKeyB64;
     if (o.record.recordKind !== address.recordKind
         || o.record.recordId !== address.recordId
-        || o.record.publisherPublicKeyB64 !== address.publisherPublicKeyB64) {
+        || recordPublisherKeyB64 !== address.publisherPublicKeyB64) {
       throw new Error("mesh.dispatch(rendezvous): record coordinate does not match address coordinate");
     }
     return this.#durableRecords.put({ record: o.record });
