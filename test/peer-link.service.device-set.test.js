@@ -1,8 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { bytesToBase64, deriveAccountIdFromPublicKey, DeviceRegistrationV1, DEVICE_SET_RECORD_KIND } from "@rezprotocol/core";
+import {
+  bytesToBase64,
+  deriveAccountIdFromPublicKey,
+  DeviceRegistrationV1,
+  DEVICE_SET_RECORD_KIND,
+  DeviceSetRecordV1,
+  DevicePrekeyBundleV1,
+  AccountDeviceCapabilityV1,
+  ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
+} from "@rezprotocol/core";
 import { createKeyValueBackedPeerLinkStorage } from "../src/peer-link/createKeyValueBackedPeerLinkStorage.js";
 import { PeerLinkService } from "../src/peer-link/PeerLinkService.js";
+import { buildSealedDeviceSetRecord, DEVICE_SET_PUBLISH_CAPABILITY } from "../src/peer-link/deviceSetPublish.js";
+import { derivePeerScopedKey, openFromPeer } from "../src/peer-link/peerScopedSeal.js";
 // REAL crypto — the seal is a static-static X25519 agreement and the session
 // round-trip needs genuine AES-GCM/ratchet auth (FakeCryptoProvider collapses
 // first-message keys and cannot prove peer-scoping).
@@ -92,6 +103,10 @@ async function makeAccount(crypto, { mailboxId }) {
     svc, sp, accountId, accountPubB64, deviceKeyPair,
     deviceId: svc.deviceId,
     identityDhPubB64: bytesToBase64(bound.identityDhKeyPair.publicKey),
+    // Harness-only private material for hand-building delegated records
+    // (S8 L5 tests): the account B signer + the identity-DH seal half.
+    accountPrivBytes: b.privateKey,
+    identityDhPrivB64: bytesToBase64(bound.identityDhKeyPair.privateKey),
   };
 }
 
@@ -126,7 +141,9 @@ test("device set: publish → ingest → responder-complete → per-device sessi
   // device; Alice completes as responder from Bob's handshake.
   const { record } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
   assert.equal(record.recordKind, DEVICE_SET_RECORD_KIND);
-  assert.equal(record.publisherPublicKeyB64, alice.accountPubB64);
+  assert.equal(record.v, 2);
+  assert.equal(record.ownerPublicKeyB64, alice.accountPubB64);
+  assert.equal(record.signerPublicKeyB64, alice.accountPubB64, "direct mode: the account key signs");
 
   const ingested = await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record });
   assert.equal(ingested.deviceSetRecord.devices.length, 1);
@@ -428,5 +445,117 @@ test("Audit R3 #5: the DURABLE floor rejects a rolled-back set even when the cal
     // Note: minRevision omitted (defaults 0) — the post-restart caller.
     () => bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record }),
     (err) => err && err.code === "DEVICE_SET_STALE_REVISION" && err.revision === 1 && err.knownRevision === 5,
+  );
+});
+
+// ── S8 L5: delegated publish → service ingest (V3/V4 through PeerLinkService) ──
+
+// Hand-build a DELEGATED device-set record for `from` sealed to `to`: open the
+// direct record's payload (static-static seal — the harness holds `from`'s dh
+// priv), re-sign the inner set with a fresh delegated device key C2 at
+// `revision`, and wrap it in a C2-signed V2 envelope carrying a B→C2 chain.
+// The device LIST (and its C1-signed prekey bundle) is unchanged — real X3DH
+// material, so session establishment still works.
+async function buildDelegatedRecordFrom(crypto, from, to, { revision } = {}) {
+  const direct = await from.svc.buildDeviceSetRecordForPeer({ peerAccountId: to.accountId });
+  const { aeadKey } = await derivePeerScopedKey({
+    cryptoProvider: crypto,
+    myIdentityDhPrivateKeyB64: from.identityDhPrivB64,
+    peerIdentityDhPublicKeyB64: to.identityDhPubB64,
+  });
+  const envelope = JSON.parse(dec(Buffer.from(direct.record.payloadB64, "base64")));
+  const plaintext = await openFromPeer({
+    cryptoProvider: crypto,
+    aeadKey,
+    nonceB64: envelope.nonceB64,
+    ciphertextB64: envelope.ciphertextB64,
+    aad: "rez:device-set:v1",
+  });
+  const inner = JSON.parse(dec(plaintext));
+
+  // A delegated device key C2, granted deviceSet.publish by the account B key.
+  const kp = await crypto.generateSigningKeyPair();
+  const c2PubB64 = bytesToBase64(kp.publicKey);
+  const certFields = {
+    v: 1,
+    purpose: ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
+    accountIdentityPublicKeyB64: from.accountPubB64,
+    parentCertId: null,
+    granteeDevicePublicKeyB64: c2PubB64,
+    granteeDeviceId: DeviceRegistrationV1.deviceIdFor(c2PubB64),
+    capabilities: [DEVICE_SET_PUBLISH_CAPABILITY],
+    maxDelegationDepth: 0,
+    issuedAtMs: 0,
+    expiresAtMs: FAR_FUTURE,
+    signerPublicKeyB64: from.accountPubB64,
+  };
+  const certId = AccountDeviceCapabilityV1.deriveCertId(certFields);
+  const certSig = await crypto.sign({ privateKey: from.accountPrivBytes, msg: AccountDeviceCapabilityV1.signableBytes({ ...certFields, certId }) });
+  const leaf = new AccountDeviceCapabilityV1({ ...certFields, certId, sig: { alg: "ed25519", sigB64: bytesToBase64(certSig) } });
+
+  // Re-sign the inner set with C2 at the requested revision (same-signer binding).
+  const setBody = { ...inner.deviceSet, revision };
+  delete setBody.sig;
+  const setSig = await crypto.sign({ privateKey: kp.privateKey, msg: DeviceSetRecordV1.signableBytes(setBody) });
+  const deviceSetRecord = new DeviceSetRecordV1({ ...setBody, sig: { alg: "ed25519", sigB64: bytesToBase64(setSig) } });
+  const prekeyBundleRecords = inner.prekeyBundles.map((j) => DevicePrekeyBundleV1.fromJSON(j));
+
+  const { record } = await buildSealedDeviceSetRecord({
+    cryptoProvider: crypto,
+    accountPublicKeyB64: from.accountPubB64,
+    signerSign: async (bytes) => crypto.sign({ privateKey: kp.privateKey, msg: bytes }),
+    signerPublicKeyB64: c2PubB64,
+    certChain: [leaf],
+    myIdentityDhPrivateKeyB64: from.identityDhPrivB64,
+    peerIdentityDhPublicKeyB64: to.identityDhPubB64,
+    deviceSetRecord,
+    prekeyBundleRecords,
+    nowMs: 1,
+    ttlMs: FAR_FUTURE,
+  });
+  return { record };
+}
+
+test("S8 L5: a DELEGATED device-set record (C2-signed, B→C2 chain) ingests through the service and advances the floor", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
+
+  // Bob first ingests Alice's DIRECT revision-1 set (the shipped path).
+  const { record: directRecord } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
+  const first = await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record: directRecord });
+  assert.equal(first.established.length, 1);
+
+  // Alice's delegated device republishes at revision 2 (same device list).
+  const { record } = await buildDelegatedRecordFrom(crypto, alice, bob, { revision: 2 });
+  assert.equal(record.v, 2);
+  assert.notEqual(record.signerPublicKeyB64, alice.accountPubB64, "envelope signed by the delegated key, not B");
+  const second = await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record });
+  assert.equal(second.revision, 2);
+  assert.equal(second.established.length, 0, "unchanged device list: no re-establishment");
+  assert.equal(second.reused.length, 1, "the existing device session is reused");
+
+  const floorKey = "peer-link:device-set-floor:" + bob.accountId + ":" + alice.accountId;
+  const storedFloor = await bob.sp.getKeyValueStore().get(floorKey);
+  assert.equal(storedFloor.revision, 2, "the delegated set advances the durable floor");
+});
+
+test("S8 L5: a delegated RE-SIGN at an already-accepted revision is rejected as equivocation (bump-on-resign contract)", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
+
+  const { record: directRecord } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
+  await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record: directRecord });
+
+  // Same revision (1), same device list, but re-signed by the delegated key —
+  // a DIFFERENT inner signature at an accepted revision. Any re-sign (B or C)
+  // must bump the revision; the floor rejects this as equivocation.
+  const { record } = await buildDelegatedRecordFrom(crypto, alice, bob, { revision: 1 });
+  await assert.rejects(
+    () => bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record }),
+    (err) => err && err.code === "DEVICE_SET_REVISION_EQUIVOCATION" && err.revision === 1,
   );
 });

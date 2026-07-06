@@ -543,7 +543,8 @@ export class PeerLinkService {
   /**
    * PUBLISH side (S2.5 Slice 3): build this account's device set + this device's
    * prekey bundle, seal them to one peer (peer-scoped static-static identity-DH),
-   * and return the signed DurableRecordV1 ready to put on the overlay. NO network:
+   * and return the signed DurableRecordV2 (direct mode; delegated C-signing
+   * arrives with the seedless keystore, S9) ready to put on the overlay. NO network:
    * the caller (rez-chat, Slice 5) drives sdk.durableRecords.put. The responder
    * preKeyState is retained keyed by the peer so that, when the peer establishes
    * to us against this bundle, completeDeviceSetResponder can finish the handshake.
@@ -574,12 +575,14 @@ export class PeerLinkService {
       nowMs: at,
       ttlMs: DEVICE_SET_TTL_MS,
     });
-    return { record, slotRecordId, recordKind: record.recordKind, recordId: record.recordId, publisherPublicKeyB64: record.publisherPublicKeyB64 };
+    // The owner (B) key occupies the publisher position of the fetch coordinate
+    // (V2 slot math is V1-identical) — the RECORD_GET wire param keeps its name.
+    return { record, slotRecordId, recordKind: record.recordKind, recordId: record.recordId, publisherPublicKeyB64: record.ownerPublicKeyB64 };
   }
 
   /**
    * RESOLVE side (S2.5 Slice 3): open + fully verify a peer's sealed device-set
-   * DurableRecordV1, then establish an INITIATOR per-device session against every
+   * DurableRecordV2, then establish an INITIATOR per-device session against every
    * device in the set. Returns the verified set plus, per peer device, the
    * handshakeData the peer device needs to complete its responder session (the
    * caller delivers it via the per-device fan-out, Slice 5). NO network here.
@@ -766,9 +769,10 @@ export class PeerLinkService {
    * their set to us at `derivePeerScopedKey(theirDhPriv, ourDhPub).slotRecordId`,
    * which equals `derivePeerScopedKey(ourDhPriv, theirDhPub).slotRecordId` — so we
    * recompute the same slot from OUR side with zero online exchange. The durable
-   * publisher is the peer's account (B) public key. The caller (rez-chat) feeds
-   * these to `sdk.durableRecords.get` then hands the fetched record to
-   * `ingestPeerDeviceSet`. NO network here.
+   * publisher is the peer's account (B) public key — under DurableRecordV2 the
+   * OWNER key occupies the publisher position of the fetch coordinate (identical
+   * slot math). The caller (rez-chat) feeds these to `sdk.durableRecords.get`
+   * then hands the fetched record to `ingestPeerDeviceSet`. NO network here.
    * @returns {Promise<{ recordKind: string, recordId: string, publisherPublicKeyB64: string }>}
    */
   async resolvePeerDeviceSetCoordinates({ ownerAccountId = this.ownerAccountId, peerAccountId } = {}) {

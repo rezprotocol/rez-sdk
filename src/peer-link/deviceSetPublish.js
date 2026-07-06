@@ -2,8 +2,9 @@ import {
   DeviceSetRecordV1,
   DevicePrekeyBundleV1,
   DEVICE_SET_RECORD_KIND,
-  buildDurableRecordV1,
-  durableRecordSignableBytes,
+  buildDurableRecordV2,
+  durableRecordV2SignableBytes,
+  verifyDurableRecordV2,
   bytesToBase64,
   base64ToBytes,
 } from "@rezprotocol/core";
@@ -13,24 +14,44 @@ import { derivePeerScopedKey, sealToPeer, openFromPeer } from "./peerScopedSeal.
  * deviceSetPublish — seal an account's device set TO a peer and publish it on the
  * durable-record overlay, plus the inverse (fetch → open → verify) (S2.5 Slice 3).
  *
- * The inner records (account-signed DeviceSetRecordV1, device-signed
+ * The inner records (DeviceSetRecordV1 signed by the envelope signer, device-signed
  * DevicePrekeyBundleV1[]) are built+signed by the caller (PeerLinkService, which
  * holds the account B signer + this device's key C). This module is PURE
  * envelope crypto: it seals the inner records under the peer-scoped key, wraps
- * them in a DurableRecordV1 at the peer-derived slot, signs that with the account
- * key, and on the way back verifies every signature + the anti-misbinding slot
- * before handing the validated records back for session establishment.
+ * them in a DurableRecordV2 at the peer-derived slot, signs that with the
+ * envelope signer, and on the way back verifies every signature + the
+ * anti-misbinding slot before handing the validated records back for session
+ * establishment.
+ *
+ * Signing is DUAL-MODE (S2.5 S8 L5):
+ * - direct: the account B key is both owner and signer (the shipped path)
+ * - delegated: a device key C signs, carrying an AccountDeviceCapabilityV1 cert
+ *   chain C←…←B that must grant "deviceSet.publish"
  *
  * Privacy/security model:
  * - payload encrypted to the peer (static-static identity-DH; only the peer can open)
  * - slot = peer-derived coordinate (only the peer can locate the record)
- * - publisher = the account B pubkey; the durable sig binds the envelope to B
- * - the inner DeviceSetRecordV1 is independently B-signed, and each prekey bundle
- *   is independently C-signed — so a peer that opens the payload still verifies
- *   authenticity end-to-end, never trusting the (non-owner-gated) overlay.
+ * - owner = the account B pubkey (anchors slot + identity in both modes)
+ * - the outer sig binds the envelope to the SIGNER; the cert chain proves the
+ *   signer's authority over the owner account (verifyDurableRecordV2)
+ * - the inner DeviceSetRecordV1 must be signed by the SAME key that signs the
+ *   envelope (same-signer binding: authority is proven ONCE by the envelope's
+ *   chain, and the sealed payload is integrity-bound to the envelope). Any
+ *   re-sign of the set — same or different signer — requires a revision bump,
+ *   or the receiver's equivocation floor rejects it.
+ * - each prekey bundle is independently C-signed — so a peer that opens the
+ *   payload still verifies authenticity end-to-end, never trusting the
+ *   (non-owner-gated) overlay.
  */
 
 const SEAL_AAD = "rez:device-set:v1";
+
+// The capability a delegated signer's cert chain must grant to publish a
+// device-set record. Fixed per record kind (never caller-chosen — a
+// caller-supplied capability would let a confused deputy stamp a weaker one).
+// Stamped on every record, direct included: direct mode grants the full
+// account capability set, so the stamp is uniformly enforceable.
+export const DEVICE_SET_PUBLISH_CAPABILITY = "deviceSet.publish";
 
 // A self-signed device set / bundle carries an attacker-chosen issuedAtMs. The
 // resolver must not honor one stamped far in the future (it would otherwise win
@@ -39,16 +60,25 @@ const SEAL_AAD = "rez:device-set:v1";
 const DEVICE_SET_MAX_FUTURE_SKEW_MS = 5 * 60_000;
 
 /**
- * Build the signed, sealed DurableRecordV1 carrying an account's device set,
+ * Build the signed, sealed DurableRecordV2 carrying an account's device set,
  * addressed to one peer.
+ *
+ * Direct mode (default): the account B key is owner AND signer; `accountSign`
+ * signs. Delegated mode: pass ALL of `signerSign`/`signerPublicKeyB64`/
+ * `certChain` — the device key C signs and the chain (which must grant
+ * "deviceSet.publish") proves its authority; `accountSign` is not required
+ * (a delegated device holds no B private key).
  *
  * @param {object} args
  * @param {object} args.cryptoProvider
- * @param {(bytes: Uint8Array) => Promise<Uint8Array>} args.accountSign — signs with the account B key
- * @param {string} args.accountPublicKeyB64 — the account B public key (durable publisher)
+ * @param {(bytes: Uint8Array) => Promise<Uint8Array>} [args.accountSign] — signs with the account B key (required in direct mode)
+ * @param {string} args.accountPublicKeyB64 — the account B public key (durable OWNER in both modes)
+ * @param {(bytes: Uint8Array) => Promise<Uint8Array>} [args.signerSign] — delegated: signs with the device key C
+ * @param {string} [args.signerPublicKeyB64] — delegated: the device C public key
+ * @param {object[]} [args.certChain] — delegated: AccountDeviceCapabilityV1 chain C←…←B
  * @param {string} args.myIdentityDhPrivateKeyB64 — my account identity-DH X25519 private (PKCS8 b64)
  * @param {string} args.peerIdentityDhPublicKeyB64 — peer account identity-DH X25519 public (SPKI b64)
- * @param {DeviceSetRecordV1} args.deviceSetRecord — already B-signed
+ * @param {DeviceSetRecordV1} args.deviceSetRecord — already signed by the ENVELOPE signer (B direct / C delegated)
  * @param {DevicePrekeyBundleV1[]} args.prekeyBundleRecords — already C-signed (one per device)
  * @param {number} args.nowMs
  * @param {number} args.ttlMs
@@ -58,6 +88,9 @@ export async function buildSealedDeviceSetRecord({
   cryptoProvider,
   accountSign,
   accountPublicKeyB64,
+  signerSign = null,
+  signerPublicKeyB64 = null,
+  certChain = [],
   myIdentityDhPrivateKeyB64,
   peerIdentityDhPublicKeyB64,
   deviceSetRecord,
@@ -66,7 +99,18 @@ export async function buildSealedDeviceSetRecord({
   ttlMs,
 } = {}) {
   requireNonEmptyString(accountPublicKeyB64, "accountPublicKeyB64");
-  if (typeof accountSign !== "function") {
+  const wantsDelegated = signerSign !== null
+    || (typeof signerPublicKeyB64 === "string" && signerPublicKeyB64.length > 0)
+    || (Array.isArray(certChain) && certChain.length > 0);
+  if (wantsDelegated) {
+    if (typeof signerSign !== "function") {
+      throw new Error("buildSealedDeviceSetRecord delegated mode requires a signerSign(bytes) function");
+    }
+    requireNonEmptyString(signerPublicKeyB64, "signerPublicKeyB64");
+    if (!Array.isArray(certChain) || certChain.length === 0) {
+      throw new Error("buildSealedDeviceSetRecord delegated mode requires a non-empty certChain");
+    }
+  } else if (typeof accountSign !== "function") {
     throw new Error("buildSealedDeviceSetRecord requires an accountSign(bytes) function");
   }
   if (!(deviceSetRecord instanceof DeviceSetRecordV1)) {
@@ -104,35 +148,47 @@ export async function buildSealedDeviceSetRecord({
     new TextEncoder().encode(JSON.stringify({ nonceB64: sealed.nonceB64, ciphertextB64: sealed.ciphertextB64 })),
   );
 
-  const record = buildDurableRecordV1({
+  const record = buildDurableRecordV2({
     recordKind: DEVICE_SET_RECORD_KIND,
     recordId: slotRecordId,
-    publisherPublicKeyB64: accountPublicKeyB64,
+    ownerPublicKeyB64: accountPublicKeyB64,
+    signerPublicKeyB64: wantsDelegated ? signerPublicKeyB64 : accountPublicKeyB64,
+    certChain: wantsDelegated ? certChain : [],
+    requiredCapability: DEVICE_SET_PUBLISH_CAPABILITY,
     payloadB64,
     issuedAtMs: nowMs,
     expiresAtMs: nowMs + ttlMs,
   });
-  const sigBytes = await accountSign(durableRecordSignableBytes(record));
+  const sign = wantsDelegated ? signerSign : accountSign;
+  const sigBytes = await sign(durableRecordV2SignableBytes(record));
   if (!(sigBytes instanceof Uint8Array) || sigBytes.length === 0) {
-    throw new Error("buildSealedDeviceSetRecord: accountSign returned no signature");
+    throw new Error("buildSealedDeviceSetRecord: the envelope signer returned no signature");
   }
   record.sigB64 = bytesToBase64(sigBytes);
   return { record, slotRecordId };
 }
 
 /**
- * Open + fully verify a peer's sealed device-set DurableRecordV1, returning the
+ * Open + fully verify a peer's sealed device-set DurableRecordV2, returning the
  * validated inner records. Throws (never returns partial) on any failure:
- * wrong publisher, wrong/misbound slot, bad durable sig, decrypt failure, a set
- * not signed by the peer's account, a bundle not signed by its device, a bundle
- * not present in the set, a stale (expired) set, or an over-cap device count (E7).
+ * wrong owner, wrong/misbound slot, bad durable sig or cert-chain authority,
+ * decrypt failure, a set not signed by the envelope signer, a bundle not signed
+ * by its device, a bundle not present in the set, a stale (expired) set, or an
+ * over-cap device count (E7).
+ *
+ * The envelope is verified by verifyDurableRecordV2 (sig against the SIGNER,
+ * signer authority over the owner via the cert chain, time window); the inner
+ * DeviceSetRecordV1 is then verified against that already-proven signer
+ * (same-signer binding). `revocationState` is not consulted here yet — the SDK
+ * reader gains a revocation source in S9; inject it into verifyDurableRecordV2
+ * then.
  *
  * @param {object} args
  * @param {object} args.cryptoProvider
- * @param {object} args.record — the fetched DurableRecordV1
+ * @param {object} args.record — the fetched DurableRecordV2
  * @param {string} args.myIdentityDhPrivateKeyB64
  * @param {string} args.peerIdentityDhPublicKeyB64
- * @param {string} args.peerAccountPublicKeyB64 — peer account B pubkey (publisher + set signer)
+ * @param {string} args.peerAccountPublicKeyB64 — peer account B pubkey (record OWNER + set authority root)
  * @param {number} args.nowMs
  * @param {number} [args.maxDevices=8] — E7 sender-side cap; reject oversized sets
  * @param {number} [args.maxFutureSkewMs] — reject sets/bundles issued beyond this lead
@@ -161,21 +217,23 @@ export async function openSealedDeviceSetRecord({
   if (String(record.recordKind) !== DEVICE_SET_RECORD_KIND) {
     throw new Error("openSealedDeviceSetRecord: record is not a device-set record");
   }
-  // The publisher MUST be the peer's account B key (anti-impersonation: a record
-  // published under any other key is not the peer's device set).
-  if (String(record.publisherPublicKeyB64) !== peerAccountPublicKeyB64) {
-    throw new Error("openSealedDeviceSetRecord: publisher is not the peer account identity");
+  // Clean V1→V2 format bump (S8 L5): the device set is E6-gated machinery with
+  // short-TTL records — no V1 record exists to grandfather. Fail loud.
+  if (record.v !== 2) {
+    throw new Error("openSealedDeviceSetRecord: record is not a DurableRecordV2");
+  }
+  // The owner MUST be the peer's account B key (anti-impersonation: a record
+  // owned by any other account is not the peer's device set).
+  if (String(record.ownerPublicKeyB64) !== peerAccountPublicKeyB64) {
+    throw new Error("openSealedDeviceSetRecord: owner is not the peer account identity");
   }
 
-  // Verify the durable envelope signature against the peer's account key
-  // (defense-in-depth; the node also verifies on put/get).
-  const durableSigOk = await cryptoProvider.verify({
-    publicKey: base64ToBytes(peerAccountPublicKeyB64),
-    msg: durableRecordSignableBytes(record),
-    sig: base64ToBytes(requireNonEmptyString(record.sigB64, "record.sigB64")),
-  });
-  if (!durableSigOk) {
-    throw new Error("openSealedDeviceSetRecord: durable record signature failed");
+  // Verify the durable envelope: signature against the SIGNER key, and the
+  // signer's authority over the owner account (direct, or a cert chain granting
+  // "deviceSet.publish") — defense-in-depth; the node also verifies on put/get.
+  const outer = await verifyDurableRecordV2({ record, crypto: cryptoProvider, nowMs });
+  if (!outer.ok) {
+    throw new Error("openSealedDeviceSetRecord: durable record verification failed (" + outer.reason + ")");
   }
 
   const { aeadKey, slotRecordId } = await derivePeerScopedKey({
@@ -205,8 +263,11 @@ export async function openSealedDeviceSetRecord({
   if (deviceSetRecord.accountIdentityPublicKeyB64 !== peerAccountPublicKeyB64) {
     throw new Error("openSealedDeviceSetRecord: device set is not the peer account's");
   }
+  // Same-signer binding: the inner set must be signed by the SAME key that
+  // signed the (already authority-verified) envelope. Direct mode this is the
+  // account B key exactly as before; delegated mode it is the proven device C.
   const setSigOk = await cryptoProvider.verify({
-    publicKey: base64ToBytes(peerAccountPublicKeyB64),
+    publicKey: base64ToBytes(outer.signerPublicKeyB64),
     msg: DeviceSetRecordV1.signableBytes(deviceSetRecord.toJSON()),
     sig: base64ToBytes(deviceSetRecord.sig.sigB64),
   });

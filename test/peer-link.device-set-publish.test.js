@@ -1,10 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { bytesToBase64, DeviceRegistrationV1, DeviceSetRecordV1, DevicePrekeyBundleV1 } from "@rezprotocol/core";
+import {
+  bytesToBase64,
+  DeviceRegistrationV1,
+  DeviceSetRecordV1,
+  DevicePrekeyBundleV1,
+  AccountDeviceCapabilityV1,
+  ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
+} from "@rezprotocol/core";
 // REAL crypto — static-static X25519 + AES-GCM + Ed25519 via WebCrypto.
 import { BrowserCryptoProvider } from "../src/e2ee/BrowserCryptoProvider.js";
-import { buildSealedDeviceSetRecord, openSealedDeviceSetRecord } from "../src/peer-link/deviceSetPublish.js";
+import {
+  buildSealedDeviceSetRecord,
+  openSealedDeviceSetRecord,
+  DEVICE_SET_PUBLISH_CAPABILITY,
+} from "../src/peer-link/deviceSetPublish.js";
 
 const NOW = 1_770_000_000_000;
 const TTL = 7 * 24 * 60 * 60 * 1000;
@@ -38,8 +49,10 @@ async function edSig(c, privBytes, bytes) {
   return { alg: "ed25519", sigB64: bytesToBase64(await c.sign({ privateKey: privBytes, msg: bytes })) };
 }
 
-// Build a one-device, account-signed device set + the device's C-signed prekey bundle.
-async function buildPublisherRecords(c, account, device, { inboxId = "rez:inbox:dev0", revision = 1 } = {}) {
+// Build a one-device device set + the device's C-signed prekey bundle. The set
+// is signed by the ENVELOPE signer (same-signer binding): the account key by
+// default, or `setSignerPrivBytes` (a delegated device key) when supplied.
+async function buildPublisherRecords(c, account, device, { inboxId = "rez:inbox:dev0", revision = 1, setSignerPrivBytes = null } = {}) {
   const deviceId = DeviceRegistrationV1.deviceIdFor(device.pubB64);
   const setBody = {
     v: 1,
@@ -50,7 +63,8 @@ async function buildPublisherRecords(c, account, device, { inboxId = "rez:inbox:
     issuedAtMs: NOW,
     expiresAtMs: NOW + TTL,
   };
-  const deviceSetRecord = new DeviceSetRecordV1({ ...setBody, sig: await edSig(c, account.privBytes, DeviceSetRecordV1.signableBytes(setBody)) });
+  const setPriv = setSignerPrivBytes !== null ? setSignerPrivBytes : account.privBytes;
+  const deviceSetRecord = new DeviceSetRecordV1({ ...setBody, sig: await edSig(c, setPriv, DeviceSetRecordV1.signableBytes(setBody)) });
 
   const bundleBody = {
     v: 1,
@@ -116,7 +130,11 @@ test("device set seals to a peer and resolves: round-trip with full verification
   const { record, slotRecordId } = await publish(c, pub, peer, records);
   assert.match(slotRecordId, /^[0-9a-f]{32}$/);
   assert.equal(record.recordId, slotRecordId);
-  assert.equal(record.publisherPublicKeyB64, pub.pubB64);
+  assert.equal(record.v, 2);
+  assert.equal(record.ownerPublicKeyB64, pub.pubB64);
+  assert.equal(record.signerPublicKeyB64, pub.pubB64, "direct mode: signer is the owner");
+  assert.deepEqual(record.certChain, []);
+  assert.equal(record.requiredCapability, DEVICE_SET_PUBLISH_CAPABILITY);
 
   const resolved = await openSealedDeviceSetRecord({ ...resolveOpts(c, peer, pub), record });
   assert.equal(resolved.deviceSetRecord.devices.length, 1);
@@ -203,17 +221,17 @@ test("E7 stale: a device set past expiry is rejected", async () => {
   );
 });
 
-test("wrong publisher: a record published under a non-peer account is rejected", async () => {
+test("wrong owner: a record owned by a non-peer account is rejected", async () => {
   const c = new BrowserCryptoProvider();
   const pub = await makeAccount(c);
   const peer = await makeAccount(c);
   const other = await makeAccount(c);
   const device = await makeDeviceKey(c);
   const { record } = await publish(c, pub, peer, await buildPublisherRecords(c, pub, device));
-  // Resolver expects the set to be published by `other`, but it's published by `pub`.
+  // Resolver expects the set to be owned by `other`, but it's owned by `pub`.
   await assert.rejects(
     () => openSealedDeviceSetRecord({ ...resolveOpts(c, peer, pub, { peerAccountPublicKeyB64: other.pubB64 }), record }),
-    /publisher is not the peer account/,
+    /owner is not the peer account/,
   );
 });
 
@@ -297,5 +315,197 @@ test("R4 #8 completeness: a set declaring a device with no prekey bundle is reje
   await assert.rejects(
     () => openSealedDeviceSetRecord({ ...resolveOpts(c, peer, pub), record }),
     /no prekey bundle/,
+  );
+});
+
+// ── S8 L5: delegated mode (device key C + AccountDeviceCapabilityV1 chain C←B) ──
+
+// A signed single-hop capability cert: `account` (B pub b64) grants
+// `capabilities` to `granteePubB64`, signed by the account key.
+async function buildCert(c, { accountPubB64, accountPrivBytes, granteePubB64, capabilities }) {
+  const fields = {
+    v: 1,
+    purpose: ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
+    accountIdentityPublicKeyB64: accountPubB64,
+    parentCertId: null,
+    granteeDevicePublicKeyB64: granteePubB64,
+    granteeDeviceId: DeviceRegistrationV1.deviceIdFor(granteePubB64),
+    capabilities,
+    maxDelegationDepth: 0,
+    issuedAtMs: NOW - 1000,
+    expiresAtMs: NOW + TTL,
+    signerPublicKeyB64: accountPubB64,
+  };
+  const certId = AccountDeviceCapabilityV1.deriveCertId(fields);
+  const sig = await edSig(c, accountPrivBytes, AccountDeviceCapabilityV1.signableBytes({ ...fields, certId }));
+  return new AccountDeviceCapabilityV1({ ...fields, certId, sig });
+}
+
+// Publish as a DELEGATED device: C signs the inner set AND the outer envelope;
+// the B key signs nothing but the capability cert.
+async function publishDelegated(c, pub, peer, device, { capabilities = [DEVICE_SET_PUBLISH_CAPABILITY], overrides = {} } = {}) {
+  const leaf = await buildCert(c, {
+    accountPubB64: pub.pubB64,
+    accountPrivBytes: pub.privBytes,
+    granteePubB64: device.pubB64,
+    capabilities,
+  });
+  const records = await buildPublisherRecords(c, pub, device, { setSignerPrivBytes: device.privBytes });
+  const built = await buildSealedDeviceSetRecord({
+    cryptoProvider: c,
+    accountPublicKeyB64: pub.pubB64,
+    signerSign: signerFor(c, device.privBytes),
+    signerPublicKeyB64: device.pubB64,
+    certChain: [leaf],
+    myIdentityDhPrivateKeyB64: pub.dhPrivB64,
+    peerIdentityDhPublicKeyB64: peer.dhPubB64,
+    deviceSetRecord: records.deviceSetRecord,
+    prekeyBundleRecords: records.prekeyBundleRecords,
+    nowMs: NOW,
+    ttlMs: TTL,
+    ...overrides,
+  });
+  return { ...built, leaf, records };
+}
+
+test("delegated round-trip: C signs inner + outer with a B→C chain granting deviceSet.publish", async () => {
+  const c = new BrowserCryptoProvider();
+  const pub = await makeAccount(c);
+  const peer = await makeAccount(c);
+  const device = await makeDeviceKey(c);
+  const { record, slotRecordId } = await publishDelegated(c, pub, peer, device);
+  assert.equal(record.v, 2);
+  assert.equal(record.ownerPublicKeyB64, pub.pubB64, "owner stays the account B key");
+  assert.equal(record.signerPublicKeyB64, device.pubB64, "signer is the delegated device C");
+  assert.equal(record.recordId, slotRecordId, "delegated signer never moves the slot");
+  const resolved = await openSealedDeviceSetRecord({ ...resolveOpts(c, peer, pub), record });
+  assert.equal(resolved.deviceSetRecord.devices.length, 1);
+  assert.equal(resolved.prekeyBundleRecords[0].deviceId, DeviceRegistrationV1.deviceIdFor(device.pubB64));
+});
+
+test("delegated: a chain granting the wrong capability is rejected", async () => {
+  const c = new BrowserCryptoProvider();
+  const pub = await makeAccount(c);
+  const peer = await makeAccount(c);
+  const device = await makeDeviceKey(c);
+  const { record } = await publishDelegated(c, pub, peer, device, { capabilities: ["peerLink.create"] });
+  await assert.rejects(
+    () => openSealedDeviceSetRecord({ ...resolveOpts(c, peer, pub), record }),
+    /durable record verification failed/,
+  );
+});
+
+test("delegated: a chain granted to a different device than the envelope signer is rejected", async () => {
+  const c = new BrowserCryptoProvider();
+  const pub = await makeAccount(c);
+  const peer = await makeAccount(c);
+  const device = await makeDeviceKey(c);
+  const otherDevice = await makeDeviceKey(c);
+  const leaf = await buildCert(c, {
+    accountPubB64: pub.pubB64,
+    accountPrivBytes: pub.privBytes,
+    granteePubB64: otherDevice.pubB64,
+    capabilities: [DEVICE_SET_PUBLISH_CAPABILITY],
+  });
+  const { record } = await publishDelegated(c, pub, peer, device, { overrides: { certChain: [leaf] } });
+  await assert.rejects(
+    () => openSealedDeviceSetRecord({ ...resolveOpts(c, peer, pub), record }),
+    /durable record verification failed/,
+  );
+});
+
+test("same-signer binding: a delegated envelope carrying a B-signed inner set is rejected", async () => {
+  const c = new BrowserCryptoProvider();
+  const pub = await makeAccount(c);
+  const peer = await makeAccount(c);
+  const device = await makeDeviceKey(c);
+  // Inner set signed by B (the old shipped shape) but the envelope is C-signed:
+  // the inner must be verified against the PROVEN envelope signer, so it fails.
+  const bSignedRecords = await buildPublisherRecords(c, pub, device);
+  const leaf = await buildCert(c, {
+    accountPubB64: pub.pubB64,
+    accountPrivBytes: pub.privBytes,
+    granteePubB64: device.pubB64,
+    capabilities: [DEVICE_SET_PUBLISH_CAPABILITY],
+  });
+  const { record } = await buildSealedDeviceSetRecord({
+    cryptoProvider: c,
+    accountPublicKeyB64: pub.pubB64,
+    signerSign: signerFor(c, device.privBytes),
+    signerPublicKeyB64: device.pubB64,
+    certChain: [leaf],
+    myIdentityDhPrivateKeyB64: pub.dhPrivB64,
+    peerIdentityDhPublicKeyB64: peer.dhPubB64,
+    deviceSetRecord: bSignedRecords.deviceSetRecord,
+    prekeyBundleRecords: bSignedRecords.prekeyBundleRecords,
+    nowMs: NOW,
+    ttlMs: TTL,
+  });
+  await assert.rejects(
+    () => openSealedDeviceSetRecord({ ...resolveOpts(c, peer, pub), record }),
+    /device set signature failed/,
+  );
+});
+
+test("clean format bump: a V1-shaped record is rejected", async () => {
+  const c = new BrowserCryptoProvider();
+  const pub = await makeAccount(c);
+  const peer = await makeAccount(c);
+  const device = await makeDeviceKey(c);
+  const { record } = await publish(c, pub, peer, await buildPublisherRecords(c, pub, device));
+  // Reshape to the retired V1 layout: publisher field, v:1, no signer/chain.
+  const v1Shaped = {
+    v: 1,
+    recordKind: record.recordKind,
+    recordId: record.recordId,
+    publisherPublicKeyB64: record.ownerPublicKeyB64,
+    issuedAtMs: record.issuedAtMs,
+    expiresAtMs: record.expiresAtMs,
+    payloadB64: record.payloadB64,
+    sigB64: record.sigB64,
+  };
+  await assert.rejects(
+    () => openSealedDeviceSetRecord({ ...resolveOpts(c, peer, pub), record: v1Shaped }),
+    /not a DurableRecordV2/,
+  );
+});
+
+test("builder validation: partial delegated params throw (fail loud, never half-delegated)", async () => {
+  const c = new BrowserCryptoProvider();
+  const pub = await makeAccount(c);
+  const peer = await makeAccount(c);
+  const device = await makeDeviceKey(c);
+  const records = await buildPublisherRecords(c, pub, device);
+  const base = {
+    cryptoProvider: c,
+    accountSign: signerFor(c, pub.privBytes),
+    accountPublicKeyB64: pub.pubB64,
+    myIdentityDhPrivateKeyB64: pub.dhPrivB64,
+    peerIdentityDhPublicKeyB64: peer.dhPubB64,
+    deviceSetRecord: records.deviceSetRecord,
+    prekeyBundleRecords: records.prekeyBundleRecords,
+    nowMs: NOW,
+    ttlMs: TTL,
+  };
+  // Signer key without a chain.
+  await assert.rejects(
+    () => buildSealedDeviceSetRecord({ ...base, signerSign: signerFor(c, device.privBytes), signerPublicKeyB64: device.pubB64 }),
+    /requires a non-empty certChain/,
+  );
+  // Chain without a signer sign fn.
+  const leaf = await buildCert(c, {
+    accountPubB64: pub.pubB64,
+    accountPrivBytes: pub.privBytes,
+    granteePubB64: device.pubB64,
+    capabilities: [DEVICE_SET_PUBLISH_CAPABILITY],
+  });
+  await assert.rejects(
+    () => buildSealedDeviceSetRecord({ ...base, certChain: [leaf] }),
+    /requires a signerSign/,
+  );
+  // Direct mode with no accountSign at all.
+  await assert.rejects(
+    () => buildSealedDeviceSetRecord({ ...base, accountSign: undefined }),
+    /requires an accountSign/,
   );
 });
