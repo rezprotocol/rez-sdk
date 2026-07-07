@@ -590,7 +590,7 @@ export class PeerLinkService {
   // the sealed envelope's signer). The set body's accountIdentityPublicKeyB64
   // stays B in both modes. The set + bundle content is account/device-level
   // (identical for every peer); only the seal coordinate is peer-scoped.
-  async #buildLocalDeviceSetMaterial(owner, accountPublicKeyB64, setSign, nowMs) {
+  async #buildLocalDeviceSetMaterial(owner, accountPublicKeyB64, setSign, nowMs, revision = 1) {
     this.#requireDeviceSessions();
     const inboxId = nonEmpty(this.inviteBinding && this.inviteBinding.mailboxId);
     if (!inboxId) {
@@ -603,15 +603,16 @@ export class PeerLinkService {
     }
     const expiresAtMs = nowMs + DEVICE_SET_TTL_MS;
 
-    // The account-level device set. revision/prekeyVersion stay 1 while this is
-    // the only device and there is no add/remove ceremony (Slice 6/7) or refresh
-    // (Slice 5) to bump them; the fields ARE versioned, the monotonic bumping
-    // lands with the mutations that warrant it.
+    // The account-level device set. `revision` is the authority epoch the caller
+    // resolved from the home (S2.5 S11) — it defaults to 1 so the pre-S11 direct
+    // path is byte-identical, and rises monotonically as device add/revoke
+    // mutations bump the epoch. A peer rejects any set below its accepted floor
+    // (rollback protection in ingestPeerDeviceSet).
     const setBody = {
       v: DEVICE_SET_VERSION,
       purpose: DEVICE_SET_PURPOSE,
       accountIdentityPublicKeyB64: accountPublicKeyB64,
-      revision: 1,
+      revision,
       devices: [{ deviceId, devicePublicKeyB64, inboxId }],
       issuedAtMs: nowMs,
       expiresAtMs,
@@ -654,11 +655,14 @@ export class PeerLinkService {
    * preKeyState is retained keyed by the peer so that, when the peer establishes
    * to us against this bundle, completeDeviceSetResponder can finish the handshake.
    */
-  async buildDeviceSetRecordForPeer({ ownerAccountId = this.ownerAccountId, peerAccountId, nowMs } = {}) {
+  async buildDeviceSetRecordForPeer({ ownerAccountId = this.ownerAccountId, peerAccountId, nowMs, revision = 1 } = {}) {
     this.#requireDeviceSessions();
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const peer = requireId(peerAccountId, "peerAccountId");
     const at = asPositiveInt(nowMs, this.clock());
+    if (!Number.isInteger(revision) || revision < 1) {
+      throw new Error("buildDeviceSetRecordForPeer requires a positive integer revision");
+    }
     const { peerIdentityDhPublicKeyB64 } = await this._requirePeerDeviceSetContext(owner, peer);
     const delegated = this.#hasAdminRoot === false;
     const signerInfo = delegated
@@ -670,7 +674,7 @@ export class PeerLinkService {
     const setSign = delegated ? signerInfo.setSign : signerInfo.accountSign;
     const { identityDhKeyPair } = await this._requireBoundX3dhIdentity(owner);
 
-    const { deviceSetRecord, prekeyBundleRecord, preKeyState } = await this.#buildLocalDeviceSetMaterial(owner, accountPublicKeyB64, setSign, at);
+    const { deviceSetRecord, prekeyBundleRecord, preKeyState } = await this.#buildLocalDeviceSetMaterial(owner, accountPublicKeyB64, setSign, at, revision);
 
     // Retain the responder state for this peer BEFORE handing out the sealed
     // bundle, so we can never publish a bundle we cannot later answer.

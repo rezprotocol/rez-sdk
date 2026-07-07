@@ -340,6 +340,33 @@ test("Audit R2 #2: ingest rejects a device set whose revision rolls back below a
   assert.equal(ok.established.length, 1);
 });
 
+test("S11: buildDeviceSetRecordForPeer threads an explicit revision (default 1 stays byte-compatible)", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
+
+  // Default: revision 1 (the pre-S11 direct path).
+  const def = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
+  const okDefault = await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record: def.record });
+  assert.equal(okDefault.revision, 1, "no revision arg ⇒ revision 1, unchanged");
+
+  // An explicit higher revision (an authority epoch bumped by a device mutation)
+  // rides through and is accepted as it advances the floor.
+  const bumped = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId, revision: 7 });
+  const okBumped = await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record: bumped.record });
+  assert.equal(okBumped.revision, 7, "the explicit revision threads into the published set");
+});
+
+test("S11: buildDeviceSetRecordForPeer rejects a non-positive/non-integer revision (fail loud)", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
+  await assert.rejects(() => alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId, revision: 0 }), /positive integer revision/);
+  await assert.rejects(() => alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId, revision: 1.5 }), /positive integer revision/);
+});
+
 test("Audit R3 #5: a successful ingest persists the revision floor durably", async () => {
   const crypto = new BrowserCryptoProvider();
   const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
