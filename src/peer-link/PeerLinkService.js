@@ -242,6 +242,12 @@ export class PeerLinkService {
   // The account root (B) pubkey the cert chain anchors to — the invite
   // record's OWNER and the key the invite code commits to, in both modes.
   #inviteOwnerPublicKeyB64;
+  // S9: the explicit signing-mode flag. true = this device holds the account
+  // admin root (B) and account-level material is signed DIRECT through the
+  // authority; false = cert-mode — the device key C signs under the capability
+  // chain and the authority signer is NEVER invoked for account-level
+  // signatures (the verifier is still used in both modes).
+  #hasAdminRoot;
 
   constructor({
     storageProvider,
@@ -258,6 +264,7 @@ export class PeerLinkService {
     deviceId = null,
     accountIdentityDhKeyPair = null,
     accountCapabilityCertChain = null,
+    hasAdminRoot = null,
   } = {}) {
     if (!storageProvider || typeof storageProvider.getPeerLinkStorage !== "function") {
       throw new Error("PeerLinkService requires storageProvider.getPeerLinkStorage()");
@@ -355,6 +362,27 @@ export class PeerLinkService {
       this.#inviteCertChain = chainJson;
       this.#inviteOwnerPublicKeyB64 = root;
     }
+
+    // S9 mode contract: omitted (null) infers from chain presence — the exact
+    // pre-S9 derivation, so every legacy call site is byte-identical. Passed
+    // explicitly (rez-chat always does), a contradiction between the flag and
+    // the supplied material fails loud here instead of missigning later.
+    if (hasAdminRoot !== null && hasAdminRoot !== true && hasAdminRoot !== false) {
+      throw new Error("PeerLinkService hasAdminRoot must be true, false, or omitted");
+    }
+    if (hasAdminRoot === true && this.#inviteCertChain !== null) {
+      throw new Error("PeerLinkService hasAdminRoot=true is incompatible with accountCapabilityCertChain (a primary device signs direct; drop the chain or set hasAdminRoot=false)");
+    }
+    if (hasAdminRoot === false && this.#inviteCertChain === null) {
+      throw new Error("PeerLinkService hasAdminRoot=false requires accountCapabilityCertChain + deviceKeyPair + deviceId + cryptoProvider (a delegated device signs with its device key under a cert chain)");
+    }
+    this.#hasAdminRoot = hasAdminRoot === null ? this.#inviteCertChain === null : hasAdminRoot;
+  }
+
+  // The signing mode this service was constructed in. true = direct (account
+  // admin root); false = cert-mode (delegated device key under a chain).
+  get hasAdminRoot() {
+    return this.#hasAdminRoot;
   }
 
   // True when this service was constructed with a device key and can run
@@ -523,12 +551,46 @@ export class PeerLinkService {
     };
   }
 
-  // Build this device's account-signed DeviceSetRecordV1 (single device until the
-  // E6 fan-out gate lifts) + this device's C-signed DevicePrekeyBundleV1, plus the
+  /**
+   * Cert-mode (S9) counterpart of _resolveAccountIdentitySigner: the device
+   * key C signs the device-set material under the account capability chain —
+   * no account (B) private key exists on this device, so the authority signer
+   * is never consulted. The direct version derives the accountId from the
+   * AUTHORITY signer's pubkey and cross-checks it against the binding; here
+   * the chain ANCHOR is the account key, so the same misconfiguration classes
+   * are caught anchor-based: the anchor must derive the owner accountId AND
+   * agree with the verified account binding.
+   */
+  async _resolveDelegatedAccountIdentitySigner(ownerAccountId) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    if (this.#hasAdminRoot !== false) {
+      throw new Error("_resolveDelegatedAccountIdentitySigner requires a delegated PeerLinkService (hasAdminRoot=false)");
+    }
+    const accountPublicKeyB64 = this.#inviteOwnerPublicKeyB64;
+    if (deriveAccountIdFromPublicKey(base64ToBytes(accountPublicKeyB64)) !== owner) {
+      throw new Error("device-set delegated signer: the account capability chain anchor does not derive the owner accountId");
+    }
+    const { accountBinding } = await this._requireBoundX3dhIdentity(owner);
+    if (!accountBinding || accountBinding.accountIdentityPublicKeyB64 !== accountPublicKeyB64) {
+      throw new Error("device-set delegated signer: the chain anchor disagrees with the account binding");
+    }
+    return {
+      accountPublicKeyB64,
+      setSign: (bytes) => this.cryptoProvider.sign({ privateKey: this.#deviceSigningKeyPair.privateKey, msg: bytes }),
+      signerPublicKeyB64: this.devicePublicKeyB64,
+      certChain: this.#inviteCertChain,
+    };
+  }
+
+  // Build this device's DeviceSetRecordV1 (single device until the E6 fan-out
+  // gate lifts) + this device's C-signed DevicePrekeyBundleV1, plus the
   // responder preKeyState that must be retained so the peer can establish to us.
-  // The set + bundle content is account/device-level (identical for every peer);
-  // only the seal coordinate (Slice 3 leaf 5) is peer-scoped.
-  async #buildLocalDeviceSetMaterial(owner, accountPublicKeyB64, accountSign, nowMs) {
+  // `setSign` is the ACCOUNT key B in direct mode and the DEVICE key C in
+  // cert-mode (same-signer binding: the opener verifies the inner set against
+  // the sealed envelope's signer). The set body's accountIdentityPublicKeyB64
+  // stays B in both modes. The set + bundle content is account/device-level
+  // (identical for every peer); only the seal coordinate is peer-scoped.
+  async #buildLocalDeviceSetMaterial(owner, accountPublicKeyB64, setSign, nowMs) {
     this.#requireDeviceSessions();
     const inboxId = nonEmpty(this.inviteBinding && this.inviteBinding.mailboxId);
     if (!inboxId) {
@@ -554,7 +616,7 @@ export class PeerLinkService {
       issuedAtMs: nowMs,
       expiresAtMs,
     };
-    const setSig = await accountSign(DeviceSetRecordV1.signableBytes(setBody));
+    const setSig = await setSign(DeviceSetRecordV1.signableBytes(setBody));
     const deviceSetRecord = new DeviceSetRecordV1({ ...setBody, sig: { alg: "ed25519", sigB64: bytesToBase64(setSig) } });
 
     // This device's prekey bundle, signed by the device key C. The responder
@@ -585,8 +647,9 @@ export class PeerLinkService {
   /**
    * PUBLISH side (S2.5 Slice 3): build this account's device set + this device's
    * prekey bundle, seal them to one peer (peer-scoped static-static identity-DH),
-   * and return the signed DurableRecordV2 (direct mode; delegated C-signing
-   * arrives with the seedless keystore, S9) ready to put on the overlay. NO network:
+   * and return the signed DurableRecordV2 — DIRECT (B signs) when hasAdminRoot,
+   * else CERT-MODE (C signs inner + envelope under the capability chain, owner
+   * stays B) — ready to put on the overlay. NO network:
    * the caller (rez-chat, Slice 5) drives sdk.durableRecords.put. The responder
    * preKeyState is retained keyed by the peer so that, when the peer establishes
    * to us against this bundle, completeDeviceSetResponder can finish the handshake.
@@ -597,10 +660,17 @@ export class PeerLinkService {
     const peer = requireId(peerAccountId, "peerAccountId");
     const at = asPositiveInt(nowMs, this.clock());
     const { peerIdentityDhPublicKeyB64 } = await this._requirePeerDeviceSetContext(owner, peer);
-    const { accountPublicKeyB64, accountSign } = await this._resolveAccountIdentitySigner(owner);
+    const delegated = this.#hasAdminRoot === false;
+    const signerInfo = delegated
+      ? await this._resolveDelegatedAccountIdentitySigner(owner)
+      : await this._resolveAccountIdentitySigner(owner);
+    const accountPublicKeyB64 = signerInfo.accountPublicKeyB64;
+    // Cert-mode signs the INNER set with C too (same-signer binding — the
+    // opener verifies the inner set against the sealed envelope's signer).
+    const setSign = delegated ? signerInfo.setSign : signerInfo.accountSign;
     const { identityDhKeyPair } = await this._requireBoundX3dhIdentity(owner);
 
-    const { deviceSetRecord, prekeyBundleRecord, preKeyState } = await this.#buildLocalDeviceSetMaterial(owner, accountPublicKeyB64, accountSign, at);
+    const { deviceSetRecord, prekeyBundleRecord, preKeyState } = await this.#buildLocalDeviceSetMaterial(owner, accountPublicKeyB64, setSign, at);
 
     // Retain the responder state for this peer BEFORE handing out the sealed
     // bundle, so we can never publish a bundle we cannot later answer.
@@ -608,7 +678,13 @@ export class PeerLinkService {
 
     const { record, slotRecordId } = await buildSealedDeviceSetRecord({
       cryptoProvider: this.cryptoProvider,
-      accountSign,
+      ...(delegated
+        ? {
+            signerSign: signerInfo.setSign,
+            signerPublicKeyB64: signerInfo.signerPublicKeyB64,
+            certChain: signerInfo.certChain,
+          }
+        : { accountSign: signerInfo.accountSign }),
       accountPublicKeyB64,
       myIdentityDhPrivateKeyB64: bytesToBase64(identityDhKeyPair.privateKey),
       peerIdentityDhPublicKeyB64,
@@ -1260,6 +1336,51 @@ export class PeerLinkService {
     return cloneJson(record.accountBinding);
   }
 
+  /**
+   * S9 producer: a DELEGATED device provisions its own x3dh-subkey binding by
+   * signing the canonical binding payload with its device key C and naming
+   * itself in accountBindingSignerPublicKeyB64. The S8 dual-mode verifier
+   * (_verifyInviteX3dhBinding) accepts it because the cert chain — which
+   * travels in the invite ENVELOPE, not the binding — anchors at the account
+   * key and grants "peerLink.create" to C. A primary device provisions its
+   * binding with the account key (host-side, unchanged); this method refuses
+   * on a direct-mode service so the two producers can never be confused.
+   */
+  async selfProvisionDelegatedAccountBinding({ ownerAccountId = this.ownerAccountId, ttlMs = 365 * 24 * 60 * 60 * 1000 } = {}) {
+    if (this.#hasAdminRoot !== false) {
+      throw new Error("selfProvisionDelegatedAccountBinding requires a delegated PeerLinkService (hasAdminRoot=false); a primary device provisions its binding with the account key");
+    }
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    if (deriveAccountIdFromPublicKey(base64ToBytes(this.#inviteOwnerPublicKeyB64)) !== owner) {
+      throw new Error("selfProvisionDelegatedAccountBinding: the account capability chain anchor does not derive the owner accountId");
+    }
+    const challenge = await this._primeAccountBindingChallenge(owner);
+    const issuedAtMs = this.clock();
+    const expiresAtMs = issuedAtMs + asPositiveInt(ttlMs, 365 * 24 * 60 * 60 * 1000);
+    const payload = x3dhBindingPayload({
+      accountId: owner,
+      x3dhIdentityPublicKeyB64: challenge.x3dhIdentityPublicKeyB64,
+      issuedAtMs,
+      expiresAtMs,
+    });
+    const sig = await this.cryptoProvider.sign({
+      privateKey: this.#deviceSigningKeyPair.privateKey,
+      msg: signedPayloadBytes(payload),
+    });
+    return this.upsertAccountBinding({
+      ownerAccountId: owner,
+      accountBinding: {
+        accountId: payload.accountId,
+        accountIdentityPublicKeyB64: this.#inviteOwnerPublicKeyB64,
+        x3dhIdentityPublicKeyB64: payload.x3dhIdentityPublicKeyB64,
+        issuedAtMs: payload.issuedAtMs,
+        expiresAtMs: payload.expiresAtMs,
+        accountBindingSigB64: bytesToBase64(sig),
+        accountBindingSignerPublicKeyB64: this.devicePublicKeyB64,
+      },
+    });
+  }
+
   async _requireBoundX3dhIdentity(accountId) {
     const owner = requireId(accountId, "accountId");
     const record = await this._loadAccountKeyRecord(owner);
@@ -1794,11 +1915,11 @@ export class PeerLinkService {
   } = {}) {
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const nowMs = this.clock();
-    // S8 L6 dual-mode: a DELEGATED inviter (constructed with a cert chain)
-    // signs everything with its device key C — it holds no account (B) key, so
-    // the app invite authority is not consulted for signing. The chain must
+    // S8 L6 dual-mode: a DELEGATED inviter (hasAdminRoot=false) signs
+    // everything with its device key C — it holds no account (B) key, so the
+    // app invite authority is not consulted for signing. The chain must
     // anchor to THIS owner account or the invite would misattribute authorship.
-    const delegated = this.#inviteCertChain !== null;
+    const delegated = this.#hasAdminRoot === false;
     let authority = null;
     if (delegated) {
       let anchorAccountId;

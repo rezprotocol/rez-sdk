@@ -12,8 +12,19 @@ function assertPublicOptions({ uplinks, identity, callerName }) {
     throw new Error(callerName + " requires uplinks[]");
   }
   const row = identity && typeof identity === "object" ? identity : null;
-  if (!row || !row.accountId || !row.publicKeyB64 || !row.privateKeyB64) {
-    throw new Error(callerName + " requires identity with accountId, publicKeyB64, privateKeyB64");
+  // Dual-mode (S9): the exact AuthStateMachine predicate — PRIMARY carries the
+  // account private key; DELEGATED carries no account priv but a device key C
+  // plus the AccountDeviceCapabilityV1 chain that authorizes it.
+  const deviceKey = row && row.deviceKey && typeof row.deviceKey === "object" ? row.deviceKey : null;
+  const hasDelegation = Boolean(
+    deviceKey
+    && deviceKey.publicKeyB64
+    && deviceKey.privateKeyB64
+    && Array.isArray(row && row.certChain)
+    && row.certChain.length > 0,
+  );
+  if (!row || !row.accountId || !row.publicKeyB64 || (!row.privateKeyB64 && !hasDelegation)) {
+    throw new Error(callerName + " requires identity with accountId, publicKeyB64, and privateKeyB64 (primary) or deviceKey + certChain (delegated)");
   }
 }
 

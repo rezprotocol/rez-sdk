@@ -63,6 +63,45 @@ test("createRezClient returns a RezClient instance", () => {
   assert.ok(client instanceof RezClient);
 });
 
+// --- S9 dual-mode identity gate (mirrors the AuthStateMachine predicate) ---
+
+const STUB_DELEGATED_IDENTITY = {
+  accountId: "acct:test",
+  deviceId: "dev:1",
+  publicKeyB64: "cHVibGljLWtleQ==",
+  // NO privateKeyB64 — a seedless (delegated) identity signs with its device key.
+  deviceKey: { publicKeyB64: "ZGV2LXB1Yg==", privateKeyB64: "ZGV2LXByaXY=" },
+  certChain: [{ certId: "rez:cap:stub" }],
+};
+
+test("createRezClient accepts a DELEGATED identity (deviceKey + certChain, no account priv)", () => {
+  const client = createRezClient({
+    uplinks: ["ws://localhost:8080/ws"],
+    identity: STUB_DELEGATED_IDENTITY,
+  });
+  assert.ok(client instanceof RezClient);
+});
+
+test("createRezClient rejects an identity in NEITHER mode (no priv, no delegation)", () => {
+  assert.throws(
+    () =>
+      createRezClient({
+        uplinks: ["ws://localhost:8080/ws"],
+        identity: { accountId: "acct:test", publicKeyB64: "a" },
+      }),
+    /privateKeyB64 \(primary\) or deviceKey \+ certChain \(delegated\)/,
+  );
+  // A device key WITHOUT a chain is not a delegation either.
+  assert.throws(
+    () =>
+      createRezClient({
+        uplinks: ["ws://localhost:8080/ws"],
+        identity: { accountId: "acct:test", publicKeyB64: "a", deviceKey: STUB_DELEGATED_IDENTITY.deviceKey },
+      }),
+    /privateKeyB64 \(primary\) or deviceKey \+ certChain \(delegated\)/,
+  );
+});
+
 test("new RezClient accepts public identity/uplinks options", () => {
   const client = new RezClient({
     uplinks: ["ws://localhost:8080/ws"],
