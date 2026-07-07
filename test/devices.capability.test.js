@@ -131,6 +131,107 @@ test("DevicesCapability.revoke sends DEVICE_REVOKE with the revoke record and re
   await assert.rejects(() => cap.revoke({}), /requires deviceRevoke/);
 });
 
+// ---- S2.5 S11: account device-mutation authority (build + submit + authority-state) ----
+
+test("IdentityCapability.buildAccountDeviceMutation signs with the ACCOUNT key by default", async () => {
+  const account = await generateAccountKeyPair();
+  const device = await generateDeviceKeyPair();
+  const deviceId = DeviceRegistrationV1.deviceIdFor(device.publicKeyB64);
+  const cap = new IdentityCapability({ pool: poolStub, eventBus: eventBusStub, identity: makeIdentity({ account, device, deviceId }) });
+
+  const target = await generateDeviceKeyPair();
+  const mutation = await cap.buildAccountDeviceMutation({
+    opId: "op-a", expectedRevision: 2, action: "device.revoke",
+    target: { revokedDeviceId: DeviceRegistrationV1.deviceIdFor(target.publicKeyB64) },
+    nowMs: NOW,
+  });
+  assert.equal(mutation.accountIdentityPublicKeyB64, account.publicKeyB64);
+  assert.equal(mutation.signerPublicKeyB64, account.publicKeyB64, "default signs with the account key");
+});
+
+test("IdentityCapability.buildAccountDeviceMutation signWith:'device' signs with the device key C", async () => {
+  const account = await generateAccountKeyPair();
+  const device = await generateDeviceKeyPair();
+  const deviceId = DeviceRegistrationV1.deviceIdFor(device.publicKeyB64);
+  const cap = new IdentityCapability({ pool: poolStub, eventBus: eventBusStub, identity: makeIdentity({ account, device, deviceId }) });
+
+  const target = await generateDeviceKeyPair();
+  const mutation = await cap.buildAccountDeviceMutation({
+    opId: "op-b", expectedRevision: 0, action: "device.revoke",
+    target: { revokedDeviceId: DeviceRegistrationV1.deviceIdFor(target.publicKeyB64) },
+    signWith: "device", nowMs: NOW,
+  });
+  assert.equal(mutation.accountIdentityPublicKeyB64, account.publicKeyB64, "still names the account");
+  assert.equal(mutation.signerPublicKeyB64, device.publicKeyB64, "delegated signs with C");
+});
+
+test("IdentityCapability.buildAccountDeviceMutation signWith:'device' fails loud without a device key", async () => {
+  const account = await generateAccountKeyPair();
+  const cap = new IdentityCapability({ pool: poolStub, eventBus: eventBusStub, identity: makeIdentity({ account, device: null, deviceId: null }) });
+  await assert.rejects(
+    () => cap.buildAccountDeviceMutation({ opId: "x", expectedRevision: 0, action: "device.revoke", target: { revokedDeviceId: "rez:dev:z" }, signWith: "device" }),
+    /no device keypair/,
+  );
+});
+
+test("buildAccountAuthorityState signs the epoch snapshot with the account key", async () => {
+  const account = await generateAccountKeyPair();
+  const cap = new IdentityCapability({ pool: poolStub, eventBus: eventBusStub, identity: makeIdentity({ account, device: null, deviceId: null }) });
+  const state = await cap.buildAccountAuthorityState({ epoch: 4, revokedCertIds: ["rez:cap:b", "rez:cap:a"], nowMs: NOW });
+  assert.equal(state.accountIdentityPublicKeyB64, account.publicKeyB64);
+  assert.equal(state.signerPublicKeyB64, account.publicKeyB64);
+  assert.deepEqual(state.revokedCertIds, ["rez:cap:a", "rez:cap:b"]);
+});
+
+test("DevicesCapability.submitDeviceMutation sends ACCOUNT_DEVICE_MUTATION_SUBMIT verbatim", async () => {
+  const account = await generateAccountKeyPair();
+  const device = await generateDeviceKeyPair();
+  const deviceId = DeviceRegistrationV1.deviceIdFor(device.publicKeyB64);
+  const idCap = new IdentityCapability({ pool: poolStub, eventBus: eventBusStub, identity: makeIdentity({ account, device, deviceId }) });
+  const target = await generateDeviceKeyPair();
+  const mutation = await idCap.buildAccountDeviceMutation({
+    opId: "op-c", expectedRevision: 0, action: "device.revoke",
+    target: { revokedDeviceId: DeviceRegistrationV1.deviceIdFor(target.publicKeyB64) }, nowMs: NOW,
+  });
+
+  const calls = [];
+  const pool = {
+    async sendRequest(req) {
+      calls.push(req);
+      return { body: { revision: 1, devices: [], authorityState: { epoch: 1, revokedCertIds: [], minValidIssuedAtMs: 0 } } };
+    },
+  };
+  const cap = new DevicesCapability({ pool });
+  const res = await cap.submitDeviceMutation({ mutation });
+
+  assert.equal(calls[0].type, T.ACCOUNT_DEVICE_MUTATION_SUBMIT);
+  assert.equal(calls[0].expectedResponseType, T.ACCOUNT_DEVICE_MUTATION_SUBMIT_RES);
+  assert.deepEqual(calls[0].body.mutation, mutation.toJSON(), "mutation carried verbatim");
+  assert.equal(res.revision, 1);
+
+  await assert.rejects(() => cap.submitDeviceMutation({}), /requires mutation/);
+});
+
+test("DevicesCapability.getAuthorityState sends ACCOUNT_AUTHORITY_STATE_GET (with + without an explicit account)", async () => {
+  const calls = [];
+  const pool = {
+    async sendRequest(req) {
+      calls.push(req);
+      return { body: { epoch: 3, revokedCertIds: ["rez:cap:x"], minValidIssuedAtMs: 7 } };
+    },
+  };
+  const cap = new DevicesCapability({ pool });
+
+  const res = await cap.getAuthorityState({ accountIdentityPublicKeyB64: "acct-pub" });
+  assert.equal(calls[0].type, T.ACCOUNT_AUTHORITY_STATE_GET);
+  assert.equal(calls[0].expectedResponseType, T.ACCOUNT_AUTHORITY_STATE_GET_RES);
+  assert.equal(calls[0].body.accountIdentityPublicKeyB64, "acct-pub");
+  assert.equal(res.epoch, 3);
+
+  await cap.getAuthorityState();
+  assert.equal("accountIdentityPublicKeyB64" in calls[1].body, false, "omits the key when not supplied (home defaults to session account)");
+});
+
 test("RezClient exposes a devices capability", () => {
   const client = new RezClient({
     pool: { authState: "idle" },

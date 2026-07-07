@@ -80,4 +80,53 @@ export class DevicesCapability {
     });
     return response && typeof response.body === "object" ? response.body : {};
   }
+
+  /**
+   * Submit a serialized AccountDeviceMutationV1 (S2.5 S11) to the account's
+   * authority home. The home verifies the envelope + the authenticated session's
+   * capability, serializes the add/revoke under a per-account lock, and returns
+   * the folded { revision, devices, authorityState } (or a { stale, currentRevision,
+   * ... } snapshot on an expectedRevision mismatch — the caller re-reads + retries).
+   * No-op against a non-durable node (SERVICE_UNAVAILABLE).
+   *
+   * @param {object} opts
+   * @param {object} opts.mutation — AccountDeviceMutationV1 instance or its toJSON()
+   * @returns {Promise<object>} the serializer result
+   */
+  async submitDeviceMutation({ mutation } = {}) {
+    const body = toBody(mutation);
+    if (!body) {
+      throw new Error("DevicesCapability.submitDeviceMutation requires mutation");
+    }
+    const response = await this.#pool.sendRequest({
+      type: T.ACCOUNT_DEVICE_MUTATION_SUBMIT,
+      body: { mutation: body },
+      expectedResponseType: T.ACCOUNT_DEVICE_MUTATION_SUBMIT_RES,
+    });
+    return response && typeof response.body === "object" ? response.body : {};
+  }
+
+  /**
+   * Fetch the home's current authority state for the authenticated account —
+   * { epoch, revokedCertIds, minValidIssuedAtMs } — so an authorized device can
+   * fold + publish the signed AccountAuthorityStateV1 for off-home peers. The home
+   * serves this for the authenticated account only. No-op against a non-durable
+   * node (SERVICE_UNAVAILABLE).
+   *
+   * @param {object} [opts]
+   * @param {string} [opts.accountIdentityPublicKeyB64] — defaults to the session account
+   * @returns {Promise<{ epoch: number, revokedCertIds: string[], minValidIssuedAtMs: number }>}
+   */
+  async getAuthorityState({ accountIdentityPublicKeyB64 } = {}) {
+    const body = {};
+    if (typeof accountIdentityPublicKeyB64 === "string" && accountIdentityPublicKeyB64.length > 0) {
+      body.accountIdentityPublicKeyB64 = accountIdentityPublicKeyB64;
+    }
+    const response = await this.#pool.sendRequest({
+      type: T.ACCOUNT_AUTHORITY_STATE_GET,
+      body,
+      expectedResponseType: T.ACCOUNT_AUTHORITY_STATE_GET_RES,
+    });
+    return response && typeof response.body === "object" ? response.body : {};
+  }
 }
