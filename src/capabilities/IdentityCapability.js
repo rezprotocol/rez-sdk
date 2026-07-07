@@ -1,5 +1,11 @@
 import { SDK_EVENTS } from "../events/SdkEvents.js";
-import { buildSignedDeviceRegistration, buildSignedDeviceInboxBinding, buildSignedDeviceRevoke } from "../device/deviceIdentity.js";
+import {
+  buildSignedDeviceRegistration,
+  buildSignedDeviceInboxBinding,
+  buildSignedDeviceRevoke,
+  buildSignedAccountDeviceMutation,
+  buildSignedAccountAuthorityState,
+} from "../device/deviceIdentity.js";
 
 /**
  * Identity capability — auth state, session info, and identity accessors.
@@ -131,6 +137,90 @@ export class IdentityCapability {
       revokedDevicePublicKeyB64,
       nowMs,
       ttlMs,
+    });
+  }
+
+  // Resolve the signing keypair for a device-authority action. "account" signs
+  // with the account root B (a primary device); "device" signs with the local
+  // device key C (a delegated / seedless device). Fails loud when the requested
+  // key is absent — never returns a partial signer.
+  #resolveSigner(signWith) {
+    const id = this.#identity;
+    if (signWith === "device") {
+      const dk = this.#deviceKey();
+      if (!dk || typeof dk.publicKeyB64 !== "string" || dk.publicKeyB64.length === 0
+          || typeof dk.privateKeyB64 !== "string" || dk.privateKeyB64.length === 0) {
+        throw new Error("IdentityCapability: identity has no device keypair to sign with (keystore predates device-key persistence)");
+      }
+      return { publicKeyB64: dk.publicKeyB64, privateKeyB64: dk.privateKeyB64 };
+    }
+    if (!id || typeof id.publicKeyB64 !== "string" || typeof id.privateKeyB64 !== "string"
+        || id.publicKeyB64.length === 0 || id.privateKeyB64.length === 0) {
+      throw new Error("IdentityCapability: identity has no account keypair to sign with");
+    }
+    return { publicKeyB64: id.publicKeyB64, privateKeyB64: id.privateKeyB64 };
+  }
+
+  #accountPublicKeyB64() {
+    const id = this.#identity;
+    if (!id || typeof id.publicKeyB64 !== "string" || id.publicKeyB64.length === 0) {
+      throw new Error("IdentityCapability: identity has no account public key");
+    }
+    return id.publicKeyB64;
+  }
+
+  /**
+   * Produce a signed AccountDeviceMutationV1 (S2.5 S11) to submit to the account's
+   * authority home. Dual-mode: `signWith: "account"` (default) signs with the
+   * account root B (a primary device); `signWith: "device"` signs with the local
+   * device key C (a delegated device — the home checks its granted capability).
+   *
+   * @param {object} opts
+   * @param {string} opts.opId — idempotency key
+   * @param {number} opts.expectedRevision — optimistic concurrency (int ≥ 0)
+   * @param {"device.add"|"device.revoke"} opts.action
+   * @param {object} opts.target — action-tagged target
+   * @param {"account"|"device"} [opts.signWith] — signing key (default "account")
+   * @param {number} [opts.nowMs]
+   * @param {number} [opts.ttlMs]
+   * @returns {Promise<import("@rezprotocol/core").AccountDeviceMutationV1>}
+   */
+  async buildAccountDeviceMutation({ opId, expectedRevision, action, target, signWith = "account", nowMs, ttlMs } = {}) {
+    const signer = this.#resolveSigner(signWith);
+    return buildSignedAccountDeviceMutation({
+      signer,
+      accountIdentityPublicKeyB64: this.#accountPublicKeyB64(),
+      opId,
+      expectedRevision,
+      action,
+      target,
+      nowMs,
+      ttlMs,
+    });
+  }
+
+  /**
+   * Produce a signed AccountAuthorityStateV1 (S2.5 S11, F4) — the account's
+   * monotonic revocation snapshot to publish for off-home peers. Same dual-mode
+   * signing as buildAccountDeviceMutation (default: account root B).
+   *
+   * @param {object} opts
+   * @param {number} opts.epoch — the authority epoch (int ≥ 0)
+   * @param {string[]} [opts.revokedCertIds] — rez:cap: ids
+   * @param {number} [opts.minValidIssuedAtMs] — issued-at cutoff
+   * @param {"account"|"device"} [opts.signWith] — signing key (default "account")
+   * @param {number} [opts.nowMs]
+   * @returns {Promise<import("@rezprotocol/core").AccountAuthorityStateV1>}
+   */
+  async buildAccountAuthorityState({ epoch, revokedCertIds, minValidIssuedAtMs, signWith = "account", nowMs } = {}) {
+    const signer = this.#resolveSigner(signWith);
+    return buildSignedAccountAuthorityState({
+      signer,
+      accountIdentityPublicKeyB64: this.#accountPublicKeyB64(),
+      epoch,
+      revokedCertIds,
+      minValidIssuedAtMs,
+      nowMs,
     });
   }
 

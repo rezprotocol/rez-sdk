@@ -9,6 +9,12 @@ import {
   DeviceRevokeV1,
   DEVICE_REVOKE_VERSION,
   DEVICE_REVOKE_PURPOSE,
+  AccountDeviceMutationV1,
+  ACCOUNT_DEVICE_MUTATION_VERSION,
+  ACCOUNT_DEVICE_MUTATION_PURPOSE,
+  AccountAuthorityStateV1,
+  ACCOUNT_AUTHORITY_STATE_VERSION,
+  ACCOUNT_AUTHORITY_STATE_PURPOSE,
   verifyDeviceRegistrationV1,
 } from "@rezprotocol/core";
 import { signPayload } from "../auth/signing.js";
@@ -30,6 +36,9 @@ import { signPayload } from "../auth/signing.js";
  */
 
 const DEFAULT_TTL_MS = 365 * 24 * 60 * 60 * 1000; // 365 days
+// A device-mutation submit is a short-lived, replay-bounded envelope (unlike the
+// long-lived registration/binding certs), so it gets a tight default window.
+const DEFAULT_MUTATION_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
 function requireSubtle() {
   if (!globalThis.crypto || !globalThis.crypto.subtle) {
@@ -177,6 +186,126 @@ export async function buildSignedDeviceRevoke({ account, revokedDevicePublicKeyB
   };
   const sigB64 = await signPayload({ privateKeyB64: account.privateKeyB64, payload: body });
   return new DeviceRevokeV1({ ...body, sig: { alg: "ed25519", sigB64 } });
+}
+
+/**
+ * Build an AccountDeviceMutationV1 (S2.5 S11) and sign it with the SUBMITTING
+ * device's session key — dual-mode: a PRIMARY device signs with the account root
+ * (signer == accountIdentityPublicKeyB64); a DELEGATED device signs with its own
+ * device key C (signer != account). The home proves per-op authority from the
+ * authenticated session (`sessionAuthority.grantedCapabilities`), NOT from a cert
+ * chain in the envelope — so this record carries none. `opId` is the caller's
+ * idempotency key; `expectedRevision` is optimistic concurrency against the home's
+ * current epoch.
+ *
+ * `signPayload` canonicalizes with the same `canonicalJSONStringify` that
+ * `AccountDeviceMutationV1.signableBytes` uses, so the signature verifies against
+ * the bytes the home recomputes — no representation drift.
+ *
+ * @param {object} opts
+ * @param {{ publicKeyB64: string, privateKeyB64: string }} opts.signer — B (primary) or C (delegated)
+ * @param {string} opts.accountIdentityPublicKeyB64 — the account being mutated (B pub)
+ * @param {string} opts.opId — idempotency key (non-empty)
+ * @param {number} opts.expectedRevision — optimistic concurrency (int ≥ 0)
+ * @param {"device.add"|"device.revoke"} opts.action
+ * @param {object} opts.target — action-tagged (see AccountDeviceMutationV1)
+ * @param {number} [opts.nowMs] — issuedAtMs (defaults to Date.now())
+ * @param {number} [opts.ttlMs] — lifetime; expiresAtMs = issuedAtMs + ttlMs
+ * @returns {Promise<AccountDeviceMutationV1>}
+ */
+export async function buildSignedAccountDeviceMutation({ signer, accountIdentityPublicKeyB64, opId, expectedRevision, action, target, nowMs, ttlMs = DEFAULT_MUTATION_TTL_MS } = {}) {
+  if (!signer || typeof signer.publicKeyB64 !== "string" || signer.publicKeyB64.length === 0) {
+    throw new Error("buildSignedAccountDeviceMutation requires signer.publicKeyB64");
+  }
+  if (typeof signer.privateKeyB64 !== "string" || signer.privateKeyB64.length === 0) {
+    throw new Error("buildSignedAccountDeviceMutation requires signer.privateKeyB64");
+  }
+  if (typeof accountIdentityPublicKeyB64 !== "string" || accountIdentityPublicKeyB64.length === 0) {
+    throw new Error("buildSignedAccountDeviceMutation requires accountIdentityPublicKeyB64");
+  }
+  if (typeof opId !== "string" || opId.trim().length === 0) {
+    throw new Error("buildSignedAccountDeviceMutation requires a non-empty opId");
+  }
+  if (!Number.isInteger(expectedRevision) || expectedRevision < 0) {
+    throw new Error("buildSignedAccountDeviceMutation requires a non-negative integer expectedRevision");
+  }
+  if (action !== "device.add" && action !== "device.revoke") {
+    throw new Error('buildSignedAccountDeviceMutation action must be "device.add" or "device.revoke"');
+  }
+  if (!target || typeof target !== "object") {
+    throw new Error("buildSignedAccountDeviceMutation requires a target object");
+  }
+  const issuedAtMs = typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : Date.now();
+  const expiresAtMs = issuedAtMs + ttlMs;
+  const body = {
+    v: ACCOUNT_DEVICE_MUTATION_VERSION,
+    purpose: ACCOUNT_DEVICE_MUTATION_PURPOSE,
+    opId: opId.trim(),
+    accountIdentityPublicKeyB64,
+    expectedRevision,
+    action,
+    target,
+    signerPublicKeyB64: signer.publicKeyB64,
+    issuedAtMs,
+    expiresAtMs,
+  };
+  const sigB64 = await signPayload({ privateKeyB64: signer.privateKeyB64, payload: body });
+  return new AccountDeviceMutationV1({ ...body, sig: { alg: "ed25519", sigB64 } });
+}
+
+/**
+ * Build an AccountAuthorityStateV1 (S2.5 S11, F4) and sign it with an AUTHORIZED
+ * device (or the account root B). It authenticates the account's monotonic
+ * revocation snapshot — `{ epoch, revokedCertIds, minValidIssuedAtMs }` — so
+ * OFF-home peers converge on revocations the durable-record slot alone cannot
+ * prove. `revokedCertIds` is normalized (sort + dedup) BEFORE signing so the
+ * signature matches the record's canonical (order-independent) form.
+ *
+ * The record has no expiry of its own — the DurableRecordV2 wrapper that
+ * publishes it (device-set-publish path) carries the slot's TTL.
+ *
+ * @param {object} opts
+ * @param {{ publicKeyB64: string, privateKeyB64: string }} opts.signer — B or an authorized device
+ * @param {string} opts.accountIdentityPublicKeyB64 — the account (B pub)
+ * @param {number} opts.epoch — the authority epoch (int ≥ 0)
+ * @param {string[]} [opts.revokedCertIds] — rez:cap: ids (normalized here)
+ * @param {number} [opts.minValidIssuedAtMs] — issued-at cutoff (default 0)
+ * @param {number} [opts.nowMs] — issuedAtMs (defaults to Date.now())
+ * @returns {Promise<AccountAuthorityStateV1>}
+ */
+export async function buildSignedAccountAuthorityState({ signer, accountIdentityPublicKeyB64, epoch, revokedCertIds = [], minValidIssuedAtMs = 0, nowMs } = {}) {
+  if (!signer || typeof signer.publicKeyB64 !== "string" || signer.publicKeyB64.length === 0) {
+    throw new Error("buildSignedAccountAuthorityState requires signer.publicKeyB64");
+  }
+  if (typeof signer.privateKeyB64 !== "string" || signer.privateKeyB64.length === 0) {
+    throw new Error("buildSignedAccountAuthorityState requires signer.privateKeyB64");
+  }
+  if (typeof accountIdentityPublicKeyB64 !== "string" || accountIdentityPublicKeyB64.length === 0) {
+    throw new Error("buildSignedAccountAuthorityState requires accountIdentityPublicKeyB64");
+  }
+  if (!Number.isInteger(epoch) || epoch < 0) {
+    throw new Error("buildSignedAccountAuthorityState requires a non-negative integer epoch");
+  }
+  if (!Array.isArray(revokedCertIds)) {
+    throw new Error("buildSignedAccountAuthorityState revokedCertIds must be an array");
+  }
+  const cutoff = typeof minValidIssuedAtMs === "number" && Number.isFinite(minValidIssuedAtMs) && minValidIssuedAtMs >= 0 ? minValidIssuedAtMs : 0;
+  const issuedAtMs = typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : Date.now();
+  // Normalize (sort + dedup) to match AccountAuthorityStateV1's canonical form so
+  // the signed bytes equal signableBytes' output.
+  const normalizedCertIds = [...new Set(revokedCertIds)].sort();
+  const body = {
+    v: ACCOUNT_AUTHORITY_STATE_VERSION,
+    purpose: ACCOUNT_AUTHORITY_STATE_PURPOSE,
+    accountIdentityPublicKeyB64,
+    epoch,
+    revokedCertIds: normalizedCertIds,
+    minValidIssuedAtMs: cutoff,
+    issuedAtMs,
+    signerPublicKeyB64: signer.publicKeyB64,
+  };
+  const sigB64 = await signPayload({ privateKeyB64: signer.privateKeyB64, payload: body });
+  return new AccountAuthorityStateV1({ ...body, sig: { alg: "ed25519", sigB64 } });
 }
 
 // WebCrypto (spki) verify adapter for the rez-core verifier. The SDK's account
