@@ -35,19 +35,29 @@ export class DevicesCapability {
 
   /**
    * @param {object} opts
-   * @param {object} opts.deviceRegistration — DeviceRegistrationV1 instance or its toJSON()
+   * @param {object|null} [opts.deviceRegistration] — DeviceRegistrationV1
+   *     instance or its toJSON(). Null on a DELEGATED session (S10): the
+   *     session's cert chain IS the registration (device.register was
+   *     dropped; the node's dual-mode handler reads sessionAuthority), so
+   *     only the device-signed binding rides.
    * @param {object} opts.deviceInboxBinding — DeviceInboxBindingV1 instance or its toJSON()
    * @returns {Promise<{ inboxId: string, deviceId: string }>}
    */
-  async bind({ deviceRegistration, deviceInboxBinding } = {}) {
-    const reg = toBody(deviceRegistration);
+  async bind({ deviceRegistration = null, deviceInboxBinding } = {}) {
+    const reg = deviceRegistration === null ? null : toBody(deviceRegistration);
     const binding = toBody(deviceInboxBinding);
-    if (!reg || !binding) {
-      throw new Error("DevicesCapability.bind requires deviceRegistration and deviceInboxBinding");
+    if (!binding) {
+      throw new Error("DevicesCapability.bind requires deviceInboxBinding");
+    }
+    if (deviceRegistration !== null && !reg) {
+      throw new Error("DevicesCapability.bind deviceRegistration must be a record object or null (delegated session)");
     }
     const response = await this.#pool.sendRequest({
       type: T.DEVICE_BIND,
-      body: { deviceRegistration: reg, deviceInboxBinding: binding },
+      body: {
+        ...(reg ? { deviceRegistration: reg } : {}),
+        deviceInboxBinding: binding,
+      },
       expectedResponseType: T.DEVICE_BIND_RES,
     });
     return response && typeof response.body === "object" ? response.body : {};

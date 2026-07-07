@@ -23,6 +23,7 @@
     "./filetransfer": "./src/filetransfer/index.js",
     "./profile": "./src/profile/index.js",
     "./peer-link": "./src/peer-link/index.js",
+    "./device-link": "./src/device-link/index.js",
     "./crypto/bip39": "./src/crypto/bip39.js",
     "./crypto/seedDerivation": "./src/crypto/seedDerivation.js"
   },

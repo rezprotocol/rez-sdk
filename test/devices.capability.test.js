@@ -100,7 +100,15 @@ test("DevicesCapability.bind sends DEVICE_BIND with both records verbatim and re
   assert.deepEqual(calls[0].body.deviceInboxBinding, binding.toJSON(), "binding carried verbatim");
   assert.deepEqual(res, { inboxId: INBOX, deviceId });
 
-  await assert.rejects(() => cap.bind({ deviceRegistration: reg }), /requires deviceRegistration and deviceInboxBinding/);
+  await assert.rejects(() => cap.bind({ deviceRegistration: reg }), /requires deviceInboxBinding/);
+
+  // S10: a DELEGATED session binds WITHOUT a registration — the session cert
+  // chain IS the registration. The body must OMIT the key, not send null.
+  const delegated = await cap.bind({ deviceInboxBinding: binding });
+  assert.equal(calls.length, 2);
+  assert.equal("deviceRegistration" in calls[1].body, false, "no registration key on a delegated bind");
+  assert.deepEqual(calls[1].body.deviceInboxBinding, binding.toJSON());
+  assert.deepEqual(delegated, { inboxId: INBOX, deviceId });
 });
 
 test("DevicesCapability.revoke sends DEVICE_REVOKE with the revoke record and returns the body", async () => {
