@@ -63,6 +63,11 @@ const DEVICE_SET_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 // E7 sender-side cap: refuse to ingest a peer device set larger than this so a
 // bloated recipient list can't force N encryptions + N deposits per message.
 const DEVICE_SET_MAX_DEVICES = 8;
+// S2.5 S12: a device that publishes ONE bundle to its account home (multi-device
+// fan-out) retains the matching responder preKeyState under this account-global
+// sentinel "peer" (not per-peer), so ANY peer that establishes against the
+// home-served bundle can be completed. Not a real accountId — cannot collide.
+const ACCOUNT_DEVICE_BUNDLE_PEER_SENTINEL = "@self-device-bundle";
 // The capability a DELEGATED inviter's cert chain must grant (S2.5 S8 L6).
 // Fixed for the invite record kind — never caller-chosen (confused-deputy
 // guard). This module is both the sole producer and the sole enforcing
@@ -628,6 +633,21 @@ export class PeerLinkService {
     // This device's prekey bundle, signed by the device key C. The responder
     // preKeyState is retained by the caller (keyed by peer) so a peer that runs
     // X3DH against this bundle and replies can be completed.
+    const { prekeyBundleRecord, preKeyState } = await this.#buildOwnDeviceBundle(owner, accountPublicKeyB64, inboxId, nowMs);
+
+    return { deviceSetRecord, prekeyBundleRecord, preKeyState };
+  }
+
+  // Build THIS device's signed DevicePrekeyBundleV1 + its responder preKeyState.
+  // Shared by the single-device set material (above) and the account-global bundle
+  // publish (S2.5 S12 buildAndRetainAccountDeviceBundle) — one SSOT for the bundle
+  // shape so both paths sign identical bytes.
+  async #buildOwnDeviceBundle(owner, accountPublicKeyB64, inboxId, nowMs) {
+    const deviceId = nonEmpty(this.deviceId);
+    const devicePublicKeyB64 = nonEmpty(this.devicePublicKeyB64);
+    if (!deviceId || !devicePublicKeyB64) {
+      throw new Error("PeerLinkService requires a device key to build a device bundle");
+    }
     const { bundleJson, preKeyState } = await this.buildDevicePreKeyBundle({ ownerAccountId: owner });
     const bundleBody = {
       v: DEVICE_PREKEY_BUNDLE_VERSION,
@@ -639,15 +659,87 @@ export class PeerLinkService {
       prekeyVersion: 1,
       bundleJson,
       issuedAtMs: nowMs,
-      expiresAtMs,
+      expiresAtMs: nowMs + DEVICE_SET_TTL_MS,
     };
     const bundleSig = await this.cryptoProvider.sign({
       privateKey: this.#deviceSigningKeyPair.privateKey,
       msg: DevicePrekeyBundleV1.signableBytes(bundleBody),
     });
     const prekeyBundleRecord = new DevicePrekeyBundleV1({ ...bundleBody, sig: { alg: "ed25519", sigB64: bytesToBase64(bundleSig) } });
+    return { prekeyBundleRecord, preKeyState };
+  }
 
-    return { deviceSetRecord, prekeyBundleRecord, preKeyState };
+  // Build a MULTI-device DeviceSetRecordV1 from the account's home-aggregated
+  // device set (S2.5 S12): every active device's self-signed DevicePrekeyBundleV1
+  // supplies its {deviceId, devicePublicKeyB64, inboxId}, and all bundles ride in
+  // the sealed record so the peer can X3DH to each device. The account authority
+  // (B direct / C cert-mode) signs the set; the bundles stay device-signed. This
+  // device's OWN responder preKeyState was retained account-globally at
+  // buildAndRetainAccountDeviceBundle time, so nothing per-peer is retained here.
+  async #buildAggregatedDeviceSetMaterial(accountPublicKeyB64, setSign, nowMs, revision, accountDeviceSet) {
+    const devices = [];
+    const prekeyBundleRecords = [];
+    for (const entry of accountDeviceSet) {
+      const bundleJson = entry && typeof entry === "object" && entry.bundle ? entry.bundle : entry;
+      let bundle;
+      try {
+        bundle = new DevicePrekeyBundleV1(bundleJson);
+      } catch (err) {
+        throw new Error("device-set aggregate: an account device bundle is invalid: " + (err && err.message ? err.message : "unknown"));
+      }
+      if (bundle.accountIdentityPublicKeyB64 !== accountPublicKeyB64) {
+        throw new Error("device-set aggregate: a bundle does not belong to the publishing account");
+      }
+      devices.push({ deviceId: bundle.deviceId, devicePublicKeyB64: bundle.devicePublicKeyB64, inboxId: bundle.inboxId });
+      prekeyBundleRecords.push(bundle);
+    }
+    if (devices.length === 0) {
+      throw new Error("device-set aggregate: the account device set is empty");
+    }
+    // Deterministic order (both arrays) so the signed set + sealed bundles are
+    // insertion-order-independent.
+    devices.sort((a, b) => String(a.deviceId).localeCompare(String(b.deviceId)));
+    prekeyBundleRecords.sort((a, b) => String(a.deviceId).localeCompare(String(b.deviceId)));
+
+    const setBody = {
+      v: DEVICE_SET_VERSION,
+      purpose: DEVICE_SET_PURPOSE,
+      accountIdentityPublicKeyB64: accountPublicKeyB64,
+      revision,
+      devices,
+      issuedAtMs: nowMs,
+      expiresAtMs: nowMs + DEVICE_SET_TTL_MS,
+    };
+    const setSig = await setSign(DeviceSetRecordV1.signableBytes(setBody));
+    const deviceSetRecord = new DeviceSetRecordV1({ ...setBody, sig: { alg: "ed25519", sigB64: bytesToBase64(setSig) } });
+    return { deviceSetRecord, prekeyBundleRecords };
+  }
+
+  /**
+   * Build THIS device's DevicePrekeyBundleV1 and retain its responder preKeyState
+   * ACCOUNT-GLOBALLY (S2.5 S12) so the device can publish ONE bundle to its account
+   * home for siblings to aggregate, and still complete a responder handshake for
+   * ANY peer that establishes against that home-served bundle. Returns the signed
+   * bundle record (the caller publishes it via devices.publishDeviceBundle).
+   *
+   * @returns {Promise<DevicePrekeyBundleV1>}
+   */
+  async buildAndRetainAccountDeviceBundle({ ownerAccountId = this.ownerAccountId, nowMs } = {}) {
+    this.#requireDeviceSessions();
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const at = asPositiveInt(nowMs, this.clock());
+    const inboxId = nonEmpty(this.inviteBinding && this.inviteBinding.mailboxId);
+    if (!inboxId) {
+      throw new Error("buildAndRetainAccountDeviceBundle requires inviteBinding.mailboxId (this device's inbox)");
+    }
+    const { accountBinding } = await this._requireBoundX3dhIdentity(owner);
+    const accountPublicKeyB64 = nonEmpty(accountBinding && accountBinding.accountIdentityPublicKeyB64);
+    if (!accountPublicKeyB64) {
+      throw new Error("buildAndRetainAccountDeviceBundle requires a bound account identity");
+    }
+    const { prekeyBundleRecord, preKeyState } = await this.#buildOwnDeviceBundle(owner, accountPublicKeyB64, inboxId, at);
+    await this.peerLinkStorage.keys.putDevicePreKey(owner, ACCOUNT_DEVICE_BUNDLE_PEER_SENTINEL, preKeyState);
+    return prekeyBundleRecord;
   }
 
   /**
@@ -660,7 +752,7 @@ export class PeerLinkService {
    * preKeyState is retained keyed by the peer so that, when the peer establishes
    * to us against this bundle, completeDeviceSetResponder can finish the handshake.
    */
-  async buildDeviceSetRecordForPeer({ ownerAccountId = this.ownerAccountId, peerAccountId, nowMs, revision = 1 } = {}) {
+  async buildDeviceSetRecordForPeer({ ownerAccountId = this.ownerAccountId, peerAccountId, nowMs, revision = 1, accountDeviceSet = null } = {}) {
     this.#requireDeviceSessions();
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const peer = requireId(peerAccountId, "peerAccountId");
@@ -679,11 +771,25 @@ export class PeerLinkService {
     const setSign = delegated ? signerInfo.setSign : signerInfo.accountSign;
     const { identityDhKeyPair } = await this._requireBoundX3dhIdentity(owner);
 
-    const { deviceSetRecord, prekeyBundleRecord, preKeyState } = await this.#buildLocalDeviceSetMaterial(owner, accountPublicKeyB64, setSign, at, revision);
-
-    // Retain the responder state for this peer BEFORE handing out the sealed
-    // bundle, so we can never publish a bundle we cannot later answer.
-    await this.peerLinkStorage.keys.putDevicePreKey(owner, peer, preKeyState);
+    // MULTI-device (S2.5 S12): when the caller supplies the account's
+    // home-aggregated device set, seal ALL devices' bundles; each device retained
+    // its OWN responder preKeyState account-globally at publish time, so nothing
+    // per-peer is retained here. SINGLE-device fallback (accountDeviceSet absent)
+    // is the byte-identical pre-S12 path: build this device's fresh bundle + retain
+    // its preKeyState for this peer.
+    const useAggregate = Array.isArray(accountDeviceSet) && accountDeviceSet.length > 0;
+    let deviceSetRecord;
+    let prekeyBundleRecords;
+    if (useAggregate) {
+      ({ deviceSetRecord, prekeyBundleRecords } = await this.#buildAggregatedDeviceSetMaterial(accountPublicKeyB64, setSign, at, revision, accountDeviceSet));
+    } else {
+      const material = await this.#buildLocalDeviceSetMaterial(owner, accountPublicKeyB64, setSign, at, revision);
+      deviceSetRecord = material.deviceSetRecord;
+      prekeyBundleRecords = [material.prekeyBundleRecord];
+      // Retain the responder state for this peer BEFORE handing out the sealed
+      // bundle, so we can never publish a bundle we cannot later answer.
+      await this.peerLinkStorage.keys.putDevicePreKey(owner, peer, material.preKeyState);
+    }
 
     const { record, slotRecordId } = await buildSealedDeviceSetRecord({
       cryptoProvider: this.cryptoProvider,
@@ -698,7 +804,7 @@ export class PeerLinkService {
       myIdentityDhPrivateKeyB64: bytesToBase64(identityDhKeyPair.privateKey),
       peerIdentityDhPublicKeyB64,
       deviceSetRecord,
-      prekeyBundleRecords: [prekeyBundleRecord],
+      prekeyBundleRecords,
       nowMs: at,
       ttlMs: DEVICE_SET_TTL_MS,
     });
@@ -992,7 +1098,15 @@ export class PeerLinkService {
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const peer = requireId(peerAccountId, "peerAccountId");
     const { peerLinkId } = await this._requirePeerDeviceSetContext(owner, peer);
-    const preKeyState = await this.peerLinkStorage.keys.getDevicePreKey(owner, peer);
+    // Per-peer preKeyState is the single-device path (a bundle built + retained for
+    // THIS peer). S2.5 S12 multi-device: this device published ONE bundle to its
+    // home with an ACCOUNT-GLOBAL preKeyState — fall back to that when no per-peer
+    // state exists, so a peer that established against the home-served bundle can
+    // be completed.
+    let preKeyState = await this.peerLinkStorage.keys.getDevicePreKey(owner, peer);
+    if (!preKeyState || typeof preKeyState !== "object") {
+      preKeyState = await this.peerLinkStorage.keys.getDevicePreKey(owner, ACCOUNT_DEVICE_BUNDLE_PEER_SENTINEL);
+    }
     if (!preKeyState || typeof preKeyState !== "object") {
       const err = new Error("no retained device pre-key state for peer " + peer);
       err.code = "PEER_LINK_DEVICE_PREKEY_MISSING";
