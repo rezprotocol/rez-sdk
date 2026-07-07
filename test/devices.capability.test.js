@@ -232,6 +232,38 @@ test("DevicesCapability.getAuthorityState sends ACCOUNT_AUTHORITY_STATE_GET (wit
   assert.equal("accountIdentityPublicKeyB64" in calls[1].body, false, "omits the key when not supplied (home defaults to session account)");
 });
 
+test("DevicesCapability.publishDeviceBundle sends ACCOUNT_DEVICE_BUNDLE_PUBLISH verbatim", async () => {
+  const calls = [];
+  const pool = {
+    async sendRequest(req) { calls.push(req); return { body: { deviceId: "rez:dev:x", prekeyVersion: 3, applied: true } }; },
+  };
+  const cap = new DevicesCapability({ pool });
+  const bundle = { v: 1, deviceId: "rez:dev:x", prekeyVersion: 3 };
+  const res = await cap.publishDeviceBundle({ bundle });
+  assert.equal(calls[0].type, T.ACCOUNT_DEVICE_BUNDLE_PUBLISH);
+  assert.equal(calls[0].expectedResponseType, T.ACCOUNT_DEVICE_BUNDLE_PUBLISH_RES);
+  assert.deepEqual(calls[0].body.bundle, bundle);
+  assert.equal(res.applied, true);
+  await assert.rejects(() => cap.publishDeviceBundle({}), /requires bundle/);
+});
+
+test("DevicesCapability.getAccountDeviceSet sends ACCOUNT_DEVICE_SET_GET and returns the devices array", async () => {
+  const calls = [];
+  const pool = {
+    async sendRequest(req) { calls.push(req); return { body: { devices: [{ deviceId: "rez:dev:a", prekeyVersion: 1, bundle: { deviceId: "rez:dev:a" } }] } }; },
+  };
+  const cap = new DevicesCapability({ pool });
+  const res = await cap.getAccountDeviceSet({ accountIdentityPublicKeyB64: "acct-pub" });
+  assert.equal(calls[0].type, T.ACCOUNT_DEVICE_SET_GET);
+  assert.equal(calls[0].expectedResponseType, T.ACCOUNT_DEVICE_SET_GET_RES);
+  assert.equal(calls[0].body.accountIdentityPublicKeyB64, "acct-pub");
+  assert.equal(res.devices.length, 1);
+  assert.equal(res.devices[0].deviceId, "rez:dev:a");
+
+  await cap.getAccountDeviceSet();
+  assert.equal("accountIdentityPublicKeyB64" in calls[1].body, false, "omits the key when not supplied");
+});
+
 test("RezClient exposes a devices capability", () => {
   const client = new RezClient({
     pool: { authState: "idle" },

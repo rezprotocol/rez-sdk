@@ -129,4 +129,50 @@ export class DevicesCapability {
     });
     return response && typeof response.body === "object" ? response.body : {};
   }
+
+  /**
+   * Self-publish this device's DevicePrekeyBundleV1 (self-contained, device-signed)
+   * to the account HOME (S2.5 S12) so sibling devices can aggregate the account's
+   * full device set. No-op against a non-durable node (SERVICE_UNAVAILABLE).
+   *
+   * @param {object} opts
+   * @param {object} opts.bundle — DevicePrekeyBundleV1 instance or its toJSON()
+   * @returns {Promise<{ deviceId: string, prekeyVersion: number, applied: boolean }>}
+   */
+  async publishDeviceBundle({ bundle } = {}) {
+    const body = toBody(bundle);
+    if (!body) {
+      throw new Error("DevicesCapability.publishDeviceBundle requires bundle");
+    }
+    const response = await this.#pool.sendRequest({
+      type: T.ACCOUNT_DEVICE_BUNDLE_PUBLISH,
+      body: { bundle: body },
+      expectedResponseType: T.ACCOUNT_DEVICE_BUNDLE_PUBLISH_RES,
+    });
+    return response && typeof response.body === "object" ? response.body : {};
+  }
+
+  /**
+   * Fetch the account's full ACTIVE device set from the home (S2.5 S12) — every
+   * active device's self-published DevicePrekeyBundleV1 — so a publishing device
+   * can assemble the multi-device DeviceSetRecordV1 it seals per peer. Served for
+   * the authenticated account only. No-op against a non-durable node.
+   *
+   * @param {object} [opts]
+   * @param {string} [opts.accountIdentityPublicKeyB64] — defaults to the session account
+   * @returns {Promise<{ devices: Array<{ deviceId: string, prekeyVersion: number, bundle: object }> }>}
+   */
+  async getAccountDeviceSet({ accountIdentityPublicKeyB64 } = {}) {
+    const body = {};
+    if (typeof accountIdentityPublicKeyB64 === "string" && accountIdentityPublicKeyB64.length > 0) {
+      body.accountIdentityPublicKeyB64 = accountIdentityPublicKeyB64;
+    }
+    const response = await this.#pool.sendRequest({
+      type: T.ACCOUNT_DEVICE_SET_GET,
+      body,
+      expectedResponseType: T.ACCOUNT_DEVICE_SET_GET_RES,
+    });
+    const b = response && typeof response.body === "object" ? response.body : {};
+    return { devices: Array.isArray(b.devices) ? b.devices : [] };
+  }
 }
