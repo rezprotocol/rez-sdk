@@ -709,7 +709,7 @@ export class PeerLinkService {
    * handshakeData the peer device needs to complete its responder session (the
    * caller delivers it via the per-device fan-out, Slice 5). NO network here.
    */
-  async ingestPeerDeviceSet({ ownerAccountId = this.ownerAccountId, peerAccountId, record, nowMs, maxDevices = DEVICE_SET_MAX_DEVICES, minRevision = 0 } = {}) {
+  async ingestPeerDeviceSet({ ownerAccountId = this.ownerAccountId, peerAccountId, record, nowMs, maxDevices = DEVICE_SET_MAX_DEVICES, minRevision = 0, revocationState = null } = {}) {
     this.#requireDeviceSessions();
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const peer = requireId(peerAccountId, "peerAccountId");
@@ -717,6 +717,9 @@ export class PeerLinkService {
     const { peerLinkId, peerIdentityDhPublicKeyB64, peerAccountPublicKeyB64 } = await this._requirePeerDeviceSetContext(owner, peer);
     const { identityDhKeyPair } = await this._requireBoundX3dhIdentity(owner);
 
+    // `revocationState` (S2.5 S11) is the PEER account's revocation projection
+    // (from its published AccountAuthorityStateV1). Passed through so a set signed
+    // by a revoked device is rejected at verification. Null = pre-S11 path.
     const { deviceSetRecord, prekeyBundleRecords } = await openSealedDeviceSetRecord({
       cryptoProvider: this.cryptoProvider,
       record,
@@ -725,6 +728,7 @@ export class PeerLinkService {
       peerAccountPublicKeyB64,
       nowMs: at,
       maxDevices,
+      revocationState,
     });
 
     // Rollback protection (Audit R2 #2 / R3 #5 / R4 #3): the device-set `revision`

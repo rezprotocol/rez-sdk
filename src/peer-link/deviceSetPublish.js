@@ -179,9 +179,11 @@ export async function buildSealedDeviceSetRecord({
  * The envelope is verified by verifyDurableRecordV2 (sig against the SIGNER,
  * signer authority over the owner via the cert chain, time window); the inner
  * DeviceSetRecordV1 is then verified against that already-proven signer
- * (same-signer binding). `revocationState` is not consulted here yet — the SDK
- * reader gains a revocation source in S9; inject it into verifyDurableRecordV2
- * then.
+ * (same-signer binding). `revocationState` (S2.5 S11) — the peer account's
+ * `{ revokedCertIds, minValidIssuedAtMs }`, learned from its published
+ * AccountAuthorityStateV1 — is fed to verifyDurableRecordV2 so a record signed by
+ * a REVOKED device (or under a revoked ancestor cert) is rejected. Default null =
+ * the pre-S11 primary path, byte-identical.
  *
  * @param {object} args
  * @param {object} args.cryptoProvider
@@ -192,6 +194,7 @@ export async function buildSealedDeviceSetRecord({
  * @param {number} args.nowMs
  * @param {number} [args.maxDevices=8] — E7 sender-side cap; reject oversized sets
  * @param {number} [args.maxFutureSkewMs] — reject sets/bundles issued beyond this lead
+ * @param {object|null} [args.revocationState=null] — peer authority revocation projection
  * @returns {Promise<{ deviceSetRecord: DeviceSetRecordV1, prekeyBundleRecords: DevicePrekeyBundleV1[] }>}
  */
 export async function openSealedDeviceSetRecord({
@@ -203,6 +206,7 @@ export async function openSealedDeviceSetRecord({
   nowMs,
   maxDevices = 8,
   maxFutureSkewMs = DEVICE_SET_MAX_FUTURE_SKEW_MS,
+  revocationState = null,
 } = {}) {
   if (!record || typeof record !== "object") {
     throw new Error("openSealedDeviceSetRecord requires a record");
@@ -231,7 +235,7 @@ export async function openSealedDeviceSetRecord({
   // Verify the durable envelope: signature against the SIGNER key, and the
   // signer's authority over the owner account (direct, or a cert chain granting
   // "deviceSet.publish") — defense-in-depth; the node also verifies on put/get.
-  const outer = await verifyDurableRecordV2({ record, crypto: cryptoProvider, nowMs });
+  const outer = await verifyDurableRecordV2({ record, crypto: cryptoProvider, nowMs, revocationState });
   if (!outer.ok) {
     throw new Error("openSealedDeviceSetRecord: durable record verification failed (" + outer.reason + ")");
   }

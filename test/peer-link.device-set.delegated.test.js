@@ -245,6 +245,33 @@ test("cert-mode: a binding that disagrees with the chain anchor fails loud", asy
   );
 });
 
+test("S11: ingest REJECTS a delegated set whose leaf cert is revoked (revocationState); accepts it otherwise", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice", delegated: true });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_a_b", bLinkId: "pl_b_a" });
+
+  const { record } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
+  const leafCertId = record.certChain[0].certId;
+  assert.ok(typeof leafCertId === "string" && leafCertId.startsWith("rez:cap:"), "the delegated record carries a leaf cert id");
+
+  // The peer learned (from Alice's published authority-state) that this exact leaf
+  // cert is revoked ⇒ the record signed by the now-revoked device must be rejected
+  // at durable-record verification, BEFORE any session establishes.
+  await assert.rejects(
+    () => bob.svc.ingestPeerDeviceSet({
+      peerAccountId: alice.accountId, record,
+      revocationState: { revokedCertIds: [leafCertId], minValidIssuedAtMs: 0 },
+    }),
+    /durable record verification failed/,
+  );
+
+  // Control: the SAME record without a matching revocation ingests normally
+  // (byte-compat — null revocationState is the primary path).
+  const ok = await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record });
+  assert.equal(ok.established.length, 1, "an unrevoked delegated set still establishes");
+});
+
 test("direct regression: the shipped publish shape is unchanged — B signs inner + envelope, no chain", async () => {
   const crypto = new BrowserCryptoProvider();
   const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
