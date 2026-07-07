@@ -272,6 +272,40 @@ test("S11: ingest REJECTS a delegated set whose leaf cert is revoked (revocation
   assert.equal(ok.established.length, 1, "an unrevoked delegated set still establishes");
 });
 
+test("S11: authority-state record round-trips (delegated publisher → peer opens → revocationState)", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice", delegated: true });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_a_b", bLinkId: "pl_b_a" });
+
+  const { record, recordKind, recordId, publisherPublicKeyB64 } = await alice.svc.buildAccountAuthorityStateRecord({
+    epoch: 3, revokedCertIds: ["rez:cap:gone-b", "rez:cap:gone-a"], minValidIssuedAtMs: 111, nowMs: 5,
+  });
+  assert.equal(recordKind, "account-authority-state");
+  assert.equal(recordId, "v1");
+  assert.equal(record.ownerPublicKeyB64, alice.accountPubB64, "owner is the account key B");
+  assert.equal(record.signerPublicKeyB64, alice.deviceKeyPair.publicKeyB64, "delegated: C signs the envelope");
+  assert.equal(publisherPublicKeyB64, alice.accountPubB64);
+
+  const { revocationState, epoch } = await bob.svc.openPeerAuthorityStateRecord({ peerAccountId: alice.accountId, record, nowMs: 6 });
+  assert.equal(epoch, 3);
+  assert.deepEqual(revocationState.revokedCertIds, ["rez:cap:gone-a", "rez:cap:gone-b"], "sorted + deduped");
+  assert.equal(revocationState.minValidIssuedAtMs, 111);
+});
+
+test("S11: authority-state record round-trips in DIRECT mode (B signs inner + envelope)", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_a_b", bLinkId: "pl_b_a" });
+
+  const { record } = await alice.svc.buildAccountAuthorityStateRecord({ epoch: 1, revokedCertIds: [], nowMs: 5 });
+  assert.equal(record.signerPublicKeyB64, alice.accountPubB64, "direct: B signs the envelope");
+  const { revocationState, epoch } = await bob.svc.openPeerAuthorityStateRecord({ peerAccountId: alice.accountId, record, nowMs: 6 });
+  assert.equal(epoch, 1);
+  assert.deepEqual(revocationState, { revokedCertIds: [], minValidIssuedAtMs: 0 });
+});
+
 test("direct regression: the shipped publish shape is unchanged — B signs inner + envelope, no chain", async () => {
   const crypto = new BrowserCryptoProvider();
   const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });

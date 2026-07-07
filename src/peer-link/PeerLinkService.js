@@ -26,10 +26,15 @@ import {
   DEVICE_PREKEY_BUNDLE_VERSION,
   DEVICE_PREKEY_BUNDLE_PURPOSE,
   DEVICE_SET_RECORD_KIND,
+  AccountAuthorityStateV1,
+  ACCOUNT_AUTHORITY_STATE_VERSION,
+  ACCOUNT_AUTHORITY_STATE_PURPOSE,
+  ACCOUNT_AUTHORITY_STATE_RECORD_KIND,
+  verifyDurableRecordV2,
 } from "@rezprotocol/core";
 import { canonicalPayloadBytesV1 } from "./inviteCodeV1.js";
 import { DevicePeerSessions } from "./DevicePeerSessions.js";
-import { buildSealedDeviceSetRecord, openSealedDeviceSetRecord } from "./deviceSetPublish.js";
+import { buildSealedDeviceSetRecord, openSealedDeviceSetRecord, DEVICE_SET_PUBLISH_CAPABILITY } from "./deviceSetPublish.js";
 import { derivePeerScopedKey } from "./peerScopedSeal.js";
 import {
   PEER_LINK_STATE,
@@ -700,6 +705,139 @@ export class PeerLinkService {
     // The owner (B) key occupies the publisher position of the fetch coordinate
     // (V2 slot math is V1-identical) — the RECORD_GET wire param keeps its name.
     return { record, slotRecordId, recordKind: record.recordKind, recordId: record.recordId, publisherPublicKeyB64: record.ownerPublicKeyB64 };
+  }
+
+  /**
+   * PUBLISH the account's authority state (S2.5 S11, F4). Unlike the device set,
+   * this record is NOT peer-scoped or sealed — it is a single, public, signed
+   * DurableRecordV2 (recordKind = account-authority-state, recordId = "v1", owner
+   * = the account B) so ANY off-home peer can fetch + verify it and learn the
+   * account's revoked-cert set / issued-at cutoff. DIRECT (B signs) when
+   * hasAdminRoot, else CERT-MODE (C signs inner + envelope under the chain, owner
+   * stays B — same-signer binding). NO network: the caller drives durableRecords.put.
+   *
+   * @param {object} opts
+   * @param {number} opts.epoch — the authority epoch (int ≥ 0)
+   * @param {string[]} [opts.revokedCertIds]
+   * @param {number} [opts.minValidIssuedAtMs]
+   * @param {number} [opts.nowMs]
+   * @param {number} [opts.ttlMs]
+   * @returns {Promise<{ record: object, recordKind: string, recordId: string, publisherPublicKeyB64: string }>}
+   */
+  async buildAccountAuthorityStateRecord({ ownerAccountId = this.ownerAccountId, epoch, revokedCertIds = [], minValidIssuedAtMs = 0, nowMs, ttlMs = DEVICE_SET_TTL_MS } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    if (!Number.isInteger(epoch) || epoch < 0) {
+      throw new Error("buildAccountAuthorityStateRecord requires a non-negative integer epoch");
+    }
+    if (!Array.isArray(revokedCertIds)) {
+      throw new Error("buildAccountAuthorityStateRecord requires an array revokedCertIds");
+    }
+    const at = asPositiveInt(nowMs, this.clock());
+    const cutoff = Number.isFinite(Number(minValidIssuedAtMs)) && Number(minValidIssuedAtMs) >= 0 ? Number(minValidIssuedAtMs) : 0;
+    const delegated = this.#hasAdminRoot === false;
+    const signerInfo = delegated
+      ? await this._resolveDelegatedAccountIdentitySigner(owner)
+      : await this._resolveAccountIdentitySigner(owner);
+    const accountPublicKeyB64 = signerInfo.accountPublicKeyB64;
+    // The inner record signer: C in cert-mode (same-signer binding), B in direct.
+    const innerSign = delegated ? signerInfo.setSign : signerInfo.accountSign;
+    const envelopeSignerPublicKeyB64 = delegated ? signerInfo.signerPublicKeyB64 : accountPublicKeyB64;
+
+    // Build + sign the inner AccountAuthorityStateV1 (certIds normalized to match
+    // the record's canonical, order-independent signable form).
+    const stateBody = {
+      v: ACCOUNT_AUTHORITY_STATE_VERSION,
+      purpose: ACCOUNT_AUTHORITY_STATE_PURPOSE,
+      accountIdentityPublicKeyB64: accountPublicKeyB64,
+      epoch,
+      revokedCertIds: [...new Set(revokedCertIds)].sort(),
+      minValidIssuedAtMs: cutoff,
+      issuedAtMs: at,
+      signerPublicKeyB64: envelopeSignerPublicKeyB64,
+    };
+    const stateSig = await innerSign(AccountAuthorityStateV1.signableBytes(stateBody));
+    const authorityState = new AccountAuthorityStateV1({ ...stateBody, sig: { alg: "ed25519", sigB64: bytesToBase64(stateSig) } });
+
+    // Wrap it (unsealed — the payload is public) in a DurableRecordV2 owned by B.
+    const payloadB64 = bytesToBase64(new TextEncoder().encode(canonicalJSONStringify(authorityState.toJSON())));
+    const skeleton = buildDurableRecordV2({
+      recordKind: ACCOUNT_AUTHORITY_STATE_RECORD_KIND,
+      recordId: "v1",
+      ownerPublicKeyB64: accountPublicKeyB64,
+      signerPublicKeyB64: envelopeSignerPublicKeyB64,
+      certChain: delegated ? signerInfo.certChain : [],
+      requiredCapability: delegated ? DEVICE_SET_PUBLISH_CAPABILITY : null,
+      payloadB64,
+      issuedAtMs: at,
+      expiresAtMs: at + ttlMs,
+    });
+    const envSig = await innerSign(durableRecordV2SignableBytes(skeleton));
+    const record = { ...skeleton, sigB64: bytesToBase64(envSig) };
+    return { record, recordKind: record.recordKind, recordId: record.recordId, publisherPublicKeyB64: accountPublicKeyB64 };
+  }
+
+  /**
+   * The fetch coordinates for a peer's published authority-state record (owner =
+   * the peer account B pubkey, single "v1" slot).
+   * @returns {Promise<{ recordKind: string, recordId: string, publisherPublicKeyB64: string }>}
+   */
+  async resolvePeerAuthorityStateCoordinates({ ownerAccountId = this.ownerAccountId, peerAccountId } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const peer = requireId(peerAccountId, "peerAccountId");
+    const { peerAccountPublicKeyB64 } = await this._requirePeerDeviceSetContext(owner, peer);
+    return { recordKind: ACCOUNT_AUTHORITY_STATE_RECORD_KIND, recordId: "v1", publisherPublicKeyB64: peerAccountPublicKeyB64 };
+  }
+
+  /**
+   * OPEN + verify a peer's authority-state DurableRecordV2 and project it to the
+   * `revocationState` shape the device-set opener consumes. The peer account B key
+   * is the OWNER + authority root; the inner AccountAuthorityStateV1 must name that
+   * same account and be signed by the envelope signer (same-signer binding). The
+   * record's OWN verification uses no revocationState (it bootstraps the
+   * revocation source — a record cannot revoke itself).
+   *
+   * @returns {Promise<{ authorityState: AccountAuthorityStateV1, revocationState: {revokedCertIds:string[], minValidIssuedAtMs:number}, epoch: number }>}
+   */
+  async openPeerAuthorityStateRecord({ ownerAccountId = this.ownerAccountId, peerAccountId, record, nowMs } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const peer = requireId(peerAccountId, "peerAccountId");
+    if (!record || typeof record !== "object") {
+      throw new Error("openPeerAuthorityStateRecord requires a record");
+    }
+    const at = asPositiveInt(nowMs, this.clock());
+    const { peerAccountPublicKeyB64 } = await this._requirePeerDeviceSetContext(owner, peer);
+    if (String(record.recordKind) !== ACCOUNT_AUTHORITY_STATE_RECORD_KIND) {
+      throw new Error("openPeerAuthorityStateRecord: record is not an authority-state record");
+    }
+    if (String(record.ownerPublicKeyB64) !== peerAccountPublicKeyB64) {
+      throw new Error("openPeerAuthorityStateRecord: owner is not the peer account identity");
+    }
+    const verdict = await verifyDurableRecordV2({ record, crypto: this.cryptoProvider, nowMs: at });
+    if (!verdict.ok) {
+      throw new Error("openPeerAuthorityStateRecord: durable record verification failed (" + verdict.reason + ")");
+    }
+    let stateJson;
+    try {
+      stateJson = JSON.parse(new TextDecoder().decode(base64ToBytes(String(record.payloadB64 || ""))));
+    } catch (err) {
+      throw new Error("openPeerAuthorityStateRecord: payload is not valid JSON");
+    }
+    const authorityState = new AccountAuthorityStateV1(stateJson);
+    if (authorityState.accountIdentityPublicKeyB64 !== peerAccountPublicKeyB64) {
+      throw new Error("openPeerAuthorityStateRecord: authority state is not the peer account's");
+    }
+    if (authorityState.signerPublicKeyB64 !== String(record.signerPublicKeyB64)) {
+      throw new Error("openPeerAuthorityStateRecord: authority state signer disagrees with the envelope signer");
+    }
+    const setOk = await this.cryptoProvider.verify({
+      publicKey: base64ToBytes(authorityState.signerPublicKeyB64),
+      msg: AccountAuthorityStateV1.signableBytes(authorityState.toJSON()),
+      sig: base64ToBytes(authorityState.sig.sigB64),
+    });
+    if (setOk !== true) {
+      throw new Error("openPeerAuthorityStateRecord: authority state signature failed");
+    }
+    return { authorityState, revocationState: authorityState.toRevocationState(), epoch: authorityState.epoch };
   }
 
   /**
