@@ -11,7 +11,9 @@ export {
   encryptKeystore,
   decryptKeystore,
   KEYSTORE_PAYLOAD_VERSION,
+  KEYSTORE_PAYLOAD_VERSION_DELEGATED,
   createKeystoreAccount,
+  createDelegatedKeystoreAccount,
   unlockKeystoreAccount,
 } from "@rezprotocol/core";
 
