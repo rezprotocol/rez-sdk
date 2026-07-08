@@ -12,3 +12,12 @@
 export { PeerLinkService } from "./PeerLinkService.js";
 export { createKeyValueBackedPeerLinkStorage } from "./createKeyValueBackedPeerLinkStorage.js";
 export { canonicalPayloadBytesV1 } from "./inviteCodeV1.js";
+export {
+  deriveAccountStateKey,
+  sealAccountStateEvent,
+  openAccountStateEvent,
+  wrapAccountStateEnvelope,
+  isAccountStateEnvelope,
+  siblingInboxesFromDeviceSet,
+  ACCOUNT_STATE_ENVELOPE_VERSION,
+} from "./accountStateSeal.js";
