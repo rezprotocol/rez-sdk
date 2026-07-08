@@ -1124,6 +1124,63 @@ export class PeerLinkService {
   }
 
   /**
+   * S14: record a peer-link RELATIONSHIP (peer identity + routing) replicated from
+   * a SIBLING device of this account — NO session/ratchet material. This lets this
+   * device resolve the peer's device set (_requirePeerDeviceSetContext) and
+   * establish its OWN per-device sessions; sharing a ratchet across devices is the
+   * rejected S2.5 anti-pattern, so only the metadata is replicated. The peerLinkId
+   * is the SIBLING's, so the derived direct-thread id matches across devices.
+   *
+   * Idempotent + non-destructive: if a peer-link for this pair already exists (e.g.
+   * a real session this device established itself), it is LEFT UNTOUCHED. The record
+   * carries no legacy session (activeSessionId null), so it never becomes a
+   * recovery candidate — decrypt/reply flow through this device's own device
+   * sessions.
+   * @returns {Promise<object>} the peer-link record (existing or newly created)
+   */
+  async upsertPeerRelationship({
+    ownerAccountId = this.ownerAccountId,
+    peerAccountId,
+    peerLinkId,
+    peerInboxId,
+    remoteAccountIdentityPublicKeyB64,
+    remoteIdentityDhPublicKeyB64,
+    nowMs,
+  } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const peer = requireId(peerAccountId, "peerAccountId");
+    const linkId = nonEmpty(peerLinkId);
+    const inbox = nonEmpty(peerInboxId);
+    const remoteAccount = nonEmpty(remoteAccountIdentityPublicKeyB64);
+    const remoteDh = nonEmpty(remoteIdentityDhPublicKeyB64);
+    if (!linkId || !inbox || !remoteAccount || !remoteDh) {
+      throw new Error("upsertPeerRelationship requires peerLinkId, peerInboxId, remoteAccountIdentityPublicKeyB64, remoteIdentityDhPublicKeyB64");
+    }
+    const existing = await this.peerLinkStorage.peerLinks.getByPair(owner, peer);
+    if (existing && typeof existing === "object") {
+      // A real (session-bearing) link this device established already exists —
+      // never clobber it with a session-less relationship record.
+      return existing;
+    }
+    return this.peerLinkStorage.peerLinks.create({
+      peerLinkId: linkId,
+      localAccountId: owner,
+      peerAccountId: peer,
+      remoteIdentityDhPublicKeyB64: remoteDh,
+      remoteAccountIdentityPublicKeyB64: remoteAccount,
+      state: PEER_LINK_STATE.SESSION_ESTABLISHED,
+      activeInviteId: null,
+      activeSessionId: null,
+      peerInboxId: inbox,
+      relationshipReplicated: true,
+      lastStateChangeAtMs: asPositiveInt(nowMs, this.clock()),
+      lastErrorCode: null,
+      lastErrorMessage: null,
+      version: 1,
+    });
+  }
+
+  /**
    * True iff a per-device ratchet session already exists for (this account,
    * peerAccountId, peerDeviceId). Makes first-contact responder establishment
    * idempotent: a re-delivered first message must NOT re-run the handshake, which
