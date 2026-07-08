@@ -65,6 +65,58 @@ export async function deriveAccountStateKey({ cryptoProvider, accountIdentityDhP
 export const sealAccountStateEvent = sealToPeer;
 export const openAccountStateEvent = openFromPeer;
 
+// The OUTER-envelope discriminator for a self account-state deposit. The sibling's
+// inbound protocol service recognizes this shape and opens it with the
+// account-state key (NOT the peer trial-decrypt path). SSOT for both the sender's
+// wrap and the receiver's recognize, so the two never drift.
+export const ACCOUNT_STATE_ENVELOPE_VERSION = 1;
+
+/** Wrap a sealed account-state event into the outer deposit envelope object. */
+export function wrapAccountStateEnvelope({ nonceB64, ciphertextB64 } = {}) {
+  if (typeof nonceB64 !== "string" || !nonceB64 || typeof ciphertextB64 !== "string" || !ciphertextB64) {
+    throw new Error("wrapAccountStateEnvelope requires nonceB64 + ciphertextB64");
+  }
+  return { accountState: ACCOUNT_STATE_ENVELOPE_VERSION, nonceB64, ciphertextB64 };
+}
+
+/** True when a parsed outer envelope is a self account-state deposit. */
+export function isAccountStateEnvelope(bodyObj) {
+  return Boolean(
+    bodyObj
+    && bodyObj.accountState === ACCOUNT_STATE_ENVELOPE_VERSION
+    && typeof bodyObj.nonceB64 === "string" && bodyObj.nonceB64.length > 0
+    && typeof bodyObj.ciphertextB64 === "string" && bodyObj.ciphertextB64.length > 0,
+  );
+}
+
+/**
+ * The SIBLING device inboxes to fan a self account-state event out to, derived
+ * from the home-served account device set, EXCLUDING this device's own inbox +
+ * deviceId (never deposit to self). Each entry's inbox comes from the sibling's
+ * self-published DevicePrekeyBundleV1 (top-level inboxId). Deduped by inbox.
+ *
+ * @returns {Array<{ deviceId: string, inboxId: string }>}
+ */
+export function siblingInboxesFromDeviceSet({ devices, ownInboxId, ownDeviceId } = {}) {
+  const own = typeof ownInboxId === "string" ? ownInboxId.trim() : "";
+  const ownDev = typeof ownDeviceId === "string" ? ownDeviceId.trim() : "";
+  const out = [];
+  const seen = new Set();
+  for (const entry of Array.isArray(devices) ? devices : []) {
+    const bundle = entry && typeof entry === "object" && entry.bundle ? entry.bundle : entry;
+    const inboxId = bundle && typeof bundle.inboxId === "string" ? bundle.inboxId.trim() : "";
+    const deviceId = bundle && typeof bundle.deviceId === "string" && bundle.deviceId.trim()
+      ? bundle.deviceId.trim()
+      : (entry && typeof entry.deviceId === "string" ? entry.deviceId.trim() : "");
+    if (!inboxId || !deviceId) continue;
+    if (inboxId === own || (ownDev && deviceId === ownDev)) continue; // never self
+    if (seen.has(inboxId)) continue;
+    seen.add(inboxId);
+    out.push({ deviceId, inboxId });
+  }
+  return out;
+}
+
 function requireB64(value, label) {
   if (typeof value !== "string" || value.length === 0) {
     throw new Error("account-state seal requires " + label);

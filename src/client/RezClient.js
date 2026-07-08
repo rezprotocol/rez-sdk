@@ -1,5 +1,6 @@
 import { SDK_EVENTS } from "../events/SdkEvents.js";
 import { REZ_CONTRACT_TYPES, buildInboxAddress } from "@rezprotocol/core";
+import { wrapAccountStateEnvelope, siblingInboxesFromDeviceSet } from "../peer-link/accountStateSeal.js";
 import { MetricsCollector } from "../observability/MetricsCollector.js";
 import { MailboxCapability } from "../capabilities/MailboxCapability.js";
 import { DurableRecordsCapability } from "../capabilities/DurableRecordsCapability.js";
@@ -484,6 +485,51 @@ export class RezClient {
         payloadBytes,
         metadata,
         capChain: Array.isArray(capChain) && capChain.length > 0 ? capChain : null,
+      },
+      address: buildInboxAddress({ inboxId: deliver }),
+    };
+  }
+
+  /**
+   * The SIBLING device inboxes of THIS account (S2.5 S14) — the home-served
+   * account device set minus this device's own inbox/deviceId. The self fan-out
+   * targets for an account-state event. @returns {Promise<Array<{deviceId,inboxId}>>}
+   */
+  async listSiblingDeviceInboxes() {
+    const identity = this.getIdentity();
+    const ownInboxId = identity && typeof identity.localInboxId === "string" ? identity.localInboxId : "";
+    const ownDeviceId = this.#peerLinkService && typeof this.#peerLinkService.deviceId === "string"
+      ? this.#peerLinkService.deviceId : "";
+    const { devices } = await this.#devices.getAccountDeviceSet();
+    return siblingInboxesFromDeviceSet({ devices, ownInboxId, ownDeviceId });
+  }
+
+  /**
+   * Build a self account-state deposit (S2.5 S14): seal the event under the
+   * account-state key (openable only by this account's own devices) and address it
+   * to a sibling inbox. Returns the same {object,address} shape sealForPeerDevice
+   * does, so the caller dispatches it via the identical sdk.mesh.dispatch path.
+   * @returns {Promise<{object:object, address:object}>}
+   */
+  async buildAccountStateDeposit({ deliverInboxId, plaintextBodyBytes } = {}) {
+    if (!(plaintextBodyBytes instanceof Uint8Array) || plaintextBodyBytes.length === 0) {
+      throw new Error("buildAccountStateDeposit requires non-empty plaintextBodyBytes");
+    }
+    const deliver = typeof deliverInboxId === "string" ? deliverInboxId.trim() : "";
+    if (!deliver) {
+      throw new Error("buildAccountStateDeposit requires deliverInboxId (a sibling device inbox)");
+    }
+    const peerLinkService = this.#peerLinkService;
+    if (!peerLinkService || typeof peerLinkService.sealAccountStateEvent !== "function") {
+      throw new Error("buildAccountStateDeposit requires a peerLinkService with account-state sealing");
+    }
+    const sealed = await peerLinkService.sealAccountStateEvent({ plaintextBytes: plaintextBodyBytes });
+    const envelope = wrapAccountStateEnvelope({ nonceB64: sealed.nonceB64, ciphertextB64: sealed.ciphertextB64 });
+    return {
+      object: {
+        payloadBytes: new TextEncoder().encode(JSON.stringify(envelope)),
+        metadata: { accountState: 1 },
+        capChain: null,
       },
       address: buildInboxAddress({ inboxId: deliver }),
     };
