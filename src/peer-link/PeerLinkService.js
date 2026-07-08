@@ -36,6 +36,7 @@ import { canonicalPayloadBytesV1 } from "./inviteCodeV1.js";
 import { DevicePeerSessions } from "./DevicePeerSessions.js";
 import { buildSealedDeviceSetRecord, openSealedDeviceSetRecord, DEVICE_SET_PUBLISH_CAPABILITY } from "./deviceSetPublish.js";
 import { derivePeerScopedKey } from "./peerScopedSeal.js";
+import { deriveAccountStateKey, sealAccountStateEvent, openAccountStateEvent } from "./accountStateSeal.js";
 import {
   PEER_LINK_STATE,
   SESSION_STATUS,
@@ -1680,6 +1681,39 @@ export class PeerLinkService {
       identityDhSignature: base64ToBytes(record.identityDhSignatureB64),
       accountBinding: cloneJson(binding),
     };
+  }
+
+  // S14: the account-state AEAD key — self static-static X25519 over the account's
+  // long-term identity-DH keypair (the SAME reconciled key every device of the
+  // account holds, so all siblings derive an identical key). Used to seal/open the
+  // cross-device account-state self-events. Separate from the live ratchet.
+  async _accountStateAeadKey(accountId = this.ownerAccountId) {
+    const owner = requireId(accountId, "accountId");
+    const { identityDhKeyPair } = await this._requireBoundX3dhIdentity(owner);
+    return deriveAccountStateKey({
+      cryptoProvider: this.cryptoProvider,
+      accountIdentityDhPrivateKeyB64: bytesToBase64(identityDhKeyPair.privateKey),
+      accountIdentityDhPublicKeyB64: bytesToBase64(identityDhKeyPair.publicKey),
+    });
+  }
+
+  /**
+   * Seal an account-state self-event's plaintext under the account-state key so
+   * only this account's own devices can open it. Idempotent envelope (nonce
+   * travels with the ciphertext). @returns {Promise<{nonceB64, ciphertextB64}>}
+   */
+  async sealAccountStateEvent({ plaintextBytes, aad = null } = {}) {
+    const aeadKey = await this._accountStateAeadKey();
+    return sealAccountStateEvent({ cryptoProvider: this.cryptoProvider, aeadKey, plaintextBytes, aad });
+  }
+
+  /**
+   * Open an account-state self-event sealed by one of this account's devices.
+   * Throws on auth failure (a peer's deposit will not open). @returns {Promise<Uint8Array>}
+   */
+  async openAccountStateEvent({ nonceB64, ciphertextB64, aad = null } = {}) {
+    const aeadKey = await this._accountStateAeadKey();
+    return openAccountStateEvent({ cryptoProvider: this.cryptoProvider, aeadKey, nonceB64, ciphertextB64, aad });
   }
 
   // Verifies the account↔x3dh-identity subkey binding. DUAL-MODE (S8 L6): the
