@@ -49,6 +49,11 @@ test("upsertPeerRelationship creates a session-LESS peer-link record resolvable 
   assert.equal(rec.peerInboxId, "inbox:carol");
   assert.equal(rec.activeSessionId, null, "no legacy session — this device runs its own device sessions");
   assert.equal(rec.relationshipReplicated, true, "provenance marker");
+  // AF3/F1 coupling: this exact shape (state session_established + no activeSessionId)
+  // is the `sessionlessEstablished` trigger in acceptInvite, so a later explicit
+  // invite accept RE-DRIVES a real handshake instead of short-circuiting as idempotent.
+  assert.equal(rec.state, "session_established");
+  assert.equal(Boolean(rec.activeSessionId), false, "sessionless ⇒ acceptInvite reattempt");
 });
 
 test("upsertPeerRelationship is idempotent + non-destructive: an existing link is left untouched", async () => {

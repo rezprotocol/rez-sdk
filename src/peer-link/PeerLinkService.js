@@ -2651,9 +2651,19 @@ export class PeerLinkService {
     // peerLinkId and overwrites the SAME session row (see existingSessionForCommit
     // below) — history is untouched (messages persist independently of the
     // ratchet). Only `invite_issued` (a not-yet-accepted link) is excluded.
+    // S14 audit AF1/F1: a replicated peer-link RELATIONSHIP record (upsertPeerRelationship)
+    // is stamped state=session_established but holds NO session (activeSessionId null).
+    // Without this, an explicit invite accept for a replicated contact would short-
+    // circuit as idempotent and leave a "connected but no crypto" link. A genuine
+    // session_established record always carries an activeSessionId, so this re-drives
+    // ONLY the session-less anomaly, reusing its peerLinkId so thread ids stay stable.
+    const sessionlessEstablished = Boolean(existing)
+      && existing.state === "session_established"
+      && !existing.activeSessionId;
     const reattempt = Boolean(existing) && (
       existing.state === "rejected"
       || existing.state === "failed"
+      || sessionlessEstablished
       || (forceReestablish === true && existing.state !== "invite_issued")
     );
     if (existing && !reattempt) {
