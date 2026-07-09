@@ -31,6 +31,7 @@ import {
   ACCOUNT_AUTHORITY_STATE_PURPOSE,
   ACCOUNT_AUTHORITY_STATE_RECORD_KIND,
   verifyDurableRecordV2,
+  DeviceRegistrationV1,
 } from "@rezprotocol/core";
 import { canonicalPayloadBytesV1 } from "./inviteCodeV1.js";
 import { DevicePeerSessions } from "./DevicePeerSessions.js";
@@ -1771,6 +1772,52 @@ export class PeerLinkService {
   async openAccountStateEvent({ nonceB64, ciphertextB64, aad = null } = {}) {
     const aeadKey = await this._accountStateAeadKey();
     return openAccountStateEvent({ cryptoProvider: this.cryptoProvider, aeadKey, nonceB64, ciphertextB64, aad });
+  }
+
+  /**
+   * S14 audit AF5/F2: SIGN an account-state event body with THIS device's key. The
+   * account-state AEAD proves an account device authored the event; this signature
+   * proves WHICH device — so a single compromised sibling cannot forge an event
+   * attributed to another (honest) origin device, and thus cannot poison that
+   * origin's idempotency stream or impersonate it.
+   * @returns {Promise<{originDeviceId, originDevicePublicKeyB64, sigB64}>}
+   */
+  async signAccountStateEvent(signableBytes) {
+    if (!this.#deviceSigningKeyPair || !this.devicePublicKeyB64 || !this.deviceId) {
+      throw new Error("signAccountStateEvent requires a device key");
+    }
+    if (!(signableBytes instanceof Uint8Array) || signableBytes.length === 0) {
+      throw new Error("signAccountStateEvent requires non-empty signableBytes");
+    }
+    const sig = await this.cryptoProvider.sign({ privateKey: this.#deviceSigningKeyPair.privateKey, msg: signableBytes });
+    return { originDeviceId: this.deviceId, originDevicePublicKeyB64: this.devicePublicKeyB64, sigB64: bytesToBase64(sig) };
+  }
+
+  /**
+   * Verify a received account-state event's origin-device signature: the claimed
+   * originDeviceId MUST be the self-cert of originDevicePublicKeyB64
+   * (deviceIdFor), and the signature MUST verify over signableBytes. Fail-closed
+   * (returns false, never throws) so a bad signature drops the event.
+   * @returns {Promise<boolean>}
+   */
+  async verifyAccountStateEventSig({ signableBytes, originDeviceId, originDevicePublicKeyB64, sigB64 } = {}) {
+    const pub = typeof originDevicePublicKeyB64 === "string" ? originDevicePublicKeyB64.trim() : "";
+    const id = typeof originDeviceId === "string" ? originDeviceId.trim() : "";
+    const s = typeof sigB64 === "string" ? sigB64.trim() : "";
+    if (!pub || !id || !s || !(signableBytes instanceof Uint8Array) || signableBytes.length === 0) return false;
+    // Self-cert: the deviceId must be the hash of the pubkey that signed.
+    let expectedId;
+    try {
+      expectedId = DeviceRegistrationV1.deviceIdFor(pub);
+    } catch (err) {
+      return false;
+    }
+    if (expectedId !== id) return false;
+    try {
+      return (await this.cryptoProvider.verify({ publicKey: base64ToBytes(pub), msg: signableBytes, sig: base64ToBytes(s) })) === true;
+    } catch (err) {
+      return false;
+    }
   }
 
   // Verifies the account↔x3dh-identity subkey binding. DUAL-MODE (S8 L6): the
