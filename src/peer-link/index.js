@@ -18,6 +18,7 @@ export {
   openAccountStateEvent,
   wrapAccountStateEnvelope,
   isAccountStateEnvelope,
+  accountStateAad,
   siblingInboxesFromDeviceSet,
   ACCOUNT_STATE_ENVELOPE_VERSION,
 } from "./accountStateSeal.js";

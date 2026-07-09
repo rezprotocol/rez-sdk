@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { bytesToBase64 } from "@rezprotocol/core";
 // REAL crypto — self static-static X25519 + AES-256-GCM via WebCrypto.
 import { BrowserCryptoProvider } from "../src/e2ee/BrowserCryptoProvider.js";
-import { deriveAccountStateKey, sealAccountStateEvent, openAccountStateEvent } from "../src/peer-link/accountStateSeal.js";
+import { deriveAccountStateKey, sealAccountStateEvent, openAccountStateEvent, accountStateAad } from "../src/peer-link/accountStateSeal.js";
 import { derivePeerScopedKey } from "../src/peer-link/peerScopedSeal.js";
 
 const enc = (s) => new TextEncoder().encode(s);
@@ -50,6 +50,21 @@ test("a DIFFERENT account (a peer) derives a different key and CANNOT open the s
   await assert.rejects(
     () => openAccountStateEvent({ cryptoProvider: crypto, aeadKey: carolKey, nonceB64: sealed.nonceB64, ciphertextB64: sealed.ciphertextB64 }),
     "carol's account-state key cannot open alice's self-event",
+  );
+});
+
+test("AF6a: AAD binds the ciphertext to its delivery inbox — a relocated deposit fails to open", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const acct = await makeAccountDh(crypto);
+  const aeadKey = await deriveAccountStateKey({ cryptoProvider: crypto, accountIdentityDhPrivateKeyB64: acct.privB64, accountIdentityDhPublicKeyB64: acct.pubB64 });
+  const sealed = await sealAccountStateEvent({ cryptoProvider: crypto, aeadKey, plaintextBytes: enc("contact.upsert"), aad: accountStateAad("inbox:sib1") });
+  // Correct inbox opens.
+  const ok = await openAccountStateEvent({ cryptoProvider: crypto, aeadKey, nonceB64: sealed.nonceB64, ciphertextB64: sealed.ciphertextB64, aad: accountStateAad("inbox:sib1") });
+  assert.equal(dec(ok), "contact.upsert");
+  // Relocated to a DIFFERENT inbox of the same account — AEAD auth fails.
+  await assert.rejects(
+    () => openAccountStateEvent({ cryptoProvider: crypto, aeadKey, nonceB64: sealed.nonceB64, ciphertextB64: sealed.ciphertextB64, aad: accountStateAad("inbox:sib2") }),
+    "same key, wrong target inbox ⇒ cannot open",
   );
 });
 

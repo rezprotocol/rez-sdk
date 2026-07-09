@@ -79,6 +79,15 @@ export function wrapAccountStateEnvelope({ nonceB64, ciphertextB64 } = {}) {
   return { accountState: ACCOUNT_STATE_ENVELOPE_VERSION, nonceB64, ciphertextB64 };
 }
 
+// AAD binding an account-state ciphertext to the DELIVERY INBOX it was sealed for.
+// The sender seals per sibling inbox with this AAD; the receiver opens with the AAD
+// of the inbox the deposit landed in. A malicious node relocating the ciphertext to
+// a DIFFERENT inbox of the account fails AEAD auth (wrong AAD), closing the
+// cross-inbox replay/relocation vector. SSOT so sender + receiver never drift.
+export function accountStateAad(inboxId) {
+  return "rez:account-state:v1:inbox:" + String(inboxId == null ? "" : inboxId);
+}
+
 /** True when a parsed outer envelope is a self account-state deposit. */
 export function isAccountStateEnvelope(bodyObj) {
   return Boolean(

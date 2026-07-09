@@ -1,6 +1,6 @@
 import { SDK_EVENTS } from "../events/SdkEvents.js";
 import { REZ_CONTRACT_TYPES, buildInboxAddress } from "@rezprotocol/core";
-import { wrapAccountStateEnvelope, siblingInboxesFromDeviceSet } from "../peer-link/accountStateSeal.js";
+import { wrapAccountStateEnvelope, siblingInboxesFromDeviceSet, accountStateAad } from "../peer-link/accountStateSeal.js";
 import { MetricsCollector } from "../observability/MetricsCollector.js";
 import { MailboxCapability } from "../capabilities/MailboxCapability.js";
 import { DurableRecordsCapability } from "../capabilities/DurableRecordsCapability.js";
@@ -523,12 +523,14 @@ export class RezClient {
     if (!peerLinkService || typeof peerLinkService.sealAccountStateEvent !== "function") {
       throw new Error("buildAccountStateDeposit requires a peerLinkService with account-state sealing");
     }
-    const sealed = await peerLinkService.sealAccountStateEvent({ plaintextBytes: plaintextBodyBytes });
+    // Bind the ciphertext to its delivery inbox (AAD) so it can't be relocated to
+    // another of the account's inboxes (audit F3, cross-inbox replay).
+    const sealed = await peerLinkService.sealAccountStateEvent({ plaintextBytes: plaintextBodyBytes, aad: accountStateAad(deliver) });
     const envelope = wrapAccountStateEnvelope({ nonceB64: sealed.nonceB64, ciphertextB64: sealed.ciphertextB64 });
     return {
       object: {
         payloadBytes: new TextEncoder().encode(JSON.stringify(envelope)),
-        metadata: { accountState: 1 },
+        metadata: {},
         capChain: null,
       },
       address: buildInboxAddress({ inboxId: deliver }),
