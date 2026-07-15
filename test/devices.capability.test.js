@@ -111,26 +111,6 @@ test("DevicesCapability.bind sends DEVICE_BIND with both records verbatim and re
   assert.deepEqual(delegated, { inboxId: INBOX, deviceId });
 });
 
-test("DevicesCapability.revoke sends DEVICE_REVOKE with the revoke record and returns the body", async () => {
-  const calls = [];
-  const pool = {
-    async sendRequest(req) {
-      calls.push(req);
-      return { body: { inboxId: INBOX, revokedDeviceId: "rez:dev:gone", revoked: true } };
-    },
-  };
-  const cap = new DevicesCapability({ pool });
-  const revokeJson = { v: 1, accountIdentityPublicKeyB64: "acct", revokedDeviceId: "rez:dev:gone" };
-  const res = await cap.revoke({ deviceRevoke: revokeJson });
-
-  assert.equal(calls[0].type, T.DEVICE_REVOKE);
-  assert.equal(calls[0].expectedResponseType, T.DEVICE_REVOKE_RES);
-  assert.deepEqual(calls[0].body.deviceRevoke, revokeJson);
-  assert.equal(res.revoked, true);
-
-  await assert.rejects(() => cap.revoke({}), /requires deviceRevoke/);
-});
-
 // ---- S2.5 S11: account device-mutation authority (build + submit + authority-state) ----
 
 test("IdentityCapability.buildAccountDeviceMutation signs with the ACCOUNT key by default", async () => {

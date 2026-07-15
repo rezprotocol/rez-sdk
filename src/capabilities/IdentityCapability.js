@@ -2,7 +2,6 @@ import { SDK_EVENTS } from "../events/SdkEvents.js";
 import {
   buildSignedDeviceRegistration,
   buildSignedDeviceInboxBinding,
-  buildSignedDeviceRevoke,
   buildSignedAccountDeviceMutation,
   buildSignedAccountAuthorityState,
 } from "../device/deviceIdentity.js";
@@ -106,35 +105,6 @@ export class IdentityCapability {
     return buildSignedDeviceInboxBinding({
       device: { publicKeyB64: dk.publicKeyB64, privateKeyB64: dk.privateKeyB64 },
       inboxId,
-      nowMs,
-      ttlMs,
-    });
-  }
-
-  /**
-   * Produce a DeviceRevokeV1 signed by THIS account's identity key (B-sign) that
-   * fail-closes another device of this account at the home (the proof a
-   * `device.revoke` presents). Closes the builder gap so DevicesCapability.revoke
-   * has a real record to send. Fails loud if the account keypair is absent or the
-   * revoked device key is missing.
-   *
-   * @param {object} opts
-   * @param {string} opts.revokedDevicePublicKeyB64 — the device public key to revoke
-   * @param {number} [opts.nowMs] — issuedAtMs (defaults to Date.now())
-   * @param {number} [opts.ttlMs] — lifetime; expiresAtMs = issuedAtMs + ttlMs
-   * @returns {Promise<import("@rezprotocol/core").DeviceRevokeV1>}
-   */
-  async buildDeviceRevoke({ revokedDevicePublicKeyB64, nowMs, ttlMs } = {}) {
-    const id = this.#identity;
-    if (!id || typeof id.publicKeyB64 !== "string" || typeof id.privateKeyB64 !== "string" || id.publicKeyB64.length === 0 || id.privateKeyB64.length === 0) {
-      throw new Error("IdentityCapability.buildDeviceRevoke: identity has no account keypair to sign with");
-    }
-    if (typeof revokedDevicePublicKeyB64 !== "string" || revokedDevicePublicKeyB64.length === 0) {
-      throw new Error("IdentityCapability.buildDeviceRevoke: revokedDevicePublicKeyB64 is required");
-    }
-    return buildSignedDeviceRevoke({
-      account: { publicKeyB64: id.publicKeyB64, privateKeyB64: id.privateKeyB64 },
-      revokedDevicePublicKeyB64,
       nowMs,
       ttlMs,
     });

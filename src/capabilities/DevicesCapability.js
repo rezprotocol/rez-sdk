@@ -64,24 +64,6 @@ export class DevicesCapability {
   }
 
   /**
-   * @param {object} opts
-   * @param {object} opts.deviceRevoke — DeviceRevokeV1 instance or its toJSON()
-   * @returns {Promise<{ inboxId: string, revokedDeviceId: string, revoked: boolean }>}
-   */
-  async revoke({ deviceRevoke } = {}) {
-    const revoke = toBody(deviceRevoke);
-    if (!revoke) {
-      throw new Error("DevicesCapability.revoke requires deviceRevoke");
-    }
-    const response = await this.#pool.sendRequest({
-      type: T.DEVICE_REVOKE,
-      body: { deviceRevoke: revoke },
-      expectedResponseType: T.DEVICE_REVOKE_RES,
-    });
-    return response && typeof response.body === "object" ? response.body : {};
-  }
-
-  /**
    * Submit a serialized AccountDeviceMutationV1 (S2.5 S11) to the account's
    * authority home. The home verifies the envelope + the authenticated session's
    * capability, serializes the add/revoke under a per-account lock, and returns
