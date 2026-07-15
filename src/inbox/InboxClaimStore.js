@@ -10,6 +10,17 @@ import {
 const STORE_KEY = "sdk:inbox:claims:v1";
 const INBOX_ID_RANDOM_BYTES = 12;
 
+// The canonical inbox-id shape this SDK mints: "inbox:" + lowercase hex. Both
+// #generateInboxId here and the device-link requester produce it. An EXPLICIT inbox
+// (a device-link ceremony's pre-registered inbox) must match, so a linked device claims
+// exactly that inbox and never a malformed/attacker-chosen string.
+function requireCanonicalInboxId(inboxId) {
+  if (typeof inboxId !== "string" || !/^inbox:[0-9a-f]{16,}$/.test(inboxId)) {
+    throw new Error('InboxClaimStore: inboxId must be canonical ("inbox:" + lowercase hex), got: ' + String(inboxId));
+  }
+  return inboxId;
+}
+
 /**
  * Client-side store of inbox claims the SDK has issued.
  *
@@ -79,7 +90,7 @@ export class InboxClaimStore {
    * Does NOT yet send the wire op or persist the claim — call `persist()`
    * after the node confirms acceptance.
    */
-  async createClaim({ clock = () => Date.now(), identity = null } = {}) {
+  async createClaim({ clock = () => Date.now(), identity = null, inboxId = null } = {}) {
     this.#requireHydrated("createClaim");
     let publicKey;
     let privateKey;
@@ -93,7 +104,14 @@ export class InboxClaimStore {
     }
     const claimantPublicKeyB64 = bytesToBase64(publicKey);
     const claimantPrivateKeyB64 = bytesToBase64(privateKey);
-    const inboxId = this.#generateInboxId();
+    // P1#2 L3.5: a device-link ceremony pre-registers a SPECIFIC inbox (the one the new
+    // device device-signed a binding for + the home's device.add recorded), so the linked
+    // device must claim THAT exact inbox, never a freshly-minted one. An explicit inboxId
+    // is validated to the canonical shape both this store and the SDK requester generate
+    // ("inbox:"+32 lowercase hex); the fresh-claim path (no inboxId) is unchanged.
+    inboxId = typeof inboxId === "string" && inboxId.trim().length > 0
+      ? requireCanonicalInboxId(inboxId.trim())
+      : this.#generateInboxId();
     const claimedAtMs = Number(clock());
 
     const signedPayload = canonicalJSONStringify({

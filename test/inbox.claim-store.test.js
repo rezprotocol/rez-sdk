@@ -120,6 +120,24 @@ test("each createClaim produces distinct keypairs and inbox IDs", async () => {
   assert.notEqual(a.claimantPrivateKeyB64, b.claimantPrivateKeyB64);
 });
 
+test("createClaim honors an EXPLICIT canonical inboxId (device-link ceremony inbox) and rejects a noncanonical one", async () => {
+  const { store } = makeStore();
+  await store.hydrate();
+  // A device-link ceremony pre-registers a specific inbox; the linked device must claim
+  // exactly that one (P1#2 L3.5), never a freshly-minted id.
+  const ceremonyInbox = "inbox:" + "a".repeat(24);
+  const claim = await store.createClaim({ inboxId: ceremonyInbox });
+  assert.equal(claim.inboxId, ceremonyInbox, "claims the exact ceremony inbox");
+  // A NON-EMPTY noncanonical explicit inbox is rejected (fail loud, no silent fallback to a
+  // random id). (An absent/empty inboxId is the unchanged fresh-claim path, not an error.)
+  for (const bad of ["notaninbox", "inbox:", "inbox:XYZ", "inbox:" + "a".repeat(4), "inbox:zzzzzzzzzzzzzzzz", "INBOX:" + "a".repeat(24)]) {
+    await assert.rejects(() => store.createClaim({ inboxId: bad }), /canonical/, "rejects " + JSON.stringify(bad));
+  }
+  // An absent inbox still mints a fresh canonical id (unchanged path).
+  const fresh = await store.createClaim({});
+  assert.match(fresh.inboxId, /^inbox:[0-9a-f]{16,}$/);
+});
+
 test("persist + get round-trips through storage", async () => {
   const { store } = makeStore();
   await store.hydrate();

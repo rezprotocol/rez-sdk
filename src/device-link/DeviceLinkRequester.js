@@ -15,7 +15,7 @@ import { generateDeviceKeyPair, buildSignedDeviceInboxBinding } from "../device/
 import { deriveRendezvousKeyPair } from "./rendezvous.js";
 import { DEVICE_LINK_LEAF_CAPABILITIES } from "./capabilities.js";
 
-const INBOX_ID_RANDOM_BYTES = 16;
+const INBOX_ID_RANDOM_BYTES = 12; // match InboxClaimStore's inbox-id length (one canonical shape).
 
 // The new device mints its OWN home inbox id (the same "inbox:"+hex shape the
 // InboxClaimStore uses). It is self-chosen so the device can device-sign an inbox
