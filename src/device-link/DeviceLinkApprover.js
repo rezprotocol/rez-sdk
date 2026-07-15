@@ -52,6 +52,7 @@ export class DeviceLinkApprover {
   #accountSign;
   #accountDhKeyPair;
   #getCachedDeviceSet;
+  #registerDevice;
   #nowMs;
   #sleep;
   #pollIntervalMs;
@@ -73,6 +74,7 @@ export class DeviceLinkApprover {
     accountSignPrivateKey = null,
     accountDhKeyPair,
     getCachedDeviceSet = null,
+    registerDevice = null,
     nowMs = () => Date.now(),
     sleep = defaultSleep,
     pollIntervalMs = 1000,
@@ -109,6 +111,17 @@ export class DeviceLinkApprover {
       privateKeyB64: accountDhKeyPair.privateKeyB64,
     };
     this.#getCachedDeviceSet = typeof getCachedDeviceSet === "function" ? getCachedDeviceSet : null;
+    // P1#2 registration-before-release: a REQUIRED async callback the approver runs — and
+    // that MUST succeed — AFTER minting the leaf cert but BEFORE the response (the leaf) is
+    // released. It submits device.add {deviceInboxBinding, deviceCapability} to the home so
+    // the home binds the leaf's certId before the new device can use it. Required (not
+    // optional) so no construction path can silently release an unregistered, off-home-
+    // unrevocable leaf — the security invariant is intrinsic to the constructor. If it
+    // throws, the ceremony fails and no leaf is released.
+    if (typeof registerDevice !== "function") {
+      throw new Error("DeviceLinkApprover requires registerDevice(...) — registration-before-release (P1#2): the home must bind the leaf's certId before the leaf is released");
+    }
+    this.#registerDevice = registerDevice;
     this.#nowMs = nowMs;
     this.#sleep = sleep;
     this.#pollIntervalMs = pollIntervalMs;
@@ -234,6 +247,26 @@ export class DeviceLinkApprover {
       granteePublicKeyB64: pinned.linkRequest.newDevicePublicKeyB64,
       nowMs: at,
     });
+
+    // P1#2 registration-before-release: register the device at the home (device.add
+    // carrying the new device's OWN inbox binding + this leaf cert) BEFORE building /
+    // publishing the response that releases the leaf. If registration fails the ceremony
+    // fails and the leaf is NEVER released — so a leaf that reaches the new device always
+    // has its certId already bound at the home (and thus is revocable to off-home peers).
+    // Ordered here, not in the caller, so no caller can accidentally release first.
+    try {
+      await this.#registerDevice({
+        newDeviceId: pinned.newDeviceId,
+        deviceInboxBinding: pinned.linkRequest.deviceInboxBinding,
+        deviceCapability: leafCert.toJSON(),
+      });
+    } catch (err) {
+      this.#terminate("failed");
+      const wrapped = new Error("device link registration (device.add) failed before release: " + (err && err.message ? err.message : String(err)));
+      wrapped.code = "DEVICE_LINK_REGISTRATION_FAILED";
+      throw wrapped;
+    }
+
     let cachedDeviceSet = null;
     if (this.#getCachedDeviceSet) {
       cachedDeviceSet = await this.#getCachedDeviceSet();

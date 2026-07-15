@@ -24,9 +24,14 @@ import { BrowserCryptoProvider } from "../src/e2ee/BrowserCryptoProvider.js";
 const CRYPTO = new BrowserCryptoProvider();
 const FAST = { pollIntervalMs: 5, pollMaxIntervalMs: 10, pollBackoff: 1.2 };
 
-async function makePrimary(overlay, { pskTtlMs = 10 * 60_000, getCachedDeviceSet = null } = {}) {
+async function makePrimary(overlay, { pskTtlMs = 10 * 60_000, getCachedDeviceSet = null, registerDevice = null } = {}) {
   const b = await CRYPTO.generateSigningKeyPair();
   const dh = await CRYPTO.dhGenerateKeyPair({ alg: "X25519", fmt: "spki" });
+  // P1#2: registerDevice is now required (registration-before-release). The default
+  // stub records each registration so tests can assert it ran BEFORE the leaf was
+  // released; individual tests inject a throwing one to prove the fail-closed path.
+  const registrations = [];
+  const reg = registerDevice || (async (args) => { registrations.push(args); });
   const approver = new DeviceLinkApprover({
     crypto: CRYPTO,
     records: overlay,
@@ -37,10 +42,11 @@ async function makePrimary(overlay, { pskTtlMs = 10 * 60_000, getCachedDeviceSet
       privateKeyB64: bytesToBase64(dh.privateKey),
     },
     getCachedDeviceSet,
+    registerDevice: reg,
     pskTtlMs,
     ...FAST,
   });
-  return { approver, accountPubB64: bytesToBase64(b.publicKey), accountId: deriveAccountIdFromPublicKey(b.publicKey) };
+  return { approver, registrations, accountPubB64: bytesToBase64(b.publicKey), accountId: deriveAccountIdFromPublicKey(b.publicKey) };
 }
 
 function runRequester(overlay, code, over = {}) {
@@ -138,39 +144,31 @@ test("tampered response: the requester fails AEAD open and never publishes a con
   const overlay = createMemoryRecordOverlay({ crypto: CRYPTO });
   const primary = await makePrimary(overlay, { pskTtlMs: 3_000 });
   const { code } = await primary.approver.start();
-  const { psk } = parseDeviceLinkCodeV1(code);
-  const rendezvous = await deriveRendezvousKeyPair({ crypto: CRYPTO, psk });
+
+  // Corrupt the RESPONSE at PUBLISH time (a malicious serving node handing back a swapped
+  // payload). Deterministic — no timing race: the interceptor stores the corrupted record
+  // RAW (_rawSet bypasses the overlay's honest signature check, exactly as a dishonest node
+  // would), so the requester can only ever read the corrupted response. The payload swap
+  // breaks the record's R-signature, so the requester's client-side re-verify rejects it,
+  // it never confirms, and the approver times out waiting for the confirm.
+  const realPut = overlay.put;
+  overlay.put = async ({ record } = {}) => {
+    if (record && String(record.recordId) === DEVICE_LINK_RECORD_ID_RESPONSE) {
+      const payload = JSON.parse(new TextDecoder().decode(Buffer.from(record.payloadB64, "base64")));
+      payload.ciphertextB64 = payload.ciphertextB64.slice(0, -4) + "AAA=";
+      const corrupted = { ...record, payloadB64: bytesToBase64(new TextEncoder().encode(JSON.stringify(payload))) };
+      overlay._rawSet(
+        overlay._localId({ publisherPublicKeyB64: record.publisherPublicKeyB64, recordKind: record.recordKind, recordId: record.recordId }),
+        corrupted,
+      );
+      return;
+    }
+    return realPut({ record });
+  };
 
   const approverFlow = (async () => {
     await primary.approver.waitForRequest();
-    // Publish the response, then TAMPER the stored ciphertext in the slot
-    // (a malicious serving node — the client-side re-verify only covers the
-    // record signature, so re-sign the tampered record is impossible; flip
-    // ciphertext bytes INSIDE the still-R-signed payload is impossible too —
-    // so emulate a node handing back a record whose payload was swapped and
-    // whose signature check we bypass via _rawSet).
-    const approvePromise = primary.approver.approve().catch((err) => err);
-    // Wait until the response record exists, then corrupt it in place.
-    for (;;) {
-      const rec = await overlay.get({
-        recordKind: DEVICE_LINK_RECORD_KIND,
-        recordId: DEVICE_LINK_RECORD_ID_RESPONSE,
-        publisherPublicKeyB64: rendezvous.publicKeyB64,
-      });
-      if (rec) {
-        const payload = JSON.parse(new TextDecoder().decode(Buffer.from(rec.payloadB64, "base64")));
-        payload.ciphertextB64 = payload.ciphertextB64.slice(0, -4) + "AAA=";
-        const corrupted = { ...rec, payloadB64: bytesToBase64(new TextEncoder().encode(JSON.stringify(payload))) };
-        overlay._rawSet(overlay._localId({
-          publisherPublicKeyB64: rendezvous.publicKeyB64,
-          recordKind: DEVICE_LINK_RECORD_KIND,
-          recordId: DEVICE_LINK_RECORD_ID_RESPONSE,
-        }), corrupted);
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 5));
-    }
-    return approvePromise;
+    return primary.approver.approve().catch((err) => err);
   })();
 
   // The corrupted record fails the R-signature re-verify on the requester
@@ -251,6 +249,7 @@ test("requester rejects a bundle whose chain is narrower than the launch set or 
       publicKeyB64: bytesToBase64(dh.publicKey),
       privateKeyB64: bytesToBase64(dh.privateKey),
     },
+    registerDevice: async () => {}, // P1#2: required; this test hand-builds the response below.
     pskTtlMs: 3_000,
     ...FAST,
   });
@@ -386,4 +385,49 @@ test("approver constructor invariants: exactly one signer form; B-dh required", 
     accountSign: async () => new Uint8Array(1),
     accountDhKeyPair: null,
   }), /requires accountDhKeyPair/);
+  // P1#2: registerDevice is required — no construction path can silently release an
+  // unregistered leaf.
+  assert.throws(() => new DeviceLinkApprover({
+    ...base,
+    accountSign: async () => new Uint8Array(1),
+  }), /registerDevice/);
+});
+
+test("P1#2: registration ran (device.add) carrying the device's binding + the leaf cert; requester returns its inbox", async () => {
+  const overlay = createMemoryRecordOverlay({ crypto: CRYPTO });
+  const primary = await makePrimary(overlay);
+  const { code } = await primary.approver.start();
+  const approverFlow = (async () => {
+    await primary.approver.waitForRequest();
+    return primary.approver.approve();
+  })();
+  const [requester] = await Promise.all([runRequester(overlay, code), approverFlow]);
+
+  assert.equal(primary.registrations.length, 1, "device.add submitted exactly once, before release");
+  const reg = primary.registrations[0];
+  assert.equal(reg.newDeviceId, requester.deviceId);
+  assert.equal(reg.deviceInboxBinding.deviceId, requester.deviceId, "the registered binding is for the new device");
+  assert.equal(reg.deviceInboxBinding.inboxId, requester.inboxId, "the requester returns + registered its self-chosen inbox");
+  assert.equal(reg.deviceCapability.granteeDeviceId, requester.deviceId, "the registered leaf cert grants the new device");
+});
+
+test("P1#2 fail-closed: a failing registerDevice fails the ceremony and NEVER releases the leaf", async () => {
+  const overlay = createMemoryRecordOverlay({ crypto: CRYPTO });
+  const primary = await makePrimary(overlay, {
+    registerDevice: async () => { throw new Error("home unavailable"); },
+  });
+  const { code } = await primary.approver.start();
+  const approverFlow = (async () => {
+    await primary.approver.waitForRequest();
+    return primary.approver.approve().then(() => null).catch((err) => err);
+  })();
+  // The requester must NEVER receive a response record (no leaf released), so it times out.
+  const requesterP = runRequester(overlay, code, { deadlineMs: 400 })
+    .then(() => null)
+    .catch((err) => err);
+  const [approveErr, reqErr] = await Promise.all([approverFlow, requesterP]);
+
+  assert.equal(approveErr && approveErr.code, "DEVICE_LINK_REGISTRATION_FAILED", "approve() failed at registration");
+  assert.ok(reqErr, "the requester got no response");
+  assert.equal(reqErr.code, "DEVICE_LINK_TIMEOUT", "no leaf was ever released to the new device");
 });

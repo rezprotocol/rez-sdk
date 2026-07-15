@@ -11,9 +11,23 @@ import {
   DEVICE_LINK_RECORD_ID_CONFIRM,
   verifyAccountAuthority,
 } from "@rezprotocol/core";
-import { generateDeviceKeyPair } from "../device/deviceIdentity.js";
+import { generateDeviceKeyPair, buildSignedDeviceInboxBinding } from "../device/deviceIdentity.js";
 import { deriveRendezvousKeyPair } from "./rendezvous.js";
 import { DEVICE_LINK_LEAF_CAPABILITIES } from "./capabilities.js";
+
+const INBOX_ID_RANDOM_BYTES = 16;
+
+// The new device mints its OWN home inbox id (the same "inbox:"+hex shape the
+// InboxClaimStore uses). It is self-chosen so the device can device-sign an inbox
+// binding for it in the ceremony request (P1#2 registration-before-release), letting
+// the approver register the device (device.add) at the home BEFORE releasing the leaf
+// cert. The device claims this exact inbox when it later comes online.
+function generateInboxId(crypto) {
+  const bytes = crypto.randomBytes(INBOX_ID_RANDOM_BYTES);
+  let hex = "";
+  for (const b of bytes) hex += b.toString(16).padStart(2, "0");
+  return "inbox:" + hex;
+}
 
 function defaultSleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -67,6 +81,16 @@ export async function runDeviceLinkRequester({
   const startedAtMs = nowMs();
   const deadlineAtMs = startedAtMs + deadlineMs;
 
+  // P1#2: mint this device's home inbox + a device-signed binding for it, carried in
+  // the request so the approver can device.add it before releasing the leaf cert.
+  const inboxId = generateInboxId(crypto);
+  const inboxBinding = await buildSignedDeviceInboxBinding({
+    device: deviceKeys,
+    inboxId,
+    nowMs: startedAtMs,
+    ttlMs: deadlineMs,
+  });
+
   emitStatus(onStatus, "publishing-request");
   const request = await buildCeremonyRequest({
     crypto,
@@ -75,6 +99,7 @@ export async function runDeviceLinkRequester({
     accountSignPublicKeyB64,
     rendezvousPublicKeyB64: rendezvousKeyPair.publicKeyB64,
     deviceKeyPair: deviceKeys,
+    deviceInboxBinding: inboxBinding.toJSON(),
     requestTtlMs: deadlineMs,
   });
   const requestRecord = await sealCeremonyRecord({
@@ -177,6 +202,9 @@ export async function runDeviceLinkRequester({
       cachedDeviceSet: opened.delegationBundle.cachedDeviceSet,
     },
     deviceId: request.linkRequest.newDeviceId,
+    // The self-chosen home inbox this device registered in the ceremony (the approver
+    // ran device.add for it); the device claims exactly this inbox when it comes online.
+    inboxId,
     fingerprint: request.fingerprint,
   };
 }
