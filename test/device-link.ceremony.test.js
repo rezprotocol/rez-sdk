@@ -31,7 +31,12 @@ async function makePrimary(overlay, { pskTtlMs = 10 * 60_000, getCachedDeviceSet
   // stub records each registration so tests can assert it ran BEFORE the leaf was
   // released; individual tests inject a throwing one to prove the fail-closed path.
   const registrations = [];
-  const reg = registerDevice || (async (args) => { registrations.push(args); });
+  const reg = registerDevice || (async (args) => {
+    registrations.push(args);
+    // A faithful home commit echoes the exact device/inbox/certId it bound — the shape
+    // the approver validates before releasing the leaf.
+    return { deviceId: args.newDeviceId, inboxId: args.deviceInboxBinding.inboxId, certId: args.deviceCapability.certId };
+  });
   const approver = new DeviceLinkApprover({
     crypto: CRYPTO,
     records: overlay,
@@ -430,4 +435,26 @@ test("P1#2 fail-closed: a failing registerDevice fails the ceremony and NEVER re
   assert.equal(approveErr && approveErr.code, "DEVICE_LINK_REGISTRATION_FAILED", "approve() failed at registration");
   assert.ok(reqErr, "the requester got no response");
   assert.equal(reqErr.code, "DEVICE_LINK_TIMEOUT", "no leaf was ever released to the new device");
+});
+
+test("P1#2: a registration that does NOT commit this device/inbox/cert is rejected (no-op callback cannot pass)", async () => {
+  // A callback that merely resolves (or resolves with a mismatched commit) must NOT satisfy
+  // registration-before-release: the approver validates the returned commit against THIS
+  // leaf's certId + the request's device + inbox.
+  for (const badReg of [
+    async () => {},                                                   // no-op: returns undefined
+    async (args) => ({ deviceId: args.newDeviceId, inboxId: args.deviceInboxBinding.inboxId, certId: "rez:cap:" + "0".repeat(64) }), // wrong cert
+  ]) {
+    const overlay = createMemoryRecordOverlay({ crypto: CRYPTO });
+    const primary = await makePrimary(overlay, { registerDevice: badReg });
+    const { code } = await primary.approver.start();
+    const approverFlow = (async () => {
+      await primary.approver.waitForRequest();
+      return primary.approver.approve().then(() => null).catch((err) => err);
+    })();
+    const requesterP = runRequester(overlay, code, { deadlineMs: 400 }).then(() => null).catch((err) => err);
+    const [approveErr, reqErr] = await Promise.all([approverFlow, requesterP]);
+    assert.equal(approveErr && approveErr.code, "DEVICE_LINK_REGISTRATION_UNVERIFIED", "unverified commit rejected");
+    assert.equal(reqErr && reqErr.code, "DEVICE_LINK_TIMEOUT", "no leaf released on an unverified registration");
+  }
 });

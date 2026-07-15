@@ -254,8 +254,18 @@ export class DeviceLinkApprover {
     // fails and the leaf is NEVER released — so a leaf that reaches the new device always
     // has its certId already bound at the home (and thus is revocable to off-home peers).
     // Ordered here, not in the caller, so no caller can accidentally release first.
+    //
+    // The callback MUST return the home's COMMITTED registration
+    // ({ deviceId, inboxId, certId }); we then VALIDATE that the home committed THIS exact
+    // device, inbox, and leaf cert. Merely resolving is not enough (a no-op `async () => {}`
+    // must NOT satisfy the invariant): only a commit that binds our minted certId to the
+    // request's device + inbox proves the leaf is registered-and-revocable before release.
+    const bindingInboxId = pinned.linkRequest.deviceInboxBinding && typeof pinned.linkRequest.deviceInboxBinding === "object"
+      ? pinned.linkRequest.deviceInboxBinding.inboxId
+      : null;
+    let commit;
     try {
-      await this.#registerDevice({
+      commit = await this.#registerDevice({
         newDeviceId: pinned.newDeviceId,
         deviceInboxBinding: pinned.linkRequest.deviceInboxBinding,
         deviceCapability: leafCert.toJSON(),
@@ -265,6 +275,17 @@ export class DeviceLinkApprover {
       const wrapped = new Error("device link registration (device.add) failed before release: " + (err && err.message ? err.message : String(err)));
       wrapped.code = "DEVICE_LINK_REGISTRATION_FAILED";
       throw wrapped;
+    }
+    if (!commit || typeof commit !== "object"
+        || commit.certId !== leafCert.certId
+        || commit.deviceId !== pinned.newDeviceId
+        || commit.inboxId !== bindingInboxId) {
+      this.#terminate("failed");
+      const err = new Error(
+        "device link registration returned an unverified commit (must bind this device, inbox, and leaf certId before release)",
+      );
+      err.code = "DEVICE_LINK_REGISTRATION_UNVERIFIED";
+      throw err;
     }
 
     let cachedDeviceSet = null;
