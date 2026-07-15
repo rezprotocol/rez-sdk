@@ -255,11 +255,14 @@ export class DeviceLinkApprover {
     // has its certId already bound at the home (and thus is revocable to off-home peers).
     // Ordered here, not in the caller, so no caller can accidentally release first.
     //
-    // The callback MUST return the home's COMMITTED registration
-    // ({ deviceId, inboxId, certId }); we then VALIDATE that the home committed THIS exact
-    // device, inbox, and leaf cert. Merely resolving is not enough (a no-op `async () => {}`
-    // must NOT satisfy the invariant): only a commit that binds our minted certId to the
-    // request's device + inbox proves the leaf is registered-and-revocable before release.
+    // The callback MUST return its asserted COMMITTED registration ({ deviceId, inboxId,
+    // certId }); we then validate it binds THIS exact device, inbox, and leaf cert. This is a
+    // TRUSTED IN-PROCESS boundary (the production wiring is ServerDeviceLinkService submitting
+    // device.add): the check catches wiring/consistency bugs — a no-op `async () => {}` or a
+    // mismatched/stale commit can no longer release a leaf — but it is NOT cryptographic proof
+    // the commit came from the home (a fabricated matching object would pass; provenance would
+    // need a home-signed commit record). The END-TO-END guarantee that the home actually bound
+    // the certId before release is proven by the real-Pg L6 test, not by this equality check.
     const bindingInboxId = pinned.linkRequest.deviceInboxBinding && typeof pinned.linkRequest.deviceInboxBinding === "object"
       ? pinned.linkRequest.deviceInboxBinding.inboxId
       : null;

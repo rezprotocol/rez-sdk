@@ -105,24 +105,34 @@ test("claimInbox does not persist if the pool send rejects", async () => {
 
 test("reattestInbox uses stored claimant key and sends inbox.claim with fresh signature", async () => {
   const { claimStore } = await makeCapability();
-  // First, claim an inbox so we have something to reattest.
-  let nextResponse = (request) => ({ body: { inboxId: request.body.inboxId } });
-  const sentRequests = [];
-  const pool = makeFakePool(async (request) => { sentRequests.push(request); return nextResponse(request); });
-  const inboxes = new InboxesCapability({ pool, claimStore });
-  const first = await inboxes.claimInbox();
-  const firstSig = sentRequests[0].body.signatureB64;
-  const firstPubkey = sentRequests[0].body.claimantPublicKeyB64;
+  // Claim + reattest both timestamp via the store's default Date.now clock. Ed25519 is
+  // DETERMINISTIC, so if both land in the SAME millisecond the claimedAtMs (and thus the
+  // signature) is identical and the "fresh signature" assertion flakes. Pin a strictly
+  // ADVANCING clock for the duration so the two timestamps always differ (restored after).
+  const realNow = Date.now;
+  let tick = 1_700_000_000_000;
+  Date.now = () => (tick += 1);
+  try {
+    let nextResponse = (request) => ({ body: { inboxId: request.body.inboxId } });
+    const sentRequests = [];
+    const pool = makeFakePool(async (request) => { sentRequests.push(request); return nextResponse(request); });
+    const inboxes = new InboxesCapability({ pool, claimStore });
+    const first = await inboxes.claimInbox();
+    const firstSig = sentRequests[0].body.signatureB64;
+    const firstPubkey = sentRequests[0].body.claimantPublicKeyB64;
 
-  // Now re-attest. Signature must be different (different timestamp) but
-  // pubkey must match.
-  const result = await inboxes.reattestInbox(first.inboxId);
+    // Now re-attest. Signature must be different (advancing timestamp) but pubkey must match.
+    const result = await inboxes.reattestInbox(first.inboxId);
 
-  assert.equal(sentRequests.length, 2);
-  assert.equal(sentRequests[1].body.inboxId, first.inboxId);
-  assert.equal(sentRequests[1].body.claimantPublicKeyB64, firstPubkey);
-  assert.notEqual(sentRequests[1].body.signatureB64, firstSig);
-  assert.equal(result.inboxId, first.inboxId);
+    assert.equal(sentRequests.length, 2);
+    assert.equal(sentRequests[1].body.inboxId, first.inboxId);
+    assert.equal(sentRequests[1].body.claimantPublicKeyB64, firstPubkey);
+    assert.ok(sentRequests[1].body.claimedAtMs > sentRequests[0].body.claimedAtMs, "reattest timestamp advances");
+    assert.notEqual(sentRequests[1].body.signatureB64, firstSig);
+    assert.equal(result.inboxId, first.inboxId);
+  } finally {
+    Date.now = realNow;
+  }
 });
 
 test("reattestInbox throws if the inbox isn't in the claim store", async () => {
