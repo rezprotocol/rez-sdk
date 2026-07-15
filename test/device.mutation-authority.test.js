@@ -6,6 +6,8 @@ import {
   DeviceInboxBindingV1,
   DEVICE_INBOX_BINDING_PURPOSE,
   AccountDeviceMutationV1,
+  AccountDeviceCapabilityV1,
+  ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
   AccountAuthorityStateV1,
 } from "@rezprotocol/core";
 import {
@@ -41,18 +43,40 @@ async function signedDeviceBinding({ device, inboxId, nowMs }) {
   return new DeviceInboxBindingV1({ ...body, sig: { alg: "ed25519", sigB64: bytesToBase64(sig) } });
 }
 
+// The account→device leaf capability cert (C←B) the device.add target carries so the
+// home can store its certId (audit R4 completeness). Account-signed (B-sign).
+async function signedLeafCert({ account, device, nowMs }) {
+  const fields = {
+    v: 1, purpose: ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
+    accountIdentityPublicKeyB64: account.publicKeyB64,
+    parentCertId: null,
+    granteeDevicePublicKeyB64: device.publicKeyB64,
+    granteeDeviceId: DeviceRegistrationV1.deviceIdFor(device.publicKeyB64),
+    capabilities: ["deviceSet.publish"],
+    maxDelegationDepth: 0,
+    issuedAtMs: nowMs, expiresAtMs: nowMs + 3_600_000,
+    signerPublicKeyB64: account.publicKeyB64,
+  };
+  const certId = AccountDeviceCapabilityV1.deriveCertId(fields);
+  const subtle = globalThis.crypto.subtle;
+  const key = await subtle.importKey("pkcs8", Buffer.from(account.privateKeyB64, "base64"), "Ed25519", false, ["sign"]);
+  const sig = new Uint8Array(await subtle.sign("Ed25519", key, AccountDeviceCapabilityV1.signableBytes({ ...fields, certId })));
+  return new AccountDeviceCapabilityV1({ ...fields, certId, sig: { alg: "ed25519", sigB64: bytesToBase64(sig) } });
+}
+
 const NOW = 1_700_000_000_000;
 
 test("PRIMARY device.add mutation: account-signed, signer == account, verifies over signableBytes", async () => {
   const account = await generateAccountKeyPair();
   const sibling = await generateDeviceKeyPair();
   const binding = await signedDeviceBinding({ device: sibling, inboxId: "inbox:new-device", nowMs: NOW });
+  const cert = await signedLeafCert({ account, device: sibling, nowMs: NOW });
 
   const mutation = await buildSignedAccountDeviceMutation({
     signer: account,
     accountIdentityPublicKeyB64: account.publicKeyB64,
     opId: "op-1", expectedRevision: 0, action: "device.add",
-    target: { deviceInboxBinding: binding.toJSON() },
+    target: { deviceInboxBinding: binding.toJSON(), deviceCapability: cert.toJSON() },
     nowMs: NOW,
   });
 
