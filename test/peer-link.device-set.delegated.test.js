@@ -278,8 +278,10 @@ test("S11: authority-state record round-trips (delegated publisher → peer open
   const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
   await crossLink(alice, bob, { aLinkId: "pl_a_b", bLinkId: "pl_b_a" });
 
+  const goneA = "rez:cap:" + "a".repeat(64);
+  const goneB = "rez:cap:" + "b".repeat(64);
   const { record, recordKind, recordId, publisherPublicKeyB64 } = await alice.svc.buildAccountAuthorityStateRecord({
-    epoch: 3, revokedCertIds: ["rez:cap:gone-b", "rez:cap:gone-a"], minValidIssuedAtMs: 111, nowMs: 5,
+    epoch: 3, revokedCertIds: [goneB, goneA], minValidIssuedAtMs: 111, nowMs: 5,
   });
   assert.equal(recordKind, "account-authority-state");
   assert.equal(recordId, "v1");
@@ -289,7 +291,7 @@ test("S11: authority-state record round-trips (delegated publisher → peer open
 
   const { revocationState, epoch } = await bob.svc.openPeerAuthorityStateRecord({ peerAccountId: alice.accountId, record, nowMs: 6 });
   assert.equal(epoch, 3);
-  assert.deepEqual(revocationState.revokedCertIds, ["rez:cap:gone-a", "rez:cap:gone-b"], "sorted + deduped");
+  assert.deepEqual(revocationState.revokedCertIds, [goneA, goneB], "sorted + deduped");
   assert.equal(revocationState.minValidIssuedAtMs, 111);
 });
 

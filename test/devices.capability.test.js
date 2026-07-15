@@ -177,10 +177,12 @@ test("IdentityCapability.buildAccountDeviceMutation signWith:'device' fails loud
 test("buildAccountAuthorityState signs the epoch snapshot with the account key", async () => {
   const account = await generateAccountKeyPair();
   const cap = new IdentityCapability({ pool: poolStub, eventBus: eventBusStub, identity: makeIdentity({ account, device: null, deviceId: null }) });
-  const state = await cap.buildAccountAuthorityState({ epoch: 4, revokedCertIds: ["rez:cap:b", "rez:cap:a"], nowMs: NOW });
+  const aCap = "rez:cap:" + "a".repeat(64);
+  const bCap = "rez:cap:" + "b".repeat(64);
+  const state = await cap.buildAccountAuthorityState({ epoch: 4, revokedCertIds: [bCap, aCap], nowMs: NOW });
   assert.equal(state.accountIdentityPublicKeyB64, account.publicKeyB64);
   assert.equal(state.signerPublicKeyB64, account.publicKeyB64);
-  assert.deepEqual(state.revokedCertIds, ["rez:cap:a", "rez:cap:b"]);
+  assert.deepEqual(state.revokedCertIds, [aCap, bCap]);
 });
 
 test("DevicesCapability.submitDeviceMutation sends ACCOUNT_DEVICE_MUTATION_SUBMIT verbatim", async () => {

@@ -79,7 +79,7 @@ test("DELEGATED device.revoke mutation: device-signed, signer == device key C (n
     signer: device,
     accountIdentityPublicKeyB64: account.publicKeyB64,
     opId: "op-2", expectedRevision: 3, action: "device.revoke",
-    target: { revokedDeviceId: DeviceRegistrationV1.deviceIdFor(target.publicKeyB64), revokedCertId: "rez:cap:leaf-x" },
+    target: { revokedDeviceId: DeviceRegistrationV1.deviceIdFor(target.publicKeyB64), revokedCertId: "rez:cap:" + "a".repeat(64) },
     nowMs: NOW,
   });
 
@@ -116,20 +116,24 @@ test("mutation builder fails loud on a bad action / missing opId / negative revi
 
 test("authority-state: revokedCertIds are sorted + deduped before signing (canonical, verifies)", async () => {
   const account = await generateAccountKeyPair();
+  // Canonical rez:cap:<64-hex> ids (finding 2) that still sort a < b < c.
+  const A = "rez:cap:" + "a".repeat(64);
+  const B = "rez:cap:" + "b".repeat(64);
+  const C = "rez:cap:" + "c".repeat(64);
   const state = await buildSignedAccountAuthorityState({
     signer: account,
     accountIdentityPublicKeyB64: account.publicKeyB64,
     epoch: 5,
-    revokedCertIds: ["rez:cap:zzz", "rez:cap:aaa", "rez:cap:zzz", "rez:cap:mmm"],
+    revokedCertIds: [C, A, C, B],
     minValidIssuedAtMs: 42,
     nowMs: NOW,
   });
 
   assert.ok(state instanceof AccountAuthorityStateV1);
-  assert.deepEqual(state.revokedCertIds, ["rez:cap:aaa", "rez:cap:mmm", "rez:cap:zzz"], "sorted + deduped");
+  assert.deepEqual(state.revokedCertIds, [A, B, C], "sorted + deduped");
   assert.equal(state.epoch, 5);
   assert.equal(state.minValidIssuedAtMs, 42);
-  assert.deepEqual(state.toRevocationState(), { revokedCertIds: ["rez:cap:aaa", "rez:cap:mmm", "rez:cap:zzz"], minValidIssuedAtMs: 42 });
+  assert.deepEqual(state.toRevocationState(), { revokedCertIds: [A, B, C], minValidIssuedAtMs: 42 });
 
   const ok = await verifyPayload({
     publicKeyB64: account.publicKeyB64,
