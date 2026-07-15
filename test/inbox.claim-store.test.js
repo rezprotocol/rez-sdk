@@ -129,13 +129,14 @@ test("createClaim honors an EXPLICIT canonical inboxId (device-link ceremony inb
   const claim = await store.createClaim({ inboxId: ceremonyInbox });
   assert.equal(claim.inboxId, ceremonyInbox, "claims the exact ceremony inbox");
   // A NON-EMPTY noncanonical explicit inbox is rejected (fail loud, no silent fallback to a
-  // random id). (An absent/empty inboxId is the unchanged fresh-claim path, not an error.)
-  for (const bad of ["notaninbox", "inbox:", "inbox:XYZ", "inbox:" + "a".repeat(4), "inbox:zzzzzzzzzzzzzzzz", "INBOX:" + "a".repeat(24)]) {
+  // random id). Includes WRONG-LENGTH hex — the shape is EXACTLY 24 hex, so 4 and 32 both fail.
+  // (An absent/empty inboxId is the unchanged fresh-claim path, not an error.)
+  for (const bad of ["notaninbox", "inbox:", "inbox:XYZ", "inbox:" + "a".repeat(4), "inbox:" + "a".repeat(32), "inbox:zzzzzzzzzzzzzzzzzzzzzzzz", "INBOX:" + "a".repeat(24)]) {
     await assert.rejects(() => store.createClaim({ inboxId: bad }), /canonical/, "rejects " + JSON.stringify(bad));
   }
-  // An absent inbox still mints a fresh canonical id (unchanged path).
+  // An absent inbox still mints a fresh canonical id (exactly 24 hex).
   const fresh = await store.createClaim({});
-  assert.match(fresh.inboxId, /^inbox:[0-9a-f]{16,}$/);
+  assert.match(fresh.inboxId, /^inbox:[0-9a-f]{24}$/);
 });
 
 test("persist + get round-trips through storage", async () => {

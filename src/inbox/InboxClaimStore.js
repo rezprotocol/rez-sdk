@@ -5,21 +5,11 @@ import {
   canonicalJSONStringify,
   CapabilitySigner,
   RCapability,
+  INBOX_ID_RANDOM_BYTES,
+  requireCanonicalInboxId,
 } from "@rezprotocol/core";
 
 const STORE_KEY = "sdk:inbox:claims:v1";
-const INBOX_ID_RANDOM_BYTES = 12;
-
-// The canonical inbox-id shape this SDK mints: "inbox:" + lowercase hex. Both
-// #generateInboxId here and the device-link requester produce it. An EXPLICIT inbox
-// (a device-link ceremony's pre-registered inbox) must match, so a linked device claims
-// exactly that inbox and never a malformed/attacker-chosen string.
-function requireCanonicalInboxId(inboxId) {
-  if (typeof inboxId !== "string" || !/^inbox:[0-9a-f]{16,}$/.test(inboxId)) {
-    throw new Error('InboxClaimStore: inboxId must be canonical ("inbox:" + lowercase hex), got: ' + String(inboxId));
-  }
-  return inboxId;
-}
 
 /**
  * Client-side store of inbox claims the SDK has issued.
@@ -107,8 +97,9 @@ export class InboxClaimStore {
     // P1#2 L3.5: a device-link ceremony pre-registers a SPECIFIC inbox (the one the new
     // device device-signed a binding for + the home's device.add recorded), so the linked
     // device must claim THAT exact inbox, never a freshly-minted one. An explicit inboxId
-    // is validated to the canonical shape both this store and the SDK requester generate
-    // ("inbox:"+32 lowercase hex); the fresh-claim path (no inboxId) is unchanged.
+    // is validated to the ONE canonical shape (SSOT @rezprotocol/core requireCanonicalInboxId:
+    // "inbox:" + 24 lowercase hex) that this store and the requester both mint; the fresh-claim
+    // path (no inboxId) is unchanged.
     inboxId = typeof inboxId === "string" && inboxId.trim().length > 0
       ? requireCanonicalInboxId(inboxId.trim())
       : this.#generateInboxId();
