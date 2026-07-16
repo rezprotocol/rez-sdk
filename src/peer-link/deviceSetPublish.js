@@ -7,6 +7,7 @@ import {
   verifyDurableRecordV2,
   bytesToBase64,
   base64ToBytes,
+  CAP_DEVICE_SET_PUBLISH,
 } from "@rezprotocol/core";
 import { derivePeerScopedKey, sealToPeer, openFromPeer } from "./peerScopedSeal.js";
 
@@ -51,7 +52,9 @@ const SEAL_AAD = "rez:device-set:v1";
 // caller-supplied capability would let a confused deputy stamp a weaker one).
 // Stamped on every record, direct included: direct mode grants the full
 // account capability set, so the stamp is uniformly enforceable.
-export const DEVICE_SET_PUBLISH_CAPABILITY = "deviceSet.publish";
+// SSOT: sourced from rez-core's CAP_DEVICE_SET_PUBLISH (audit leaf-3c F6) — the
+// authorization vocabulary has a single owner and cannot drift from the node.
+export const DEVICE_SET_PUBLISH_CAPABILITY = CAP_DEVICE_SET_PUBLISH;
 
 // A self-signed device set / bundle carries an attacker-chosen issuedAtMs. The
 // resolver must not honor one stamped far in the future (it would otherwise win
