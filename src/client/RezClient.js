@@ -97,7 +97,7 @@ export class RezClient {
     this.#accountOutbox = new AccountOutboxCapability({ pool });
     // The one mesh-dispatch verb. Delegates to mailbox / durableRecords so the
     // wire op stays single-sourced; apps call rez.mesh.dispatch(object, address).
-    this.#mesh = new MeshCapability({ pool, mailbox: this.#mailbox, durableRecords: this.#durableRecords });
+    this.#mesh = new MeshCapability({ mailbox: this.#mailbox, durableRecords: this.#durableRecords });
   }
 
   #resolveRuntime(options) {

@@ -27,16 +27,14 @@ const T = REZ_CONTRACT_TYPES;
  * differ. dispatch delegates to the existing mailbox / durable-record
  * capabilities so the wire op stays single-sourced; it never inspects payload
  * meaning, only routes by address kind.
- *
- * Also retains `getMeshStatus()` (mesh-status query) — unchanged.
  */
 export class MeshCapability {
-  #pool;
   #mailbox;
   #durableRecords;
 
-  constructor({ pool, mailbox = null, durableRecords = null }) {
-    this.#pool = pool;
+  // No `pool`: mesh has no wire op of its own. dispatch() delegates to the mailbox and
+  // durable-record capabilities so the wire op stays single-sourced.
+  constructor({ mailbox = null, durableRecords = null }) {
     this.#mailbox = mailbox;
     this.#durableRecords = durableRecords;
   }
@@ -100,26 +98,5 @@ export class MeshCapability {
       throw new Error("mesh.dispatch(rendezvous): record coordinate does not match address coordinate");
     }
     return this.#durableRecords.put({ record: o.record });
-  }
-
-  /**
-   * DEAD OP — kept as-is pending a decision, do not build on it. `T.NODE_MESH_STATUS` is not
-   * defined in rez-core and no rez-node handler implements it, so this call resolves `type` to
-   * undefined and the transport throws BAD_REQUEST ("type required") before anything is sent.
-   * The only mesh-status consumer (rez-chat ServerConnectionService.getMeshStatus) never calls
-   * this — it uses `sdk.node.status()`. Either wire up the op or delete the method.
-   */
-  async getMeshStatus({ timeoutMs = 5000, tryAllUplinks = true, continueOnCodes = [] } = {}) {
-    const response = await this.#pool.sendRequest({
-      type: T.NODE_MESH_STATUS,
-      body: {},
-      expectedResponseType: T.NODE_MESH_STATUS_RES,
-      timeoutMs,
-      tryAllUplinks,
-      continueOnCodes,
-    });
-    // Shape-only: this op has no pinnable field list because no node implements it — see the
-    // note on getMeshStatus above. The gate still keeps it consistent with every sibling.
-    return requireResponseBody({ op: "MeshCapability.getMeshStatus", response });
   }
 }

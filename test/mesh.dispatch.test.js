@@ -39,7 +39,7 @@ function buildMesh() {
   const pool = capturingPool();
   const mailbox = new MailboxCapability({ pool });
   const durableRecords = new DurableRecordsCapability({ pool });
-  const mesh = new MeshCapability({ pool, mailbox, durableRecords });
+  const mesh = new MeshCapability({ mailbox, durableRecords });
   return { pool, mesh };
 }
 
