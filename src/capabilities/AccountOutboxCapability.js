@@ -1,4 +1,5 @@
 import { REZ_CONTRACT_TYPES } from "@rezprotocol/core";
+import { requireResponseBody } from "../util/responseBody.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -24,11 +25,12 @@ const T = REZ_CONTRACT_TYPES;
  *
  * Rides the generic request path like every other capability — no per-directive facade.
  *
- * STRICTNESS (matching the node-side records' F5 posture): every response discriminant is
- * REQUIRED to be a boolean. Sibling capabilities fall back to `{}` on a malformed body, which
- * here would be actively dangerous — a missing `leased` would read as "nothing to lease" and a
- * missing `completed` as "the lease was lost", silently converting backend/contract drift into
- * a plausible-but-wrong no-op that stalls revocation propagation. Drift throws instead.
+ * STRICTNESS: every response discriminant is REQUIRED to be a boolean, enforced through the
+ * shared `requireResponseBody` gate (src/util/responseBody.js — the SSOT for the convention:
+ * return what the JSDoc promises, or throw). The alternative, an empty-object fallback, is
+ * actively dangerous here — a missing `leased` would read as "nothing to lease" and a missing
+ * `completed` as "the lease was lost", silently converting contract drift into a
+ * plausible-but-wrong no-op that stalls revocation propagation.
  */
 export class AccountOutboxCapability {
   #pool;
@@ -160,15 +162,13 @@ export class AccountOutboxCapability {
 
   async #send({ op, type, expectedResponseType, body, discriminant }) {
     const response = await this.#pool.sendRequest({ type, body, expectedResponseType });
-    const responseBody = response && typeof response.body === "object" && response.body !== null && !Array.isArray(response.body)
-      ? response.body
-      : null;
-    if (responseBody === null) {
-      throw new Error("AccountOutboxCapability." + op + ": node returned no response body");
-    }
-    if (typeof responseBody[discriminant] !== "boolean") {
-      throw new Error("AccountOutboxCapability." + op + ": response is missing the required '" + discriminant + "' boolean");
-    }
-    return responseBody;
+    // The discriminant is the ONE field every branch of the caller's logic turns on, so it is the
+    // one the contract gate must prove. The remaining fields are guarded by their presence on the
+    // true branch of the node's response record.
+    return requireResponseBody({
+      op: "AccountOutboxCapability." + op,
+      response,
+      require: { [discriminant]: "boolean" },
+    });
   }
 }
