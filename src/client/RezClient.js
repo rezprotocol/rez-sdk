@@ -9,6 +9,7 @@ import { SubscriptionCapability } from "../capabilities/SubscriptionCapability.j
 import { ConnectivityCapability } from "../capabilities/ConnectivityCapability.js";
 import { IdentityCapability } from "../capabilities/IdentityCapability.js";
 import { DevicesCapability } from "../capabilities/DevicesCapability.js";
+import { AccountOutboxCapability } from "../capabilities/AccountOutboxCapability.js";
 import { MeshCapability } from "../capabilities/MeshCapability.js";
 import { bytesToBase64, base64ToBytes } from "../util/bytes.js";
 import { buildRezClientRuntime } from "./buildRezClientRuntime.js";
@@ -43,6 +44,7 @@ export class RezClient {
   #connectivity;
   #identityCap;
   #devices;
+  #accountOutbox;
   #mesh;
   // Local PeerLinkService instance (Shape A). When set, the SDK encrypts
   // outbound messages locally and sends them as plain MAILBOX_DEPOSIT, so the
@@ -91,6 +93,7 @@ export class RezClient {
     this.#connectivity = new ConnectivityCapability({ pool, eventBus });
     this.#identityCap = new IdentityCapability({ pool, eventBus, identity });
     this.#devices = new DevicesCapability({ pool });
+    this.#accountOutbox = new AccountOutboxCapability({ pool });
     // The one mesh-dispatch verb. Delegates to mailbox / durableRecords so the
     // wire op stays single-sourced; apps call rez.mesh.dispatch(object, address).
     this.#mesh = new MeshCapability({ pool, mailbox: this.#mailbox, durableRecords: this.#durableRecords });
@@ -613,6 +616,15 @@ export class RezClient {
 
   get devices() {
     return this.#devices;
+  }
+
+  /**
+   * The account authority-state propagation outbox (P1#3): claim → prepare → publish →
+   * complete. Only an authorized device can drain it — the node cannot publish an
+   * account-signed record on the account's behalf.
+   */
+  get accountOutbox() {
+    return this.#accountOutbox;
   }
 
   get mesh() {
