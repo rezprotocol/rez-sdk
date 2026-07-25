@@ -155,3 +155,55 @@ test("aggregate build rejects a bundle that does not belong to the publishing ac
     /does not belong to the publishing account/,
   );
 });
+
+test("REPUBLISH does not strand a peer holding the PREVIOUS bundle (prekey retention window)", async () => {
+  // The live bug this pins. buildAndRetainAccountDeviceBundle mints a FRESH signed prekey on every
+  // call, and it is called on every reconnect (ServerRuntimeService#publishMultiDeviceSet). The
+  // retained private half lived in ONE overwrite-only slot, so a reconnect destroyed the key any
+  // peer still holding the previous bundle was about to use — and peers cache a resolved device set
+  // for 5 minutes. A first contact begun just before a republish could never be completed.
+  const crypto = new BrowserCryptoProvider();
+  const accountA = await makeAccount(crypto, { seedByte: 11, mailboxes: ["rez:inbox:a1r"] });
+  const carol = await makeAccount(crypto, { seedByte: 12, mailboxes: ["rez:inbox:carol2"] });
+  const [a1] = accountA.devices;
+  const c = carol.devices[0];
+
+  await link(c, accountA.accountId, accountA.accountPubB64, accountA.seededDh.publicKeyB64, "pl_carol_A2");
+  await link(a1, carol.accountId, carol.accountPubB64, c.identityDhPubB64, "pl_A_carol2");
+
+  // v1 — the bundle carol resolves and caches.
+  const v1 = await a1.svc.buildAndRetainAccountDeviceBundle({});
+  const { record: recV1 } = await a1.svc.buildDeviceSetRecordForPeer({
+    peerAccountId: carol.accountId,
+    accountDeviceSet: [{ deviceId: a1.deviceId, bundle: v1.toJSON() }],
+    revision: 1,
+  });
+  const ingested = await c.svc.ingestPeerDeviceSet({ peerAccountId: accountA.accountId, record: recV1 });
+  const handshakeFromCarol = ingested.established[0].handshakeData;
+
+  // A1 reconnects and republishes BEFORE carol's handshake is processed. Under the old
+  // single-slot storage, v1's private half was destroyed right here.
+  await a1.svc.buildAndRetainAccountDeviceBundle({});
+
+  // A1 must still complete the session carol began against v1...
+  await a1.svc.completeDeviceSetResponder({
+    peerAccountId: carol.accountId,
+    peerDeviceId: c.deviceId,
+    handshakeData: handshakeFromCarol,
+  });
+
+  // ...and that session must actually carry a message, not merely construct.
+  const sealed = await c.svc.encryptDirectMessageForDevice({
+    peerAccountId: accountA.accountId,
+    peerLinkId: "pl_carol_A2",
+    peerDeviceId: a1.deviceId,
+    plaintextBytes: enc("first contact across a republish"),
+  });
+  const got = await a1.svc.decryptFromDevice({
+    peerAccountId: carol.accountId,
+    peerLinkId: "pl_A_carol2",
+    peerDeviceId: c.deviceId,
+    packetBytes: sealed.encryptedPacket.toBytes(),
+  });
+  assert.equal(dec(got.plaintextBytes), "first contact across a republish");
+});

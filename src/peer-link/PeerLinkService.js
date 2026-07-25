@@ -70,6 +70,35 @@ const DEVICE_SET_MAX_DEVICES = 8;
 // sentinel "peer" (not per-peer), so ANY peer that establishes against the
 // home-served bundle can be completed. Not a real accountId — cannot collide.
 const ACCOUNT_DEVICE_BUNDLE_PEER_SENTINEL = "@self-device-bundle";
+
+// How many signed-prekey private halves this device keeps. A fresh prekey is minted on every
+// republish (i.e. every reconnect), while peers cache a resolved device set for minutes — so the
+// window only has to outlive that cache plus any handshake already in flight. Three covers a
+// flapping connection without keeping old key material around indefinitely, which would work
+// against the forward secrecy rotation exists to provide.
+const ACCOUNT_DEVICE_BUNDLE_PREKEY_RETENTION = 3;
+
+/**
+ * Pick the retained prekey state an initiator computed against.
+ *
+ * The handshake names the receiver's signed prekey (`receiverSignedPreKeyPubB64`) precisely because
+ * nothing else in it identifies which one was used. A handshake from before that field existed
+ * falls back to the NEWEST state, which is exactly the pre-retention behaviour — so an old peer is
+ * no worse off than before, and a current one is correct.
+ */
+function selectPreKeyStateFor(retainedStates, handshakeData) {
+  if (!Array.isArray(retainedStates) || retainedStates.length === 0) return null;
+  const named = handshakeData && typeof handshakeData.receiverSignedPreKeyPubB64 === "string"
+    ? handshakeData.receiverSignedPreKeyPubB64
+    : "";
+  if (named.length > 0) {
+    const match = retainedStates.find((s) => s.signedPreKeyPublic === named);
+    // A named-but-unknown prekey means the window has already rolled past it. Returning the newest
+    // would derive a wrong secret and fail confusingly; report the miss for what it is.
+    return match ? match : null;
+  }
+  return retainedStates[0];
+}
 // The capability a DELEGATED inviter's cert chain must grant (S2.5 S8 L6).
 // Fixed for the invite record kind — never caller-chosen (confused-deputy
 // guard). This module is both the sole producer and the sole enforcing
@@ -740,8 +769,36 @@ export class PeerLinkService {
       throw new Error("buildAndRetainAccountDeviceBundle requires a bound account identity");
     }
     const { prekeyBundleRecord, preKeyState } = await this.#buildOwnDeviceBundle(owner, accountPublicKeyB64, inboxId, at);
-    await this.peerLinkStorage.keys.putDevicePreKey(owner, ACCOUNT_DEVICE_BUNDLE_PEER_SENTINEL, preKeyState);
+    // RETENTION WINDOW. This mints a FRESH signed prekey every call, and it is called on every
+    // reconnect. Overwriting a single slot destroyed the private half that any peer still holding
+    // the previous bundle was about to use — and peers cache a device set for minutes — so a first
+    // contact begun just before a republish could never be completed. Keep the newest plus a short
+    // tail of prior states so those handshakes still land.
+    const retained = await this.#retainedAccountPreKeyStates(owner);
+    const next = [preKeyState, ...retained.filter((s) => s.signedPreKeyPublic !== preKeyState.signedPreKeyPublic)]
+      .slice(0, ACCOUNT_DEVICE_BUNDLE_PREKEY_RETENTION);
+    await this.peerLinkStorage.keys.putDevicePreKey(owner, ACCOUNT_DEVICE_BUNDLE_PEER_SENTINEL, {
+      v: 2,
+      states: next,
+    });
     return prekeyBundleRecord;
+  }
+
+  /**
+   * The account-global prekey retention window, newest first.
+   *
+   * Reads both shapes: the v2 `{ v: 2, states: [...] }` list and the legacy single preKeyState a
+   * device wrote before this window existed — a device that upgrades mid-life must not lose the
+   * key its peers are currently holding.
+   */
+  async #retainedAccountPreKeyStates(ownerAccountId) {
+    const stored = await this.peerLinkStorage.keys.getDevicePreKey(ownerAccountId, ACCOUNT_DEVICE_BUNDLE_PEER_SENTINEL);
+    if (!stored || typeof stored !== "object") return [];
+    if (Array.isArray(stored.states)) {
+      return stored.states.filter((s) => s && typeof s === "object" && typeof s.signedPreKeyPublic === "string");
+    }
+    // Legacy single-state slot.
+    return typeof stored.signedPreKeyPrivate === "string" ? [stored] : [];
   }
 
   /**
@@ -1107,7 +1164,11 @@ export class PeerLinkService {
     // be completed.
     let preKeyState = await this.peerLinkStorage.keys.getDevicePreKey(owner, peer);
     if (!preKeyState || typeof preKeyState !== "object") {
-      preKeyState = await this.peerLinkStorage.keys.getDevicePreKey(owner, ACCOUNT_DEVICE_BUNDLE_PEER_SENTINEL);
+      // The account-global slot holds a RETENTION WINDOW (newest first), not a single state: this
+      // device mints a fresh signed prekey on every republish, and a peer may still be holding a
+      // bundle from before the last one. Select the state the initiator actually computed against.
+      const retained = await this.#retainedAccountPreKeyStates(owner);
+      preKeyState = selectPreKeyStateFor(retained, handshakeData);
     }
     if (!preKeyState || typeof preKeyState !== "object") {
       const err = new Error("no retained device pre-key state for peer " + peer);
