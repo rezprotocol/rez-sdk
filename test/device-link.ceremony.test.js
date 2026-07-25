@@ -24,14 +24,26 @@ import { BrowserCryptoProvider } from "../src/e2ee/BrowserCryptoProvider.js";
 const CRYPTO = new BrowserCryptoProvider();
 const FAST = { pollIntervalMs: 5, pollMaxIntervalMs: 10, pollBackoff: 1.2 };
 
-async function makePrimary(overlay, { pskTtlMs = 10 * 60_000, getCachedDeviceSet = null, registerDevice = null } = {}) {
+async function makePrimary(overlay, { pskTtlMs = 10 * 60_000, getCachedDeviceSet = null, registerDevice = null, registrationJournal = null } = {}) {
   const b = await CRYPTO.generateSigningKeyPair();
   const dh = await CRYPTO.dhGenerateKeyPair({ alg: "X25519", fmt: "spki" });
   // P1#2: registerDevice is now required (registration-before-release). The default
   // stub records each registration so tests can assert it ran BEFORE the leaf was
   // released; individual tests inject a throwing one to prove the fail-closed path.
   const registrations = [];
+  // P1#2a: the journal makes the registration RESUMABLE. `steps` records the ceremony's ordering
+  // decisions — persist BEFORE the commit, publish AFTER it — which is the invariant that lets a
+  // crash between commit and publish be recovered by republishing the stored bytes.
+  const steps = [];
+  const journalRecords = [];
+  const journal = registrationJournal || {
+    async persistPending(rec) { steps.push("persist"); journalRecords.push(rec); },
+    async markPublished() { steps.push("markPublished"); },
+    async markConfirmed() { steps.push("markConfirmed"); },
+    warn() {},
+  };
   const reg = registerDevice || (async (args) => {
+    steps.push("register");
     registrations.push(args);
     // A faithful home commit echoes the exact device/inbox/certId it bound — the shape
     // the approver validates before releasing the leaf.
@@ -48,10 +60,11 @@ async function makePrimary(overlay, { pskTtlMs = 10 * 60_000, getCachedDeviceSet
     },
     getCachedDeviceSet,
     registerDevice: reg,
+    registrationJournal: journal,
     pskTtlMs,
     ...FAST,
   });
-  return { approver, registrations, accountPubB64: bytesToBase64(b.publicKey), accountId: deriveAccountIdFromPublicKey(b.publicKey) };
+  return { approver, registrations, steps, journalRecords, accountPubB64: bytesToBase64(b.publicKey), accountId: deriveAccountIdFromPublicKey(b.publicKey) };
 }
 
 function runRequester(overlay, code, over = {}) {
@@ -255,6 +268,9 @@ test("requester rejects a bundle whose chain is narrower than the launch set or 
       privateKeyB64: bytesToBase64(dh.privateKey),
     },
     registerDevice: async () => {}, // P1#2: required; this test hand-builds the response below.
+    // P1#2a: also required. This test never calls approve() — it drives the core functions
+    // directly — so the journal is present purely to satisfy the constructor invariant.
+    registrationJournal: { async persistPending() {}, async markPublished() {}, async markConfirmed() {} },
     pskTtlMs: 3_000,
     ...FAST,
   });
@@ -457,4 +473,77 @@ test("P1#2: a registration that does NOT commit this device/inbox/cert is reject
     assert.equal(approveErr && approveErr.code, "DEVICE_LINK_REGISTRATION_UNVERIFIED", "unverified commit rejected");
     assert.equal(reqErr && reqErr.code, "DEVICE_LINK_TIMEOUT", "no leaf released on an unverified registration");
   }
+});
+
+test("P1#2a: the exact publication is PERSISTED before device.add and published only after", async () => {
+  // The ordering is the recovery guarantee. Persist-then-commit-then-publish means a crash
+  // anywhere in between leaves stored bytes that can simply be republished; building the response
+  // AFTER the commit would instead force a fresh ceremony, which mints a DIFFERENT certId and
+  // never converges on the registration that already committed.
+  const overlay = createMemoryRecordOverlay({ crypto: CRYPTO });
+  const { approver, steps, journalRecords, accountPubB64 } = await makePrimary(overlay);
+  const started = await approver.start();
+  const requesterDone = runRequester(overlay, started.code);
+  await approver.waitForRequest();
+  const result = await approver.approve();
+  await requesterDone;
+
+  assert.deepEqual(
+    steps,
+    ["persist", "register", "markPublished", "markConfirmed"],
+    "persist BEFORE the home commit; publish only AFTER it",
+  );
+
+  // What was persisted must be the publication itself, not a description of it.
+  assert.equal(journalRecords.length, 1);
+  const rec = journalRecords[0];
+  assert.equal(rec.deviceId, result.newDeviceId);
+  assert.equal(rec.certId, result.certId);
+  assert.equal(rec.leafCert.certId, result.certId, "the minted leaf, verbatim");
+  assert.ok(rec.sealedResponse && typeof rec.sealedResponse === "object", "the SEALED response record");
+  assert.equal(rec.sealedResponse.recordId, "response");
+  assert.ok(rec.inboxId && rec.inboxId.startsWith("inbox:"), "the device's own ceremony inbox");
+  assert.ok(rec.thRequestB64 && rec.thResponseB64, "the transcript binding");
+  assert.ok(rec.expiresAtMs > 0);
+
+  // The stored confirmation material is the expected TAG, never the master secret — the tag
+  // recognises the device's confirmation but cannot decrypt the sealed response at rest.
+  assert.ok(rec.confirmTagB64 && rec.confirmTagB64.length > 0);
+  assert.equal(rec.masterSecret, undefined, "no key material at rest");
+
+  // The record that went to the overlay is the one that was persisted.
+  const published = await overlay.get({
+    recordKind: rec.sealedResponse.recordKind,
+    recordId: "response",
+    publisherPublicKeyB64: rec.sealedResponse.publisherPublicKeyB64,
+  });
+  assert.deepEqual(published, rec.sealedResponse, "published the EXACT persisted bytes");
+  assert.ok(accountPubB64.length > 0);
+});
+
+test("P1#2a fail-closed: if the registration cannot be made durable, device.add never runs", async () => {
+  // Committing a registration with nothing to resume from is the one thing this leaf exists to
+  // prevent: the leaf would be released with no way to republish and no way to recover.
+  const overlay = createMemoryRecordOverlay({ crypto: CRYPTO });
+  const steps = [];
+  const { approver } = await makePrimary(overlay, {
+    registrationJournal: {
+      async persistPending() { steps.push("persist"); throw new Error("disk full"); },
+      async markPublished() { steps.push("markPublished"); },
+      async markConfirmed() { steps.push("markConfirmed"); },
+    },
+    registerDevice: async () => { steps.push("register"); return {}; },
+  });
+  const { code } = await approver.start();
+  const approverFlow = (async () => {
+    await approver.waitForRequest();
+    return approver.approve().then(() => null).catch((err) => err);
+  })();
+  // No response is ever published, so the requester must time out rather than hang.
+  const requesterP = runRequester(overlay, code, { deadlineMs: 400 }).then(() => null).catch((err) => err);
+  const [approveErr, reqErr] = await Promise.all([approverFlow, requesterP]);
+
+  assert.equal(approveErr && approveErr.code, "DEVICE_LINK_REGISTRATION_NOT_DURABLE");
+  assert.deepEqual(steps, ["persist"], "device.add never ran");
+  assert.equal(reqErr && reqErr.code, "DEVICE_LINK_TIMEOUT", "and no leaf reached the new device");
 });

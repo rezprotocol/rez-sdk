@@ -53,6 +53,8 @@ export class DeviceLinkApprover {
   #accountDhKeyPair;
   #getCachedDeviceSet;
   #registerDevice;
+  #registrationJournal;
+  #journalWarn;
   #nowMs;
   #sleep;
   #pollIntervalMs;
@@ -75,6 +77,7 @@ export class DeviceLinkApprover {
     accountDhKeyPair,
     getCachedDeviceSet = null,
     registerDevice = null,
+    registrationJournal = null,
     nowMs = () => Date.now(),
     sleep = defaultSleep,
     pollIntervalMs = 1000,
@@ -122,6 +125,23 @@ export class DeviceLinkApprover {
       throw new Error("DeviceLinkApprover requires registerDevice(...) — registration-before-release (P1#2): the home must bind the leaf's certId before the leaf is released");
     }
     this.#registerDevice = registerDevice;
+    // P1#2a persist-and-resume. Required for the same reason registerDevice is: a device.add is
+    // authoritative the moment the leaf is released, and a fresh ceremony mints a DIFFERENT certId,
+    // so a registration that is not durably recorded BEFORE the commit cannot be recovered — only
+    // abandoned. Making the journal intrinsic to the constructor means no path exists that submits
+    // device.add with nothing to resume from.
+    const journal = registrationJournal && typeof registrationJournal === "object" ? registrationJournal : null;
+    if (!journal
+        || typeof journal.persistPending !== "function"
+        || typeof journal.markPublished !== "function"
+        || typeof journal.markConfirmed !== "function") {
+      throw new Error(
+        "DeviceLinkApprover requires registrationJournal { persistPending, markPublished, markConfirmed }"
+          + " — persist-and-resume (P1#2a): the exact publication must be durable before device.add",
+      );
+    }
+    this.#registrationJournal = journal;
+    this.#journalWarn = typeof journal.warn === "function" ? (m) => journal.warn(m) : null;
     this.#nowMs = nowMs;
     this.#sleep = sleep;
     this.#pollIntervalMs = pollIntervalMs;
@@ -235,6 +255,16 @@ export class DeviceLinkApprover {
    * + publish the delegation bundle, and wait for the key-confirmation
    * record. → { newDeviceId, certId }
    */
+  #onJournalWarning(op, err) {
+    const message = "DeviceLinkApprover: registration journal " + op + " failed after the ceremony"
+      + " already succeeded: " + (err && err.message ? err.message : String(err));
+    if (typeof this.#journalWarn === "function") {
+      this.#journalWarn(message);
+      return;
+    }
+    console.warn(message);
+  }
+
   async approve() {
     if (this.#status !== "awaiting-approval" || !this.#pinned) {
       throw new Error("DeviceLinkApprover.approve: no pending request to approve");
@@ -248,49 +278,17 @@ export class DeviceLinkApprover {
       nowMs: at,
     });
 
-    // P1#2 registration-before-release: register the device at the home (device.add
-    // carrying the new device's OWN inbox binding + this leaf cert) BEFORE building /
-    // publishing the response that releases the leaf. If registration fails the ceremony
-    // fails and the leaf is NEVER released — so a leaf that reaches the new device always
-    // has its certId already bound at the home (and thus is revocable to off-home peers).
-    // Ordered here, not in the caller, so no caller can accidentally release first.
+    // ORDER (P1#2 + P1#2a). Build and SEAL the response, PERSIST it, THEN register, THEN publish.
     //
-    // The callback MUST return its asserted COMMITTED registration ({ deviceId, inboxId,
-    // certId }); we then validate it binds THIS exact device, inbox, and leaf cert. This is a
-    // TRUSTED IN-PROCESS boundary (the production wiring is ServerDeviceLinkService submitting
-    // device.add): the check catches wiring/consistency bugs — a no-op `async () => {}` or a
-    // mismatched/stale commit can no longer release a leaf — but it is NOT cryptographic proof
-    // the commit came from the home (a fabricated matching object would pass; provenance would
-    // need a home-signed commit record). The END-TO-END guarantee that the home actually bound
-    // the certId before release is proven by the real-Pg L6 test, not by this equality check.
-    const bindingInboxId = pinned.linkRequest.deviceInboxBinding && typeof pinned.linkRequest.deviceInboxBinding === "object"
-      ? pinned.linkRequest.deviceInboxBinding.inboxId
-      : null;
-    let commit;
-    try {
-      commit = await this.#registerDevice({
-        newDeviceId: pinned.newDeviceId,
-        deviceInboxBinding: pinned.linkRequest.deviceInboxBinding,
-        deviceCapability: leafCert.toJSON(),
-      });
-    } catch (err) {
-      this.#terminate("failed");
-      const wrapped = new Error("device link registration (device.add) failed before release: " + (err && err.message ? err.message : String(err)));
-      wrapped.code = "DEVICE_LINK_REGISTRATION_FAILED";
-      throw wrapped;
-    }
-    if (!commit || typeof commit !== "object"
-        || commit.certId !== leafCert.certId
-        || commit.deviceId !== pinned.newDeviceId
-        || commit.inboxId !== bindingInboxId) {
-      this.#terminate("failed");
-      const err = new Error(
-        "device link registration returned an unverified commit (must bind this device, inbox, and leaf certId before release)",
-      );
-      err.code = "DEVICE_LINK_REGISTRATION_UNVERIFIED";
-      throw err;
-    }
-
+    // P1#2 registration-before-release: the home must bind this leaf's certId before the leaf
+    // reaches the new device, or an off-home peer has no way to learn it was revoked. So the
+    // response is never PUBLISHED before the commit.
+    //
+    // P1#2a persist-and-resume: the response is nonetheless BUILT before the commit, because a
+    // crash between "device.add committed" and "response published" must be recoverable — and it
+    // can only be recovered by republishing these exact bytes. A fresh ceremony mints a different
+    // certId (the id covers issuedAtMs/expiresAtMs), so retrying never converges on the
+    // registration that already committed.
     let cachedDeviceSet = null;
     if (this.#getCachedDeviceSet) {
       cachedDeviceSet = await this.#getCachedDeviceSet();
@@ -317,7 +315,73 @@ export class DeviceLinkApprover {
       payloadB64: response.payloadB64,
       expiresAtMs: this.#expiresAtMs,
     });
+
+    const bindingInboxId = pinned.linkRequest.deviceInboxBinding && typeof pinned.linkRequest.deviceInboxBinding === "object"
+      ? pinned.linkRequest.deviceInboxBinding.inboxId
+      : null;
+
+    // Durable BEFORE the commit. `confirmTagB64` is the expected confirmation tag rather than the
+    // master secret: it is enough to recognise the new device's confirmation on resume, and unlike
+    // the secret it cannot decrypt the sealed response at rest.
+    try {
+      await this.#registrationJournal.persistPending({
+        deviceId: pinned.newDeviceId,
+        inboxId: bindingInboxId,
+        certId: leafCert.certId,
+        leafCert: leafCert.toJSON(),
+        sealedResponse: responseRecord,
+        thRequestB64: pinned.thRequestB64,
+        thResponseB64: response.thResponseB64,
+        confirmTagB64: response.confirmTagB64,
+        expiresAtMs: this.#expiresAtMs,
+      });
+    } catch (err) {
+      this.#terminate("failed");
+      const wrapped = new Error(
+        "device link registration could not be made durable before device.add: "
+          + (err && err.message ? err.message : String(err)),
+      );
+      wrapped.code = "DEVICE_LINK_REGISTRATION_NOT_DURABLE";
+      throw wrapped;
+    }
+
+    // The callback MUST return its asserted COMMITTED registration ({ deviceId, inboxId,
+    // certId }); we then validate it binds THIS exact device, inbox, and leaf cert. This is a
+    // TRUSTED IN-PROCESS boundary (the production wiring is ServerDeviceLinkService submitting
+    // device.add): the check catches wiring/consistency bugs — a no-op `async () => {}` or a
+    // mismatched/stale commit can no longer release a leaf — but it is NOT cryptographic proof
+    // the commit came from the home (a fabricated matching object would pass; provenance would
+    // need a home-signed commit record). The END-TO-END guarantee that the home actually bound
+    // the certId before release is proven by the real-Pg L6 test, not by this equality check.
+    let commit;
+    try {
+      commit = await this.#registerDevice({
+        newDeviceId: pinned.newDeviceId,
+        deviceInboxBinding: pinned.linkRequest.deviceInboxBinding,
+        deviceCapability: leafCert.toJSON(),
+      });
+    } catch (err) {
+      this.#terminate("failed");
+      const wrapped = new Error("device link registration (device.add) failed before release: " + (err && err.message ? err.message : String(err)));
+      wrapped.code = "DEVICE_LINK_REGISTRATION_FAILED";
+      throw wrapped;
+    }
+    if (!commit || typeof commit !== "object"
+        || commit.certId !== leafCert.certId
+        || commit.deviceId !== pinned.newDeviceId
+        || commit.inboxId !== bindingInboxId) {
+      this.#terminate("failed");
+      const err = new Error(
+        "device link registration returned an unverified commit (must bind this device, inbox, and leaf certId before release)",
+      );
+      err.code = "DEVICE_LINK_REGISTRATION_UNVERIFIED";
+      throw err;
+    }
+
+    // Publish the EXACT record that was persisted, then record that it is out. Republishing the
+    // same record is a no-op, which is what makes the resume path safe to run more than once.
     await this.#records.put({ record: responseRecord });
+    await this.#registrationJournal.markPublished({ deviceId: pinned.newDeviceId });
 
     // Explicit key confirmation: only the device that derived the SAME master
     // secret (psk + the pinned ephemeral DH) can produce the tag.
@@ -366,6 +430,16 @@ export class DeviceLinkApprover {
           confirmed = false;
         }
         if (confirmed) {
+          // ACKNOWLEDGMENT ONLY (P1#2a): the leaf has been live since it was released, so this
+          // grants nothing — it closes out the resume obligation. A failure to record the
+          // acknowledgment must not fail a ceremony that has already succeeded; the registration
+          // simply stays `published` and the next sweep sees it as complete-but-unacknowledged.
+          try {
+            await this.#registrationJournal.markConfirmed({ deviceId: pinned.newDeviceId });
+          } catch (err) {
+            // Deliberately non-fatal, and deliberately not silent.
+            this.#onJournalWarning("markConfirmed", err);
+          }
           const result = { newDeviceId: pinned.newDeviceId, certId: leafCert.certId };
           this.#terminate("done");
           return result;
