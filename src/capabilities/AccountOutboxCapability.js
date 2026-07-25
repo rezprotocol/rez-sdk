@@ -25,12 +25,13 @@ const T = REZ_CONTRACT_TYPES;
  *
  * Rides the generic request path like every other capability — no per-directive facade.
  *
- * STRICTNESS: every response discriminant is REQUIRED to be a boolean, enforced through the
- * shared `requireResponseBody` gate (src/util/responseBody.js — the SSOT for the convention:
- * return what the JSDoc promises, or throw). The alternative, an empty-object fallback, is
- * actively dangerous here — a missing `leased` would read as "nothing to lease" and a missing
- * `completed` as "the lease was lost", silently converting contract drift into a
- * plausible-but-wrong no-op that stalls revocation propagation.
+ * STRICTNESS: every response discriminant is REQUIRED to be a boolean, AND the payload the node
+ * guarantees on the true branch is required too — both through the shared `requireResponseBody`
+ * gate (src/util/responseBody.js — the SSOT for the convention: return what the JSDoc promises,
+ * or throw). An empty-object fallback would be actively dangerous here: a missing `leased` reads
+ * as "nothing to lease" and a missing `completed` as "the lease was lost", silently converting
+ * contract drift into a plausible-but-wrong no-op that stalls revocation propagation. Validating
+ * only the discriminant was not enough either — see the audit note on #send.
  */
 export class AccountOutboxCapability {
   #pool;
@@ -55,6 +56,14 @@ export class AccountOutboxCapability {
       // the lease owner from the session device.
       body: {},
       discriminant: "leased",
+      // OutboxLeaseClaimResponse guarantees the whole lease on the leased branch.
+      onTrue: {
+        token: "nonEmptyString",
+        anchorEpoch: "integer",
+        headEpoch: "integer",
+        leaseExpiresAtMs: "integer",
+        attempts: "integer",
+      },
     });
   }
 
@@ -76,6 +85,8 @@ export class AccountOutboxCapability {
       expectedResponseType: T.ACCOUNT_OUTBOX_LEASE_PREPARE_RES,
       body: { leaseToken: this.#requireToken("prepare", leaseToken) },
       discriminant: "prepared",
+      // The FROZEN epoch is the whole point of prepare — a prepared lease without one is drift.
+      onTrue: { anchorEpoch: "integer", headEpoch: "integer" },
     });
   }
 
@@ -115,6 +126,13 @@ export class AccountOutboxCapability {
       expectedResponseType: T.ACCOUNT_OUTBOX_LEASE_FAIL_RES,
       body: { leaseToken: this.#requireToken("fail", leaseToken) },
       discriminant: "recorded",
+      onTrue: {
+        attemptedEpoch: "integer",
+        anchorEpoch: "integer",
+        attempts: "integer",
+        backoffMs: "integer",
+        blocked: "boolean",
+      },
     });
   }
 
@@ -145,6 +163,9 @@ export class AccountOutboxCapability {
       expectedResponseType: T.ACCOUNT_OUTBOX_LEASE_COMPLETE_RES,
       body: { leaseToken: token, record },
       discriminant: "completed",
+      // The watermark the caller records as "published through". Without it a completed
+      // publication cannot be told from a lost lease.
+      onTrue: { doneThroughEpoch: "integer" },
     });
   }
 
@@ -160,15 +181,22 @@ export class AccountOutboxCapability {
     return leaseToken;
   }
 
-  async #send({ op, type, expectedResponseType, body, discriminant }) {
+  /**
+   * @param {object} args
+   * @param {string} args.discriminant — the boolean every branch of the caller's logic turns on
+   * @param {Record<string,string>} [args.onTrue] — fields the node's response record guarantees
+   *     WHEN the discriminant is true (see the audit note below)
+   */
+  async #send({ op, type, expectedResponseType, body, discriminant, onTrue = null }) {
     const response = await this.#pool.sendRequest({ type, body, expectedResponseType });
-    // The discriminant is the ONE field every branch of the caller's logic turns on, so it is the
-    // one the contract gate must prove. The remaining fields are guarded by their presence on the
-    // true branch of the node's response record.
-    return requireResponseBody({
-      op: "AccountOutboxCapability." + op,
-      response,
-      require: { [discriminant]: "boolean" },
-    });
+    const opName = "AccountOutboxCapability." + op;
+    const result = requireResponseBody({ op: opName, response, require: { [discriminant]: "boolean" } });
+    if (result[discriminant] !== true || onTrue === null) return result;
+    // AUDIT FIX: validating the discriminant ALONE was not enough. The node's response records
+    // guarantee a payload on the true branch, but a drifted `{prepared: true}` with no headEpoch
+    // left the drain worker comparing against undefined — which reads as "the head advanced",
+    // so it released the lease and re-claimed until it burned its entire cycle budget, silently,
+    // instead of failing. A true discriminant with a missing payload is drift like any other.
+    return requireResponseBody({ op: opName, response, require: onTrue });
   }
 }

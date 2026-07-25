@@ -201,3 +201,39 @@ test("RezClient exposes an accountOutbox capability", () => {
   });
   assert.ok(client.accountOutbox instanceof AccountOutboxCapability);
 });
+
+// ---- audit remediation: a TRUE discriminant with a missing payload is drift too ----
+
+test("a leased/prepared/completed response missing its payload THROWS", async () => {
+  // Found by auditing the drain worker: `{prepared: true}` with no headEpoch left the worker
+  // comparing the home's epoch against undefined, which reads as "the head advanced" — so it
+  // released the lease and re-claimed until it burned its whole cycle budget, publishing nothing
+  // and reporting no error. A true discriminant must carry the payload the node guarantees.
+  const cases = [
+    ["claim", {}, { leased: true }, /missing the required 'token' non-empty string/],
+    ["claim", {}, { leased: true, token: TOKEN, anchorEpoch: 1, leaseExpiresAtMs: 0, attempts: 0 }, /missing the required 'headEpoch' integer/],
+    ["prepare", { leaseToken: TOKEN }, { prepared: true, anchorEpoch: 4 }, /missing the required 'headEpoch' integer/],
+    ["fail", { leaseToken: TOKEN }, { recorded: true, attemptedEpoch: 6, anchorEpoch: 6, attempts: 1, backoffMs: 0 }, /missing the required 'blocked' boolean/],
+    ["complete", { leaseToken: TOKEN, record: { v: 2 } }, { completed: true }, /missing the required 'doneThroughEpoch' integer/],
+  ];
+  for (const [op, args, body, expected] of cases) {
+    const cap = new AccountOutboxCapability({ pool: makePool(body) });
+    await assert.rejects(() => cap[op](args), expected, op + " must reject a payload-less success");
+  }
+});
+
+test("the FALSE branch carries no payload and must stay accepted", async () => {
+  // The mirror of the rule above: `{leased: false}` legitimately has no token, and requiring one
+  // unconditionally would break the single most common response in the whole protocol.
+  const claim = new AccountOutboxCapability({ pool: makePool({ leased: false }) });
+  assert.deepEqual(await claim.claim(), { leased: false });
+
+  const prepare = new AccountOutboxCapability({ pool: makePool({ prepared: false }) });
+  assert.deepEqual(await prepare.prepare({ leaseToken: TOKEN }), { prepared: false });
+
+  const fail = new AccountOutboxCapability({ pool: makePool({ recorded: false }) });
+  assert.deepEqual(await fail.fail({ leaseToken: TOKEN }), { recorded: false });
+
+  const complete = new AccountOutboxCapability({ pool: makePool({ completed: false }) });
+  assert.deepEqual(await complete.complete({ leaseToken: TOKEN, record: { v: 2 } }), { completed: false });
+});
