@@ -12,6 +12,7 @@ import { DevicesCapability } from "../capabilities/DevicesCapability.js";
 import { AccountOutboxCapability } from "../capabilities/AccountOutboxCapability.js";
 import { MeshCapability } from "../capabilities/MeshCapability.js";
 import { bytesToBase64, base64ToBytes } from "../util/bytes.js";
+import { requireResponseBody } from "../util/responseBody.js";
 import { buildRezClientRuntime } from "./buildRezClientRuntime.js";
 import { RezPayloadSendParams } from "./RezPayloadSendParams.js";
 
@@ -304,7 +305,14 @@ export class RezClient {
       },
       expectedResponseType: T.MAILBOX_DEPOSIT_RES,
     });
-    const body = response && typeof response.body === "object" ? response.body : {};
+    // Same MAILBOX_DEPOSIT_RES contract MailboxCapability.deposit is pinned to: mailboxId always,
+    // eventId present but empty on the queued branch. The `||` defaults below are for that queued
+    // case, NOT for a missing response — drift now throws before it can look like a delivery.
+    const body = requireResponseBody({
+      op: "RezClient.sendPayload",
+      response,
+      require: { mailboxId: "nonEmptyString", eventId: "string" },
+    });
     return {
       mailboxId: body.mailboxId || params.deliverInboxId,
       eventId: body.eventId || null,

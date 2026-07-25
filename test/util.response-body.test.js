@@ -139,3 +139,26 @@ test("failure messages never interpolate a response VALUE", () => {
   assert.equal(message.includes("yes"), false, "offending value must not appear in the message");
   assert.ok(message.includes("leased"), "field name is what the developer needs");
 });
+
+test("nullableObject accepts an object OR null, but the key must be PRESENT", () => {
+  // The contract for record.get (not-found) and node.status (meshing off): null is an ANSWER,
+  // an absent key is drift. Collapsing the two is exactly what this convention exists to stop.
+  assert.equal(
+    requireResponseBody({ op: OP, response: { body: { record: null } }, require: { record: "nullableObject" } }).record,
+    null,
+  );
+  const found = { record: { k: 1 } };
+  assert.equal(requireResponseBody({ op: OP, response: { body: found }, require: { record: "nullableObject" } }), found);
+
+  assert.throws(
+    () => requireResponseBody({ op: OP, response: { body: {} }, require: { record: "nullableObject" } }),
+    /missing the required 'record' object or null/,
+  );
+  for (const bad of [[], "null", 0, false]) {
+    assert.throws(
+      () => requireResponseBody({ op: OP, response: { body: { record: bad } }, require: { record: "nullableObject" } }),
+      /missing the required 'record' object or null/,
+      JSON.stringify(bad) + " must not satisfy nullableObject",
+    );
+  }
+});

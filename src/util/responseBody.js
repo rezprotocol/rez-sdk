@@ -36,6 +36,10 @@ const TYPE_CHECKS = {
   number: (v) => typeof v === "number" && Number.isFinite(v),
   integer: (v) => Number.isInteger(v),
   object: (v) => v !== null && typeof v === "object" && !Array.isArray(v),
+  // A field whose contract is "an object, or explicitly null" — e.g. record.get answering
+  // not-found, or node.status on a mesh-less node. The KEY must still be present: an absent key
+  // is drift, a null value is an answer. Distinguishing those is the whole point.
+  nullableObject: (v) => v === null || (typeof v === "object" && !Array.isArray(v)),
   array: (v) => Array.isArray(v),
 };
 
@@ -47,6 +51,7 @@ const TYPE_LABELS = {
   number: "finite number",
   integer: "integer",
   object: "object",
+  nullableObject: "object or null",
   array: "array",
 };
 

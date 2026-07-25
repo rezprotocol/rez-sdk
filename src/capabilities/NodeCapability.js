@@ -1,4 +1,5 @@
 import { REZ_CONTRACT_TYPES } from "@rezprotocol/core";
+import { requireResponseBody } from "../util/responseBody.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -21,6 +22,13 @@ export class NodeCapability {
       tryAllUplinks,
       continueOnCodes,
     });
-    return response && typeof response.body === "object" ? response.body : {};
+    // Pinned against MeshStatusHandler, which always sends { node, mesh, peers } — `mesh` is null
+    // on a node with meshing off, which is an answer, not an absence. (Note: the NodeStatusResponse
+    // record class describes a DIFFERENT, older shape and is not what this op sends.)
+    return requireResponseBody({
+      op: "NodeCapability.status",
+      response,
+      require: { node: "object", mesh: "nullableObject", peers: "array" },
+    });
   }
 }

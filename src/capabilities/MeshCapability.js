@@ -102,6 +102,13 @@ export class MeshCapability {
     return this.#durableRecords.put({ record: o.record });
   }
 
+  /**
+   * DEAD OP — kept as-is pending a decision, do not build on it. `T.NODE_MESH_STATUS` is not
+   * defined in rez-core and no rez-node handler implements it, so this call resolves `type` to
+   * undefined and the transport throws BAD_REQUEST ("type required") before anything is sent.
+   * The only mesh-status consumer (rez-chat ServerConnectionService.getMeshStatus) never calls
+   * this — it uses `sdk.node.status()`. Either wire up the op or delete the method.
+   */
   async getMeshStatus({ timeoutMs = 5000, tryAllUplinks = true, continueOnCodes = [] } = {}) {
     const response = await this.#pool.sendRequest({
       type: T.NODE_MESH_STATUS,
@@ -111,6 +118,8 @@ export class MeshCapability {
       tryAllUplinks,
       continueOnCodes,
     });
-    return response && typeof response.body === "object" ? response.body : {};
+    // Shape-only: this op has no pinnable field list because no node implements it — see the
+    // note on getMeshStatus above. The gate still keeps it consistent with every sibling.
+    return requireResponseBody({ op: "MeshCapability.getMeshStatus", response });
   }
 }
