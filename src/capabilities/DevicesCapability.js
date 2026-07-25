@@ -1,4 +1,5 @@
 import { REZ_CONTRACT_TYPES } from "@rezprotocol/core";
+import { requireResponseBody } from "../util/responseBody.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -60,7 +61,12 @@ export class DevicesCapability {
       },
       expectedResponseType: T.DEVICE_BIND_RES,
     });
-    return response && typeof response.body === "object" ? response.body : {};
+    // Pinned against the node's DeviceBindResponse: both fields are asserted non-empty there.
+    return requireResponseBody({
+      op: "DevicesCapability.bind",
+      response,
+      require: { inboxId: "nonEmptyString", deviceId: "nonEmptyString" },
+    });
   }
 
   /**
@@ -85,7 +91,21 @@ export class DevicesCapability {
       body: { mutation: body },
       expectedResponseType: T.ACCOUNT_DEVICE_MUTATION_SUBMIT_RES,
     });
-    return response && typeof response.body === "object" ? response.body : {};
+    // Two legitimate shapes, both pinned against PgAccountMutationSerializer.submit: the STALE
+    // snapshot names `currentRevision`, while every applied / no-op / idempotent-replay shape
+    // names `revision`. Both always carry the committed state (devices + authorityState).
+    //
+    // This is the site the empty-object fallback hurt most: a `{}` left `stale` undefined, so the
+    // caller neither retried nor threw, and propagation then ran with a fabricated revision and a
+    // null authorityState — a revocation that silently never published.
+    const result = requireResponseBody({ op: "DevicesCapability.submitDeviceMutation", response });
+    return requireResponseBody({
+      op: "DevicesCapability.submitDeviceMutation",
+      response,
+      require: result.stale === true
+        ? { currentRevision: "integer", devices: "array", authorityState: "object" }
+        : { revision: "integer", devices: "array", authorityState: "object" },
+    });
   }
 
   /**
@@ -109,7 +129,16 @@ export class DevicesCapability {
       body,
       expectedResponseType: T.ACCOUNT_AUTHORITY_STATE_GET_RES,
     });
-    return response && typeof response.body === "object" ? response.body : {};
+    // Pinned against PgAccountMutationSerializer.getAuthorityState, which always returns all
+    // three (an unknown account yields the explicit zero state, never a partial one). A `{}` here
+    // used to read as epoch 0 — i.e. "this account has never mutated" — which would submit the
+    // next mutation against a stale expectedRevision and publish an authority state that
+    // un-revokes every revoked cert.
+    return requireResponseBody({
+      op: "DevicesCapability.getAuthorityState",
+      response,
+      require: { epoch: "integer", revokedCertIds: "array", minValidIssuedAtMs: "number" },
+    });
   }
 
   /**
@@ -131,7 +160,13 @@ export class DevicesCapability {
       body: { bundle: body },
       expectedResponseType: T.ACCOUNT_DEVICE_BUNDLE_PUBLISH_RES,
     });
-    return response && typeof response.body === "object" ? response.body : {};
+    // Pinned against AccountDeviceBundleHandler.handlePublish, which builds all three fields
+    // explicitly (`applied` is already normalized to a strict boolean there).
+    return requireResponseBody({
+      op: "DevicesCapability.publishDeviceBundle",
+      response,
+      require: { deviceId: "nonEmptyString", prekeyVersion: "integer", applied: "boolean" },
+    });
   }
 
   /**
@@ -154,7 +189,15 @@ export class DevicesCapability {
       body,
       expectedResponseType: T.ACCOUNT_DEVICE_SET_GET_RES,
     });
-    const b = response && typeof response.body === "object" ? response.body : {};
-    return { devices: Array.isArray(b.devices) ? b.devices : [] };
+    // `devices` is REQUIRED, not defaulted. The old `Array.isArray(b.devices) ? b.devices : []`
+    // turned drift into "this account has no other devices" — the silent single-device downgrade
+    // that multi-device fan-out must never take. An account with one device gets [] from the node
+    // explicitly; that stays a valid answer.
+    const b = requireResponseBody({
+      op: "DevicesCapability.getAccountDeviceSet",
+      response,
+      require: { devices: "array" },
+    });
+    return { devices: b.devices };
   }
 }

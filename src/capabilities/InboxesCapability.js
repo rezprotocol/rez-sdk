@@ -1,4 +1,5 @@
 import { REZ_CONTRACT_TYPES } from "@rezprotocol/core";
+import { requireResponseBody } from "../util/responseBody.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -45,7 +46,14 @@ export class InboxesCapability {
       },
       expectedResponseType: T.INBOX_CLAIM_RES,
     });
-    const body = response && typeof response.body === "object" ? response.body : {};
+    // The echoed inboxId is the field this ceremony turns on, so it must be PRESENT before it can
+    // be COMPARED. Under the old fallback a null body returned null (typeof null === "object"),
+    // and the mismatch check below then threw a TypeError instead of naming the real fault.
+    const body = requireResponseBody({
+      op: "InboxesCapability.claimInbox",
+      response,
+      require: { inboxId: "nonEmptyString" },
+    });
     if (body.inboxId !== claim.inboxId) {
       throw new Error("inbox.claim response inboxId mismatch: expected " + claim.inboxId + ", got " + body.inboxId);
     }
@@ -74,7 +82,11 @@ export class InboxesCapability {
       },
       expectedResponseType: T.INBOX_CLAIM_RES,
     });
-    const body = response && typeof response.body === "object" ? response.body : {};
+    const body = requireResponseBody({
+      op: "InboxesCapability.reattestInbox",
+      response,
+      require: { inboxId: "nonEmptyString" },
+    });
     if (body.inboxId !== attestation.inboxId) {
       throw new Error("inbox.claim response inboxId mismatch: expected " + attestation.inboxId + ", got " + body.inboxId);
     }

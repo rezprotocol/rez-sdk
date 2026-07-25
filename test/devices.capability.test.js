@@ -255,3 +255,87 @@ test("RezClient exposes a devices capability", () => {
   });
   assert.ok(client.devices instanceof DevicesCapability);
 });
+
+// ---- response-contract gate (leaf 2): drift throws, it never becomes a plausible answer ----
+
+test("submitDeviceMutation THROWS on an empty body instead of reading as an applied mutation", async () => {
+  // The F3 failure this closes: `{}` left `stale` undefined, so ServerAccountMutationService
+  // neither retried nor threw and went on to propagate with a fabricated revision of 1 and a
+  // null authorityState — a revocation that silently never published.
+  const cap = new DevicesCapability({ pool: { async sendRequest() { return { body: {} }; } } });
+  const mutation = { toJSON: () => ({ v: 1 }) };
+  await assert.rejects(
+    () => cap.submitDeviceMutation({ mutation }),
+    /DevicesCapability\.submitDeviceMutation: response is missing the required 'revision' integer/,
+  );
+});
+
+test("submitDeviceMutation accepts BOTH legitimate shapes and requires the right key in each", async () => {
+  const applied = { revision: 4, devices: [], authorityState: { epoch: 4, revokedCertIds: [], minValidIssuedAtMs: 0 } };
+  const stale = { stale: true, currentRevision: 9, devices: [], authorityState: { epoch: 9, revokedCertIds: [], minValidIssuedAtMs: 0 } };
+  const mutation = { toJSON: () => ({ v: 1 }) };
+
+  for (const body of [applied, stale]) {
+    const cap = new DevicesCapability({ pool: { async sendRequest() { return { body }; } } });
+    assert.equal(await cap.submitDeviceMutation({ mutation }), body, "returned verbatim");
+  }
+
+  // A stale snapshot that forgot currentRevision is drift — it must not pass by virtue of the
+  // `revision` requirement not applying to it.
+  const brokenStale = new DevicesCapability({
+    pool: { async sendRequest() { return { body: { stale: true, devices: [], authorityState: {} } }; } },
+  });
+  await assert.rejects(() => brokenStale.submitDeviceMutation({ mutation }), /missing the required 'currentRevision' integer/);
+
+  // An applied shape missing the committed state is drift too.
+  const noState = new DevicesCapability({
+    pool: { async sendRequest() { return { body: { revision: 4 } }; } },
+  });
+  await assert.rejects(() => noState.submitDeviceMutation({ mutation }), /missing the required 'devices' array/);
+});
+
+test("getAuthorityState THROWS rather than reporting epoch 0 for a drifted response", async () => {
+  // "epoch 0" means "this account has never mutated": it would submit the next mutation against a
+  // stale expectedRevision and publish an authority state that un-revokes every revoked cert.
+  const cap = new DevicesCapability({ pool: { async sendRequest() { return { body: {} }; } } });
+  await assert.rejects(() => cap.getAuthorityState(), /missing the required 'epoch' integer/);
+
+  const partial = new DevicesCapability({
+    pool: { async sendRequest() { return { body: { epoch: 3, minValidIssuedAtMs: 0 } }; } },
+  });
+  await assert.rejects(() => partial.getAuthorityState(), /missing the required 'revokedCertIds' array/);
+
+  // The explicit zero state IS a real answer and must still pass.
+  const zero = new DevicesCapability({
+    pool: { async sendRequest() { return { body: { epoch: 0, revokedCertIds: [], minValidIssuedAtMs: 0 } }; } },
+  });
+  assert.deepEqual(await zero.getAuthorityState(), { epoch: 0, revokedCertIds: [], minValidIssuedAtMs: 0 });
+});
+
+test("getAccountDeviceSet THROWS on a missing devices array — no silent single-device downgrade", async () => {
+  const cap = new DevicesCapability({ pool: { async sendRequest() { return { body: {} }; } } });
+  await assert.rejects(() => cap.getAccountDeviceSet(), /missing the required 'devices' array/);
+
+  // An account that genuinely has no other devices answers with an explicit [] — still valid.
+  const empty = new DevicesCapability({ pool: { async sendRequest() { return { body: { devices: [] } }; } } });
+  assert.deepEqual(await empty.getAccountDeviceSet(), { devices: [] });
+});
+
+test("bind and publishDeviceBundle require every field they promise", async () => {
+  const noDeviceId = new DevicesCapability({ pool: { async sendRequest() { return { body: { inboxId: "inbox:abc" } }; } } });
+  await assert.rejects(
+    () => noDeviceId.bind({ deviceInboxBinding: { toJSON: () => ({ v: 1 }) } }),
+    /DevicesCapability\.bind: response is missing the required 'deviceId' non-empty string/,
+  );
+
+  const noApplied = new DevicesCapability({
+    pool: { async sendRequest() { return { body: { deviceId: "rez:dev:x", prekeyVersion: 3 } }; } },
+  });
+  await assert.rejects(() => noApplied.publishDeviceBundle({ bundle: { v: 1 } }), /missing the required 'applied' boolean/);
+
+  // applied:false is a real answer (an older prekeyVersion was not applied), not an absence.
+  const notApplied = new DevicesCapability({
+    pool: { async sendRequest() { return { body: { deviceId: "rez:dev:x", prekeyVersion: 3, applied: false } }; } },
+  });
+  assert.equal((await notApplied.publishDeviceBundle({ bundle: { v: 1 } })).applied, false);
+});

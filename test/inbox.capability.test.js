@@ -157,3 +157,26 @@ test("listClaimed proxies to InboxClaimStore.listRedacted", async () => {
     assert.equal(entry.claimantPrivateKeyB64, undefined);
   }
 });
+
+// ---- response-contract gate (leaf 2) ----
+
+test("claimInbox names the contract fault on a drifted response instead of throwing a TypeError", async () => {
+  const { claimStore } = await makeCapability();
+  // A null body used to slip through the `typeof null === "object"` guard and return null, so the
+  // inboxId comparison below it threw a TypeError far from the actual cause.
+  const nullBody = new InboxesCapability({ pool: makeFakePool(async () => ({ body: null })), claimStore });
+  await assert.rejects(() => nullBody.claimInbox(), /InboxesCapability\.claimInbox: node returned no response body/);
+
+  const { claimStore: store2 } = await makeCapability();
+  const noInbox = new InboxesCapability({ pool: makeFakePool(async () => ({ body: { claimedAtMs: 1 } })), claimStore: store2 });
+  await assert.rejects(() => noInbox.claimInbox(), /missing the required 'inboxId' non-empty string/);
+});
+
+test("claimInbox still reports a genuine inboxId MISMATCH as a mismatch, not as drift", async () => {
+  const { claimStore } = await makeCapability();
+  const wrong = new InboxesCapability({
+    pool: makeFakePool(async () => ({ body: { inboxId: "inbox:" + "f".repeat(24), claimedAtMs: 1 } })),
+    claimStore,
+  });
+  await assert.rejects(() => wrong.claimInbox(), /response inboxId mismatch/);
+});
