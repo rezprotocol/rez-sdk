@@ -23,7 +23,7 @@ function makePool(bodies) {
 }
 
 test("claim sends ACCOUNT_OUTBOX_LEASE_CLAIM with an empty body and returns the lease", async () => {
-  const lease = { leased: true, token: TOKEN, anchorEpoch: 4, headEpoch: 6, leaseExpiresAtMs: 1_700_000_030_000, attempts: 0 };
+  const lease = { leased: true, awaitingRootSignature: false, token: TOKEN, anchorEpoch: 4, headEpoch: 6, leaseExpiresAtMs: 1_700_000_030_000, attempts: 0 };
   const pool = makePool(lease);
   const cap = new AccountOutboxCapability({ pool });
 
@@ -39,11 +39,31 @@ test("claim sends ACCOUNT_OUTBOX_LEASE_CLAIM with an empty body and returns the 
 });
 
 test("claim returns { leased: false } verbatim — nothing to publish is not an error", async () => {
-  const pool = makePool({ leased: false });
+  const pool = makePool({ leased: false, awaitingRootSignature: false });
   const cap = new AccountOutboxCapability({ pool });
   const res = await cap.claim();
-  assert.deepEqual(res, { leased: false });
+  assert.deepEqual(res, { leased: false, awaitingRootSignature: false });
   assert.equal("token" in res, false, "no lease, no token");
+});
+
+test("claim surfaces AWAITING-ROOT-SIGNATURE as its own state, not as nothing-to-publish", async () => {
+  // Since the P0 fix the authority state is root-signed only, so a delegated session cannot author
+  // the publication and the node refuses it the lease outright (taking none, so nothing is counted
+  // as a failed attempt). The two not-leased answers mean different things and the caller has to be
+  // able to tell them apart: one is the steady state, the other means revocations are stuck until a
+  // primary session runs.
+  const pool = makePool({ leased: false, awaitingRootSignature: true });
+  const res = await new AccountOutboxCapability({ pool }).claim();
+  assert.deepEqual(res, { leased: false, awaitingRootSignature: true });
+});
+
+test("claim REQUIRES awaitingRootSignature on both branches — absent is drift, not false", async () => {
+  // Absence and false must not be indistinguishable: a caller deciding whether to tell the user
+  // their primary device needs to come online would silently get "no" from a drifted node.
+  for (const body of [{ leased: false }, { leased: true, token: TOKEN, anchorEpoch: 1, headEpoch: 1, leaseExpiresAtMs: 0, attempts: 0 }]) {
+    const cap = new AccountOutboxCapability({ pool: makePool(body) });
+    await assert.rejects(() => cap.claim(), /missing the required 'awaitingRootSignature' boolean/);
+  }
 });
 
 test("prepare sends the token verbatim and returns the FROZEN epoch", async () => {
@@ -210,8 +230,8 @@ test("a leased/prepared/completed response missing its payload THROWS", async ()
   // released the lease and re-claimed until it burned its whole cycle budget, publishing nothing
   // and reporting no error. A true discriminant must carry the payload the node guarantees.
   const cases = [
-    ["claim", {}, { leased: true }, /missing the required 'token' non-empty string/],
-    ["claim", {}, { leased: true, token: TOKEN, anchorEpoch: 1, leaseExpiresAtMs: 0, attempts: 0 }, /missing the required 'headEpoch' integer/],
+    ["claim", {}, { leased: true, awaitingRootSignature: false }, /missing the required 'token' non-empty string/],
+    ["claim", {}, { leased: true, awaitingRootSignature: false, token: TOKEN, anchorEpoch: 1, leaseExpiresAtMs: 0, attempts: 0 }, /missing the required 'headEpoch' integer/],
     ["prepare", { leaseToken: TOKEN }, { prepared: true, anchorEpoch: 4 }, /missing the required 'headEpoch' integer/],
     ["fail", { leaseToken: TOKEN }, { recorded: true, attemptedEpoch: 6, anchorEpoch: 6, attempts: 1, backoffMs: 0 }, /missing the required 'blocked' boolean/],
     ["complete", { leaseToken: TOKEN, record: { v: 2 } }, { completed: true }, /missing the required 'doneThroughEpoch' integer/],
@@ -225,8 +245,8 @@ test("a leased/prepared/completed response missing its payload THROWS", async ()
 test("the FALSE branch carries no payload and must stay accepted", async () => {
   // The mirror of the rule above: `{leased: false}` legitimately has no token, and requiring one
   // unconditionally would break the single most common response in the whole protocol.
-  const claim = new AccountOutboxCapability({ pool: makePool({ leased: false }) });
-  assert.deepEqual(await claim.claim(), { leased: false });
+  const claim = new AccountOutboxCapability({ pool: makePool({ leased: false, awaitingRootSignature: false }) });
+  assert.deepEqual(await claim.claim(), { leased: false, awaitingRootSignature: false });
 
   const prepare = new AccountOutboxCapability({ pool: makePool({ prepared: false }) });
   assert.deepEqual(await prepare.prepare({ leaseToken: TOKEN }), { prepared: false });

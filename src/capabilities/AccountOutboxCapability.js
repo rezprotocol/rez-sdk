@@ -41,11 +41,21 @@ export class AccountOutboxCapability {
   }
 
   /**
-   * Claim the account's publication lease. Returns the server-minted lease, or
-   * `{ leased: false }` when there is nothing publishable, another device holds the lease, or
-   * the head is backing off after a failed attempt.
+   * Claim the account's publication lease. Returns the server-minted lease, or a not-leased answer
+   * whose `awaitingRootSignature` says WHICH kind it is:
    *
-   * @returns {Promise<{ leased: boolean, token?: string, anchorEpoch?: number, headEpoch?: number, leaseExpiresAtMs?: number, attempts?: number }>}
+   *   - `{ leased: false, awaitingRootSignature: false }` — nothing publishable, another device
+   *     holds the lease, or the head is backing off. Come back later.
+   *   - `{ leased: false, awaitingRootSignature: true }`  — an obligation exists, but this session
+   *     is delegated and the authority state is root-signed only, so only a primary (account-root)
+   *     session can discharge it. The node takes NO lease in this case, so nothing is counted as a
+   *     failed attempt and the head stays immediately claimable.
+   *
+   * `awaitingRootSignature` is required on every claim response, not optional: absent and false
+   * would otherwise be indistinguishable to a caller deciding whether to tell the user that their
+   * primary device needs to come online.
+   *
+   * @returns {Promise<{ leased: boolean, awaitingRootSignature: boolean, token?: string, anchorEpoch?: number, headEpoch?: number, leaseExpiresAtMs?: number, attempts?: number }>}
    */
   async claim() {
     return this.#send({
@@ -56,6 +66,8 @@ export class AccountOutboxCapability {
       // the lease owner from the session device.
       body: {},
       discriminant: "leased",
+      // Present on BOTH branches, so it is required regardless of the discriminant.
+      always: { awaitingRootSignature: "boolean" },
       // OutboxLeaseClaimResponse guarantees the whole lease on the leased branch.
       onTrue: {
         token: "nonEmptyString",
@@ -184,13 +196,19 @@ export class AccountOutboxCapability {
   /**
    * @param {object} args
    * @param {string} args.discriminant — the boolean every branch of the caller's logic turns on
+   * @param {Record<string,string>} [args.always] — fields the node's response record guarantees on
+   *     EVERY branch, checked alongside the discriminant
    * @param {Record<string,string>} [args.onTrue] — fields the node's response record guarantees
    *     WHEN the discriminant is true (see the audit note below)
    */
-  async #send({ op, type, expectedResponseType, body, discriminant, onTrue = null }) {
+  async #send({ op, type, expectedResponseType, body, discriminant, always = null, onTrue = null }) {
     const response = await this.#pool.sendRequest({ type, body, expectedResponseType });
     const opName = "AccountOutboxCapability." + op;
-    const result = requireResponseBody({ op: opName, response, require: { [discriminant]: "boolean" } });
+    const result = requireResponseBody({
+      op: opName,
+      response,
+      require: always === null ? { [discriminant]: "boolean" } : { [discriminant]: "boolean", ...always },
+    });
     if (result[discriminant] !== true || onTrue === null) return result;
     // AUDIT FIX: validating the discriminant ALONE was not enough. The node's response records
     // guarantee a payload on the true branch, but a drifted `{prepared: true}` with no headEpoch
