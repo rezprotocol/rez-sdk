@@ -899,14 +899,27 @@ export class PeerLinkService {
     }
     const at = asPositiveInt(nowMs, this.clock());
     const cutoff = Number.isFinite(Number(minValidIssuedAtMs)) && Number(minValidIssuedAtMs) >= 0 ? Number(minValidIssuedAtMs) : 0;
-    const delegated = this.#hasAdminRoot === false;
-    const signerInfo = delegated
-      ? await this._resolveDelegatedAccountIdentitySigner(owner)
-      : await this._resolveAccountIdentitySigner(owner);
+    // ROOT-SIGNED ONLY (audit P0, 2026-07-26). This record decides WHO IS AUTHORIZED, so a
+    // delegated device must not author it — a revoked device still holds its key and its
+    // now-revoked cert, and could otherwise sign a newer snapshot omitting itself. The verifier
+    // enforces the same rule structurally (ROOT_SIGNED_ONLY_RECORD_KINDS); refusing here too means
+    // a delegated session fails at the point of AUTHORSHIP with a usable error, instead of minting
+    // a record every peer will reject.
+    //
+    // Delegated devices still PUBLISH this record — they just publish one the primary signed.
+    if (this.#hasAdminRoot === false) {
+      const err = new Error(
+        "buildAccountAuthorityStateRecord requires the account root key: the authority state is"
+          + " root-signed only, so a delegated device cannot author it (it may publish one the"
+          + " primary signed)",
+      );
+      err.code = "AUTHORITY_STATE_REQUIRES_ROOT";
+      throw err;
+    }
+    const signerInfo = await this._resolveAccountIdentitySigner(owner);
     const accountPublicKeyB64 = signerInfo.accountPublicKeyB64;
-    // The inner record signer: C in cert-mode (same-signer binding), B in direct.
-    const innerSign = delegated ? signerInfo.setSign : signerInfo.accountSign;
-    const envelopeSignerPublicKeyB64 = delegated ? signerInfo.signerPublicKeyB64 : accountPublicKeyB64;
+    const innerSign = signerInfo.accountSign;
+    const envelopeSignerPublicKeyB64 = accountPublicKeyB64;
 
     // Build + sign the inner AccountAuthorityStateV1 (certIds normalized to match
     // the record's canonical, order-independent signable form).
@@ -930,8 +943,10 @@ export class PeerLinkService {
       recordId: "v1",
       ownerPublicKeyB64: accountPublicKeyB64,
       signerPublicKeyB64: envelopeSignerPublicKeyB64,
-      certChain: delegated ? signerInfo.certChain : [],
-      requiredCapability: delegated ? DEVICE_SET_PUBLISH_CAPABILITY : null,
+      // Root-signed only: never a chain, never a delegated capability. The verifier rejects both
+      // for this kind, so emitting either would only produce a record no peer accepts.
+      certChain: [],
+      requiredCapability: null,
       payloadB64,
       issuedAtMs: at,
       expiresAtMs: at + ttlMs,

@@ -272,27 +272,26 @@ test("S11: ingest REJECTS a delegated set whose leaf cert is revoked (revocation
   assert.equal(ok.established.length, 1, "an unrevoked delegated set still establishes");
 });
 
-test("S11: authority-state record round-trips (delegated publisher → peer opens → revocationState)", async () => {
+test("AUDIT P0: a delegated device REFUSES to author the authority state (root-signed only)", async () => {
+  // This test previously asserted the opposite — "delegated: C signs the envelope" — which is the
+  // vulnerability the 2026-07-26 audit found. The authority state decides WHO IS AUTHORIZED, so a
+  // revoked device that still held its key and cert could sign a newer snapshot omitting itself and
+  // un-revoke itself for every off-home peer.
+  //
+  // Authorship is now root-only. A delegated device still PUBLISHES this record; it just publishes
+  // one the primary signed. Failing at authorship gives a usable error instead of minting a record
+  // every peer would reject.
   const crypto = new BrowserCryptoProvider();
   const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice", delegated: true });
   const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
   await crossLink(alice, bob, { aLinkId: "pl_a_b", bLinkId: "pl_b_a" });
 
-  const goneA = "rez:cap:" + "a".repeat(64);
-  const goneB = "rez:cap:" + "b".repeat(64);
-  const { record, recordKind, recordId, publisherPublicKeyB64 } = await alice.svc.buildAccountAuthorityStateRecord({
-    epoch: 3, revokedCertIds: [goneB, goneA], minValidIssuedAtMs: 111, nowMs: 5,
-  });
-  assert.equal(recordKind, "account-authority-state");
-  assert.equal(recordId, "v1");
-  assert.equal(record.ownerPublicKeyB64, alice.accountPubB64, "owner is the account key B");
-  assert.equal(record.signerPublicKeyB64, alice.deviceKeyPair.publicKeyB64, "delegated: C signs the envelope");
-  assert.equal(publisherPublicKeyB64, alice.accountPubB64);
-
-  const { revocationState, epoch } = await bob.svc.openPeerAuthorityStateRecord({ peerAccountId: alice.accountId, record, nowMs: 6 });
-  assert.equal(epoch, 3);
-  assert.deepEqual(revocationState.revokedCertIds, [goneA, goneB], "sorted + deduped");
-  assert.equal(revocationState.minValidIssuedAtMs, 111);
+  await assert.rejects(
+    () => alice.svc.buildAccountAuthorityStateRecord({
+      epoch: 3, revokedCertIds: [], minValidIssuedAtMs: 111, nowMs: 5,
+    }),
+    (err) => err.code === "AUTHORITY_STATE_REQUIRES_ROOT",
+  );
 });
 
 test("S11: authority-state record round-trips in DIRECT mode (B signs inner + envelope)", async () => {
