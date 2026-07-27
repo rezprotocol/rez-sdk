@@ -6,9 +6,9 @@ import {
   DeviceInboxBindingV1,
   DEVICE_INBOX_BINDING_VERSION,
   DEVICE_INBOX_BINDING_PURPOSE,
-  AccountDeviceMutationV1,
-  ACCOUNT_DEVICE_MUTATION_VERSION,
-  ACCOUNT_DEVICE_MUTATION_PURPOSE,
+  AccountDeviceMutationV2,
+  ACCOUNT_DEVICE_MUTATION_V2_VERSION,
+  ACCOUNT_DEVICE_MUTATION_V2_PURPOSE,
   AccountAuthorityStateV1,
   ACCOUNT_AUTHORITY_STATE_VERSION,
   ACCOUNT_AUTHORITY_STATE_PURPOSE,
@@ -144,7 +144,7 @@ export async function buildSignedDeviceInboxBinding({ device, inboxId, nowMs, tt
 }
 
 /**
- * Build an AccountDeviceMutationV1 (S2.5 S11) and sign it with the SUBMITTING
+ * Build an AccountDeviceMutationV2 (S2.5 S11; V2 since audit #5) and sign it with the SUBMITTING
  * device's session key — dual-mode: a PRIMARY device signs with the account root
  * (signer == accountIdentityPublicKeyB64); a DELEGATED device signs with its own
  * device key C (signer != account). The home proves per-op authority from the
@@ -154,7 +154,7 @@ export async function buildSignedDeviceInboxBinding({ device, inboxId, nowMs, tt
  * current epoch.
  *
  * `signPayload` canonicalizes with the same `canonicalJSONStringify` that
- * `AccountDeviceMutationV1.signableBytes` uses, so the signature verifies against
+ * `AccountDeviceMutationV2.signableBytes` uses, so the signature verifies against
  * the bytes the home recomputes — no representation drift.
  *
  * @param {object} opts
@@ -163,10 +163,10 @@ export async function buildSignedDeviceInboxBinding({ device, inboxId, nowMs, tt
  * @param {string} opts.opId — idempotency key (non-empty)
  * @param {number} opts.expectedRevision — optimistic concurrency (int ≥ 0)
  * @param {"device.add"|"device.revoke"} opts.action
- * @param {object} opts.target — action-tagged (see AccountDeviceMutationV1)
+ * @param {object} opts.target — action-tagged (see AccountDeviceMutationV2)
  * @param {number} [opts.nowMs] — issuedAtMs (defaults to Date.now())
  * @param {number} [opts.ttlMs] — lifetime; expiresAtMs = issuedAtMs + ttlMs
- * @returns {Promise<AccountDeviceMutationV1>}
+ * @returns {Promise<AccountDeviceMutationV2>}
  */
 export async function buildSignedAccountDeviceMutation({ signer, accountIdentityPublicKeyB64, opId, expectedRevision, action, target, nowMs, ttlMs = DEFAULT_MUTATION_TTL_MS } = {}) {
   if (!signer || typeof signer.publicKeyB64 !== "string" || signer.publicKeyB64.length === 0) {
@@ -193,8 +193,8 @@ export async function buildSignedAccountDeviceMutation({ signer, accountIdentity
   const issuedAtMs = typeof nowMs === "number" && Number.isFinite(nowMs) ? nowMs : Date.now();
   const expiresAtMs = issuedAtMs + ttlMs;
   const body = {
-    v: ACCOUNT_DEVICE_MUTATION_VERSION,
-    purpose: ACCOUNT_DEVICE_MUTATION_PURPOSE,
+    v: ACCOUNT_DEVICE_MUTATION_V2_VERSION,
+    purpose: ACCOUNT_DEVICE_MUTATION_V2_PURPOSE,
     opId: opId.trim(),
     accountIdentityPublicKeyB64,
     expectedRevision,
@@ -205,7 +205,7 @@ export async function buildSignedAccountDeviceMutation({ signer, accountIdentity
     expiresAtMs,
   };
   const sigB64 = await signPayload({ privateKeyB64: signer.privateKeyB64, payload: body });
-  return new AccountDeviceMutationV1({ ...body, sig: { alg: "ed25519", sigB64 } });
+  return new AccountDeviceMutationV2({ ...body, sig: { alg: "ed25519", sigB64 } });
 }
 
 /**

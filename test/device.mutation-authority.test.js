@@ -5,7 +5,7 @@ import {
   DeviceRegistrationV1,
   DeviceInboxBindingV1,
   DEVICE_INBOX_BINDING_PURPOSE,
-  AccountDeviceMutationV1,
+  AccountDeviceMutationV2,
   AccountDeviceCapabilityV1,
   ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
   AccountAuthorityStateV1,
@@ -17,7 +17,7 @@ import {
 } from "../src/device/index.js";
 import { verifyPayload } from "../src/auth/signing.js";
 
-// S2.5 S11 L9: dual-mode AccountDeviceMutationV1 + AccountAuthorityStateV1
+// S2.5 S11 L9: dual-mode AccountDeviceMutationV2 (V2 since audit #5) + AccountAuthorityStateV1
 // builders. REAL WebCrypto — the produced signature must verify against the exact
 // bytes the record's signableBytes recomputes (no representation drift), proven by
 // verifying the signature over signableBytes, not a mock.
@@ -80,7 +80,7 @@ test("PRIMARY device.add mutation: account-signed, signer == account, verifies o
     nowMs: NOW,
   });
 
-  assert.ok(mutation instanceof AccountDeviceMutationV1);
+  assert.ok(mutation instanceof AccountDeviceMutationV2);
   assert.equal(mutation.accountIdentityPublicKeyB64, account.publicKeyB64);
   assert.equal(mutation.signerPublicKeyB64, account.publicKeyB64, "primary signs with the account key");
   assert.equal(mutation.action, "device.add");
@@ -88,7 +88,7 @@ test("PRIMARY device.add mutation: account-signed, signer == account, verifies o
 
   const ok = await verifyPayload({
     publicKeyB64: account.publicKeyB64,
-    payload: JSON.parse(new TextDecoder().decode(AccountDeviceMutationV1.signableBytes(mutation))),
+    payload: JSON.parse(new TextDecoder().decode(AccountDeviceMutationV2.signableBytes(mutation))),
     signatureB64: mutation.sig.sigB64,
   });
   assert.equal(ok, true, "signature verifies over the record's canonical signable bytes");
@@ -113,7 +113,7 @@ test("DELEGATED device.revoke mutation: device-signed, signer == device key C (n
 
   const ok = await verifyPayload({
     publicKeyB64: device.publicKeyB64,
-    payload: JSON.parse(new TextDecoder().decode(AccountDeviceMutationV1.signableBytes(mutation))),
+    payload: JSON.parse(new TextDecoder().decode(AccountDeviceMutationV2.signableBytes(mutation))),
     signatureB64: mutation.sig.sigB64,
   });
   assert.equal(ok, true);

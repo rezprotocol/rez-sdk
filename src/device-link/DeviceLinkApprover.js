@@ -241,8 +241,18 @@ export class DeviceLinkApprover {
             linkRequest: opened.linkRequest,
           };
         } catch (err) {
-          // An invalid record in the slot (an attacker without the psk cannot
-          // even sign one, so this is corruption/staleness) — keep polling.
+          // A VERSION mismatch is terminal, not noise (audit #5). The device-link ceremony has no
+          // handshake — the request arrives as a sealed record at a rendezvous coordinate, so
+          // nothing negotiated schema support beforehand and this is the first and only place the
+          // mismatch can be seen. Swallowing it here would leave the user watching a ceremony that
+          // silently times out, when the actionable truth is "the other device is too old to link
+          // safely". Surface it and stop.
+          if (err && err.code === "DEVICE_LINK_UPGRADE_REQUIRED") {
+            this.#terminate("failed");
+            throw err;
+          }
+          // Anything else: an invalid record in the slot (an attacker without the psk cannot even
+          // sign one, so this is corruption or staleness) — keep polling until the deadline.
         }
       }
       await this.#sleep(Math.min(interval, this.#pollMaxIntervalMs));
