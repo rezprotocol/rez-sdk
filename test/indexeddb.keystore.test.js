@@ -99,6 +99,9 @@ function createFakeIndexedDb() {
                       return undefined;
                     }, tx);
                   },
+                  getAllKeys() {
+                    return createRequest(() => [...store.keys()], tx);
+                  },
                 };
               },
             };
@@ -148,6 +151,68 @@ test("KeystoreStore default uses IndexedDB provider and persists envelope shape"
     await store.putKeystoreEnvelope(envelope);
     const saved = await store.getKeystoreEnvelope();
     assert.deepEqual(saved, envelope);
+  } finally {
+    globalThis.indexedDB = prev;
+  }
+});
+
+test("IndexedDbStorageProvider exposes owner-partitioned encrypted key-value stores", async () => {
+  const prev = globalThis.indexedDB;
+  globalThis.indexedDB = createFakeIndexedDb();
+  const cryptoProvider = {
+    randomBytes(length) {
+      return new Uint8Array(length).fill(7);
+    },
+    async aeadEncrypt({ key, nonce, plaintext, aad }) {
+      const out = new Uint8Array(plaintext.length);
+      for (let index = 0; index < plaintext.length; index += 1) {
+        out[index] = plaintext[index] ^ key[index % key.length] ^ nonce[0] ^ aad[index % aad.length];
+      }
+      return out;
+    },
+    async aeadDecrypt({ key, nonce, ciphertext, aad }) {
+      return this.aeadEncrypt({ key, nonce, plaintext: ciphertext, aad });
+    },
+  };
+  try {
+    const provider = new IndexedDbStorageProvider({
+      dbName: "rez-chat-runtime-test",
+      storeName: "runtime",
+      encryptionKey: new Uint8Array(32).fill(11),
+      cryptoProvider,
+    });
+    const alice = provider.getKeyValueStore("alice");
+    const bob = provider.getKeyValueStore("bob");
+    await alice.set("app:chat:thread/one", { plaintext: "secret message" });
+    await bob.set("app:chat:thread/one", { plaintext: "different secret" });
+
+    assert.deepEqual(await alice.get("app:chat:thread/one"), { plaintext: "secret message" });
+    assert.deepEqual(await bob.get("app:chat:thread/one"), { plaintext: "different secret" });
+    assert.deepEqual(await alice.keys("app:chat:"), ["app:chat:thread/one"]);
+
+    const stored = await provider.get("kv/alice/app:chat:thread/one");
+    assert.equal(JSON.stringify(stored).includes("secret message"), false);
+    assert.equal(await alice.delete("app:chat:thread/one"), true);
+    assert.equal(await alice.get("app:chat:thread/one"), undefined);
+  } finally {
+    globalThis.indexedDB = prev;
+  }
+});
+
+test("IndexedDbStorageProvider exposes the peer-link storage contract", async () => {
+  const prev = globalThis.indexedDB;
+  globalThis.indexedDB = createFakeIndexedDb();
+  try {
+    const provider = new IndexedDbStorageProvider();
+    const first = provider.getPeerLinkStorage(null);
+    const second = provider.getPeerLinkStorage(null);
+
+    assert.equal(first, second);
+    assert.equal(typeof first.peerLinks.getById, "function");
+    assert.equal(typeof first.sessions.getById, "function");
+    assert.equal(typeof first.handshakeAttempts.getById, "function");
+    assert.equal(typeof first.events.listByPeerLinkId, "function");
+    assert.equal(typeof first.keys.getAccountIdentity, "function");
   } finally {
     globalThis.indexedDB = prev;
   }

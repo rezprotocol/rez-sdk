@@ -14,7 +14,16 @@ export {
   KEYSTORE_PAYLOAD_VERSION_DELEGATED,
   createKeystoreAccount,
   createDelegatedKeystoreAccount,
+  resealKeystoreEnvelope,
   unlockKeystoreAccount,
 } from "@rezprotocol/core";
 
 export { KeystoreStore } from "./KeystoreStore.js";
+export {
+  generateBrowserMnemonic,
+  validateBrowserMnemonic,
+  browserMnemonicToSeed,
+  deriveBrowserAccountRecovery,
+  sealBrowserRecoveryMnemonic,
+  openBrowserRecoveryMnemonic,
+} from "./BrowserRecovery.js";

@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
 import { SecureChannelManager, X3DHKeyExchange, E2eePacketCodec, DeviceRegistrationV1, bytesToBase64 } from "@rezprotocol/core";
+import { runtimeUuid } from "../util/runtimeUuid.js";
 
 const SESSION_STATUS_ACTIVE = "active";
 
@@ -348,7 +348,7 @@ export class DevicePeerSessions {
     const now = this.#clock();
     const existing = await this.#peerLinkStorage.sessions.getByPeerLinkAndDevice(ownerAccountId, peerLinkId, peerDeviceId);
     const hasExisting = existing && typeof existing === "object";
-    const sessionId = hasExisting && existing.sessionId ? existing.sessionId : ("pls_" + randomUUID());
+    const sessionId = hasExisting && existing.sessionId ? existing.sessionId : ("pls_" + runtimeUuid());
     const createdAtMs = hasExisting && existing.createdAtMs ? existing.createdAtMs : now;
     const stored = await this.#peerLinkStorage.sessions.put({
       sessionId,

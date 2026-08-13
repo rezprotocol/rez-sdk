@@ -82,6 +82,7 @@ export { WsConnection } from "./WsConnection.js";
 export { WARN_CODES } from "../pool/WarnCodes.js";
 export { createFrameCodec as createJsonFrameCodec } from "../transport/FrameCodec.js";
 export { asInt, nonEmpty, requireId } from "../util/coerce.js";
+export { runtimeUuid } from "../util/runtimeUuid.js";
 
 // Bridge infrastructure (wrapped via rez-sdk/bridge to avoid direct @rezprotocol/core import)
 export {

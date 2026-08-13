@@ -1,4 +1,3 @@
-import { createHash, randomUUID } from "node:crypto";
 import {
   E2eeHandshakeAckV1,
   E2eeHandshakeRejectV1,
@@ -32,12 +31,14 @@ import {
   ACCOUNT_AUTHORITY_STATE_RECORD_KIND,
   verifyDurableRecordV2,
   DeviceRegistrationV1,
+  Hash,
 } from "@rezprotocol/core";
 import { canonicalPayloadBytesV1 } from "./inviteCodeV1.js";
 import { DevicePeerSessions } from "./DevicePeerSessions.js";
 import { buildSealedDeviceSetRecord, openSealedDeviceSetRecord, DEVICE_SET_PUBLISH_CAPABILITY } from "./deviceSetPublish.js";
 import { derivePeerScopedKey } from "./peerScopedSeal.js";
 import { deriveAccountStateKey, sealAccountStateEvent, openAccountStateEvent } from "./accountStateSeal.js";
+import { runtimeUuid } from "../util/runtimeUuid.js";
 import {
   PEER_LINK_STATE,
   SESSION_STATUS,
@@ -114,9 +115,7 @@ function asPositiveInt(value, fallback) {
 }
 
 function stableId(prefix) {
-  const digest = createHash("sha256")
-    .update(`${Date.now()}:${randomUUID()}:${prefix}`)
-    .digest("base64url");
+  const digest = Hash.sha256Hex(`${Date.now()}:${runtimeUuid()}:${prefix}`);
   return `${prefix}_${digest.slice(0, 24)}`;
 }
 
@@ -2506,8 +2505,8 @@ export class PeerLinkService {
     const signatureBytes = delegated
       ? await this.cryptoProvider.sign({ privateKey: this.#deviceSigningKeyPair.privateKey, msg: canonicalPayloadBytes })
       : await authority.signer.sign(canonicalPayloadBytes);
-    const signatureB64 = Buffer.from(signatureBytes).toString("base64");
-    const tokenHash = createHash("sha256").update(canonicalPayloadBytes).digest("hex");
+    const signatureB64 = bytesToBase64(signatureBytes);
+    const tokenHash = Hash.sha256Hex(canonicalPayloadBytes);
     await this._saveInviteRecord({
       inviteId,
       ownerAccountId: owner,
@@ -2664,7 +2663,7 @@ export class PeerLinkService {
       throw err;
     }
     const envelope = envelopeArg;
-    const signatureBytes = new Uint8Array(Buffer.from(signatureB64Arg, "base64"));
+    const signatureBytes = base64ToBytes(signatureB64Arg);
     const canonicalPayloadBytes = canonicalPayloadBytesV1(envelope);
     verifyInviteKind(envelope);
     const inviterAccountId = requireId(envelope.creatorAccountId, "creatorAccountId");
@@ -2817,7 +2816,7 @@ export class PeerLinkService {
     // authenticated). Accept is optimistic here: we resolve the local invite
     // record only to back-link `peerLinkId` onto it (same-node case), never to
     // spend it.
-    const tokenHashHex = createHash("sha256").update(canonicalPayloadBytes).digest("hex");
+    const tokenHashHex = Hash.sha256Hex(canonicalPayloadBytes);
     const localInviteIdForLink = await this._getInviteRecordByHash(inviterAccountId, tokenHashHex);
 
     // Reuse the existing peer-link id when re-driving a terminal dead link so
@@ -3004,7 +3003,7 @@ export class PeerLinkService {
       }
       // Generate a random nonce to bind the ack to this specific handshake.
       // The inviter must echo this nonce in the ack; the acceptor verifies it.
-      const ackNonce = randomUUID();
+      const ackNonce = runtimeUuid();
       const handshakeData = {
         ...acceptedInvite.handshakeData,
         inviteId: requireId(envelope.inviteId, "inviteId"),
