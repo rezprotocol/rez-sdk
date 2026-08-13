@@ -1,21 +1,33 @@
-import { SeedKeys } from "../crypto/seedDerivation.js";
-import { deriveCeremonySecrets, DEVICE_LINK_RENDEZVOUS_KEY_LABEL } from "@rezprotocol/core";
+import {
+  bytesToBase64,
+  deriveCeremonySecrets,
+  DEVICE_LINK_RENDEZVOUS_KEY_LABEL,
+} from "@rezprotocol/core";
+
+const SEED_DERIVATION_SALT = new TextEncoder().encode("rez-v1");
 
 /**
  * PSK → rendezvous Ed25519 keypair R. Both ceremony sides derive it, so R
  * signs every ceremony record AND its public key IS the fetch coordinate —
  * only PSK holders can write to (or even locate) the ceremony slots.
  *
- * The 32-byte seed derivation is core protocol (deviceLinkV1); the seed →
- * keypair step needs SeedKeys (node:crypto) and therefore lives here, the
- * only device-link file allowed to touch it (rez-core's barrel must stay
- * browser-safe). Desktop-only for now, like every SeedKeys consumer.
+ * The second HKDF preserves the original SeedKeys(seed, label) derivation,
+ * while the injected crypto provider turns the final 32-byte private seed
+ * into the canonical PKCS#8/SPKI pair on both Node and WebCrypto runtimes.
  */
 export async function deriveRendezvousKeyPair({ crypto, psk } = {}) {
   const secrets = await deriveCeremonySecrets({ crypto, psk });
-  const keys = SeedKeys.deriveEd25519({
-    seed: secrets.rendezvousSeed,
-    label: DEVICE_LINK_RENDEZVOUS_KEY_LABEL,
+  if (!crypto || typeof crypto.signingKeyPairFromSeed !== "function") {
+    throw new Error("deriveRendezvousKeyPair requires crypto.signingKeyPairFromSeed(seed)");
+  }
+  const rawPrivate = await crypto.hkdfSha256(secrets.rendezvousSeed, {
+    salt: SEED_DERIVATION_SALT,
+    info: new TextEncoder().encode(DEVICE_LINK_RENDEZVOUS_KEY_LABEL),
+    length: 32,
   });
-  return { publicKeyB64: keys.publicKeyB64, privateKeyB64: keys.privateKeyB64 };
+  const keys = await crypto.signingKeyPairFromSeed(rawPrivate);
+  return {
+    publicKeyB64: bytesToBase64(keys.publicKey),
+    privateKeyB64: bytesToBase64(keys.privateKey),
+  };
 }

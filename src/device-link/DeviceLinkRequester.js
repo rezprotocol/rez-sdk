@@ -63,6 +63,7 @@ export async function runDeviceLinkRequester({
   deadlineMs = 10 * 60_000,
   deviceKeyPair = null,
   onStatus = null,
+  persistDelegation = null,
 } = {}) {
   if (!crypto || typeof crypto !== "object") {
     throw new Error("runDeviceLinkRequester requires a crypto provider");
@@ -72,6 +73,9 @@ export async function runDeviceLinkRequester({
   }
   if (typeof nowMs !== "function") {
     throw new Error("runDeviceLinkRequester requires nowMs() (a clock function)");
+  }
+  if (typeof persistDelegation !== "function") {
+    throw new Error("runDeviceLinkRequester requires persistDelegation(result) before key confirmation");
   }
 
   const { psk, accountSignPublicKeyB64 } = parseDeviceLinkCodeV1(code);
@@ -175,6 +179,26 @@ export async function runDeviceLinkRequester({
     }
   }
 
+  const result = {
+    delegation: {
+      accountSignPublicKeyB64: opened.delegationBundle.accountSignPublicKeyB64,
+      accountDhKeyPair: opened.delegationBundle.accountDhKeyPair,
+      deviceKeyPair: deviceKeys,
+      certChain: opened.delegationBundle.certChain,
+      cachedDeviceSet: opened.delegationBundle.cachedDeviceSet,
+    },
+    deviceId: request.linkRequest.newDeviceId,
+    inboxId,
+    fingerprint: request.fingerprint,
+  };
+
+  // Confirmation means this device can survive a crash and come back as the
+  // granted device. Persist the locally-minted private key and the exact
+  // pre-registered inbox before publishing that confirmation; otherwise a
+  // storage failure strands an active home registration whose key is gone.
+  emitStatus(onStatus, "persisting");
+  const persistence = await persistDelegation(result);
+
   emitStatus(onStatus, "confirming");
   const confirm = await buildCeremonyConfirm({
     crypto,
@@ -191,19 +215,5 @@ export async function runDeviceLinkRequester({
   });
   await records.put({ record: confirmRecord });
 
-  return {
-    // The EXACT createDelegatedKeystoreAccount `delegation` shape.
-    delegation: {
-      accountSignPublicKeyB64: opened.delegationBundle.accountSignPublicKeyB64,
-      accountDhKeyPair: opened.delegationBundle.accountDhKeyPair,
-      deviceKeyPair: deviceKeys,
-      certChain: opened.delegationBundle.certChain,
-      cachedDeviceSet: opened.delegationBundle.cachedDeviceSet,
-    },
-    deviceId: request.linkRequest.newDeviceId,
-    // The self-chosen home inbox this device registered in the ceremony (the approver
-    // ran device.add for it); the device claims exactly this inbox when it comes online.
-    inboxId,
-    fingerprint: request.fingerprint,
-  };
+  return { ...result, persistence };
 }

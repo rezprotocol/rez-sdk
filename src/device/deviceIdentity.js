@@ -37,6 +37,10 @@ const DEFAULT_TTL_MS = 365 * 24 * 60 * 60 * 1000; // 365 days
 // long-lived registration/binding certs), so it gets a tight default window.
 const DEFAULT_MUTATION_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
+export function deriveDeviceIdFromPublicKeyB64(devicePublicKeyB64) {
+  return DeviceRegistrationV1.deviceIdFor(devicePublicKeyB64);
+}
+
 function requireSubtle() {
   if (!globalThis.crypto || !globalThis.crypto.subtle) {
     throw Object.assign(new Error("WebCrypto unavailable"), { code: "BAD_CONFIG", retryable: false });

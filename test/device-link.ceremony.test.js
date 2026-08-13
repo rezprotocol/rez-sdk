@@ -7,6 +7,7 @@ import {
   DEVICE_LINK_RECORD_KIND,
   DEVICE_LINK_RECORD_ID_REQUEST,
   DEVICE_LINK_RECORD_ID_RESPONSE,
+  DEVICE_LINK_RECORD_ID_CONFIRM,
   parseDeviceLinkCodeV1,
   createDelegatedKeystoreAccount,
   KeystoreStore,
@@ -20,6 +21,7 @@ import { createMemoryRecordOverlay } from "./support/memoryRecordStore.js";
 // REAL crypto — the ceremony's properties (AAD binding, PSK-authenticated
 // ephemeral DH, key confirmation) are meaningless under a fake provider.
 import { BrowserCryptoProvider } from "../src/e2ee/BrowserCryptoProvider.js";
+import { SeedKeys } from "../src/crypto/seedDerivation.js";
 
 const CRYPTO = new BrowserCryptoProvider();
 const FAST = { pollIntervalMs: 5, pollMaxIntervalMs: 10, pollBackoff: 1.2 };
@@ -68,8 +70,22 @@ async function makePrimary(overlay, { pskTtlMs = 10 * 60_000, getCachedDeviceSet
 }
 
 function runRequester(overlay, code, over = {}) {
-  return runDeviceLinkRequester({ code, crypto: CRYPTO, records: overlay, ...FAST, ...over });
+  const persistDelegation = Object.prototype.hasOwnProperty.call(over, "persistDelegation")
+    ? over.persistDelegation
+    : async () => null;
+  return runDeviceLinkRequester({ code, crypto: CRYPTO, records: overlay, ...FAST, ...over, persistDelegation });
 }
+
+test("browser rendezvous derivation stays byte-compatible with the frozen SeedKeys path", async () => {
+  const core = await import("@rezprotocol/core");
+  const psk = new Uint8Array(32).fill(19);
+  const secrets = await core.deriveCeremonySecrets({ crypto: CRYPTO, psk });
+  const expected = SeedKeys.deriveEd25519({
+    seed: secrets.rendezvousSeed,
+    label: core.DEVICE_LINK_RENDEZVOUS_KEY_LABEL,
+  });
+  assert.deepEqual(await deriveRendezvousKeyPair({ crypto: CRYPTO, psk }), expected);
+});
 
 function createMemoryStorage() {
   const m = new Map();
@@ -119,6 +135,32 @@ test("happy path: full ceremony over the shared overlay — delegation feeds the
   assert.deepEqual(leaf.capabilities, [...DEVICE_LINK_LEAF_CAPABILITIES]);
   assert.equal(leaf.maxDelegationDepth, 0);
   assert.equal(leaf.granteeDevicePublicKeyB64, requester.delegation.deviceKeyPair.publicKeyB64);
+});
+
+test("requester publishes no confirmation when durable delegation persistence fails", async () => {
+  const overlay = createMemoryRecordOverlay({ crypto: CRYPTO });
+  const primary = await makePrimary(overlay, { pskTtlMs: 300 });
+  const { code } = await primary.approver.start();
+  const { psk } = parseDeviceLinkCodeV1(code);
+  const rendezvous = await deriveRendezvousKeyPair({ crypto: CRYPTO, psk });
+  const requesterRun = runRequester(overlay, code, {
+    deadlineMs: 1_000,
+    persistDelegation: async () => {
+      throw new Error("local storage unavailable");
+    },
+  }).then(() => null).catch((err) => err);
+  await primary.approver.waitForRequest();
+  const approvalRun = primary.approver.approve().then(() => null).catch((err) => err);
+  const requesterError = await requesterRun;
+  assert.match(requesterError.message, /local storage unavailable/);
+  const confirm = await overlay.get({
+    recordKind: DEVICE_LINK_RECORD_KIND,
+    recordId: DEVICE_LINK_RECORD_ID_CONFIRM,
+    publisherPublicKeyB64: rendezvous.publicKeyB64,
+  });
+  assert.equal(confirm, null, "key confirmation is withheld until the private device key is durable");
+  primary.approver.cancel();
+  await approvalRun;
 });
 
 test("a wrong-psk writer cannot reach the ceremony slot, and cannot sign for R even knowing its coordinate", async () => {

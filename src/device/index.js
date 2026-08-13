@@ -1,4 +1,5 @@
 export {
+  deriveDeviceIdFromPublicKeyB64,
   generateDeviceKeyPair,
   buildSignedDeviceRegistration,
   buildSignedDeviceInboxBinding,
