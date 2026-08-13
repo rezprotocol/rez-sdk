@@ -37,9 +37,10 @@ import { derivePeerScopedKey, sealToPeer, openFromPeer } from "./peerScopedSeal.
  *   signer's authority over the owner account (verifyDurableRecordV2)
  * - the inner DeviceSetRecordV1 must be signed by the SAME key that signs the
  *   envelope (same-signer binding: authority is proven ONCE by the envelope's
- *   chain, and the sealed payload is integrity-bound to the envelope). Any
- *   re-sign of the set — same or different signer — requires a revision bump,
- *   or the receiver's equivocation floor rejects it.
+ *   chain, and the sealed payload is integrity-bound to the envelope). The
+ *   receiver's revision floor binds stable device membership, so freshness and
+ *   signer rotation may re-sign unchanged authority content at one revision;
+ *   adding, removing, or rebinding a device requires a revision bump.
  * - each prekey bundle is independently C-signed — so a peer that opens the
  *   payload still verifies authenticity end-to-end, never trusting the
  *   (non-owner-gated) overlay.

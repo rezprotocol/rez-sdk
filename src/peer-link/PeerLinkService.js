@@ -247,6 +247,28 @@ function _deviceSetFloorKey(ownerAccountId, peerAccountId) {
   return "peer-link:device-set-floor:" + ownerAccountId + ":" + peerAccountId;
 }
 
+// A device-set revision binds AUTHORITY CONTENT, not one particular issuance.
+// `issuedAtMs`, `expiresAtMs`, and the signature necessarily change when an
+// otherwise-identical set is refreshed before expiry; prekey bundles rotate at
+// that same revision too. Treating the signature as the binding therefore turns
+// every honest reconnect/refresh into false equivocation. Keep the security
+// invariant on the fields the revision actually governs: account + canonical
+// device membership. Sorting makes the binding independent of backend row order.
+function deviceSetAuthorityBinding(deviceSetRecord) {
+  const devices = deviceSetRecord.devices.map((device) => ({
+    deviceId: device.deviceId,
+    devicePublicKeyB64: device.devicePublicKeyB64,
+    inboxId: device.inboxId,
+  })).sort((a, b) => String(a.deviceId).localeCompare(String(b.deviceId)));
+  return Hash.sha256Hex(canonicalJSONStringify({
+    v: deviceSetRecord.v,
+    purpose: deviceSetRecord.purpose,
+    accountIdentityPublicKeyB64: deviceSetRecord.accountIdentityPublicKeyB64,
+    revision: deviceSetRecord.revision,
+    devices,
+  }));
+}
+
 export class PeerLinkService {
   #decryptFailureCounts;
   // Per-(owner:peer) count of any-peer trial-decrypt total misses. Unlike
@@ -1055,13 +1077,11 @@ export class PeerLinkService {
     // per-(owner,peer) lock with a monotonic-only write: the R3 fix read the
     // floor and saved it across an await without serialization, so two concurrent
     // ingests (rev 5 + rev 6) could persist 5 last and regress the floor (R4 #3).
-    // The lock closes that TOCTOU; the floor now also records the accepted set's
-    // signature so a SAME-revision set with DIFFERENT content (equivocation) is
-    // rejected rather than silently re-establishing a divergent device list.
+    // The lock closes that TOCTOU; the floor also records the accepted set's
+    // stable authority binding so a SAME-revision set with DIFFERENT membership
+    // (equivocation) is rejected while an honest timestamp/prekey refresh is not.
     const passedFloor = Number.isInteger(minRevision) && minRevision > 0 ? minRevision : 0;
-    const incomingSigB64 = deviceSetRecord.sig && typeof deviceSetRecord.sig.sigB64 === "string"
-      ? deviceSetRecord.sig.sigB64
-      : "";
+    const incomingBinding = deviceSetAuthorityBinding(deviceSetRecord);
     return withLock(`device-set-ingest:${owner}:${peer}`, async () => {
       const floorRec = await this.#loadDeviceSetFloor(owner, peer);
       const persistedFloor = floorRec.revision;
@@ -1076,14 +1096,13 @@ export class PeerLinkService {
         err.knownRevision = floor;
         throw err;
       }
-      // Equivocation: the same revision we already accepted, but a different
-      // account signature ⇒ a second, conflicting set published at one revision
-      // (peer key compromise or a tampered replay). Only an idempotent re-present
-      // of the IDENTICAL set is allowed at an already-accepted revision.
+      // Equivocation: the same revision we already accepted, but different
+      // authority content ⇒ a conflicting device membership was published at
+      // one revision (peer key compromise or tampered replay). Fresh timestamps,
+      // signatures, and prekeys are intentionally outside this stable binding.
       if (deviceSetRecord.revision === persistedFloor
-        && floorRec.sigB64
-        && incomingSigB64
-        && incomingSigB64 !== floorRec.sigB64) {
+        && floorRec.binding
+        && incomingBinding !== floorRec.binding) {
         const err = new Error(
           "ingestPeerDeviceSet: conflicting device set at revision " + deviceSetRecord.revision
           + " for peer " + peer + " (equivocation)",
@@ -1119,44 +1138,42 @@ export class PeerLinkService {
         established.push({ peerDeviceId: bundle.deviceId, handshakeData, sessionId });
       }
       // Advance the durable floor AFTER establishment succeeds — monotonic only
-      // (re-read under the lock, never lower). Records the accepted signature so a
-      // later same-revision equivocation is detectable.
+      // (re-read under the lock, never lower). Records the stable authority
+      // binding so a later same-revision membership conflict is detectable.
       if (deviceSetRecord.revision > persistedFloor) {
-        await this.#saveDeviceSetFloor(owner, peer, deviceSetRecord.revision, incomingSigB64);
-      } else if (deviceSetRecord.revision === persistedFloor && !floorRec.sigB64 && incomingSigB64) {
-        // Legacy-floor signature backfill (review P2). A floor persisted before the
-        // R4 #3 hardening stored only { revision } (sigB64 = null), so at the SAME
-        // revision the equivocation check above is skipped (no recorded sig to
-        // compare) AND this advance never ran (revision is not > persistedFloor) —
-        // leaving the floor permanently unable to detect a same-revision conflict,
-        // so an upgraded client would accept conflicting same-revision sets forever.
-        // Anchor the legacy floor to the first set we accept post-upgrade (monotonic:
-        // same revision, adds only the missing signature) so a later same-revision
-        // set with a DIFFERENT signature is rejected as equivocation.
-        await this.#saveDeviceSetFloor(owner, peer, deviceSetRecord.revision, incomingSigB64);
+        await this.#saveDeviceSetFloor(owner, peer, deviceSetRecord.revision, incomingBinding);
+      } else if (deviceSetRecord.revision === persistedFloor && !floorRec.binding) {
+        // Migration for both historical floor shapes: { revision } and
+        // { revision, sigB64 }. A signature cannot distinguish an honest refresh
+        // from conflicting membership because freshness fields are signed too.
+        // Anchor the first fully-verified post-upgrade set to its stable content.
+        // This also repairs browsers already stuck on a false signature conflict
+        // without deleting their IndexedDB/account state.
+        await this.#saveDeviceSetFloor(owner, peer, deviceSetRecord.revision, incomingBinding);
       }
       return { deviceSetRecord, prekeyBundleRecords, established, reused, revision: deviceSetRecord.revision };
     });
   }
 
   // The persisted rollback floor for a peer's device set (Audit R3 #5 / R4 #3):
-  // { revision, sigB64 } — the highest accepted revision and the signature of the
-  // set accepted at it (for equivocation detection). Legacy floors stored a bare
-  // { revision } (or a bare number) and read back with sigB64 = null.
+  // { revision, binding } — the highest accepted revision and stable authority
+  // content accepted at it (for equivocation detection). Legacy floors stored a
+  // bare revision or { revision, sigB64 }; both read back with binding = null and
+  // are migrated by the next fully-verified ingest at that revision.
   async #loadDeviceSetFloor(ownerAccountId, peerAccountId) {
     const stored = await this.kv.get(_deviceSetFloorKey(ownerAccountId, peerAccountId));
     const rev = stored && typeof stored === "object" ? stored.revision : stored;
-    const sigB64 = stored && typeof stored === "object" && typeof stored.sigB64 === "string" ? stored.sigB64 : null;
+    const binding = stored && typeof stored === "object" && typeof stored.binding === "string" ? stored.binding : null;
     return {
       revision: Number.isInteger(rev) && rev > 0 ? rev : 0,
-      sigB64,
+      binding,
     };
   }
 
-  async #saveDeviceSetFloor(ownerAccountId, peerAccountId, revision, sigB64) {
+  async #saveDeviceSetFloor(ownerAccountId, peerAccountId, revision, binding) {
     await this.kv.set(_deviceSetFloorKey(ownerAccountId, peerAccountId), {
       revision,
-      sigB64: typeof sigB64 === "string" && sigB64.length > 0 ? sigB64 : null,
+      binding: typeof binding === "string" && binding.length > 0 ? binding : null,
     });
   }
 

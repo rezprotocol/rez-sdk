@@ -378,31 +378,35 @@ test("Audit R3 #5: a successful ingest persists the revision floor durably", asy
   const floorKey = "peer-link:device-set-floor:" + bob.accountId + ":" + alice.accountId;
   const storedFloor = await bob.sp.getKeyValueStore().get(floorKey);
   assert.equal(storedFloor.revision, 1, "the highest accepted revision is persisted so the floor survives a restart");
-  assert.equal(typeof storedFloor.sigB64, "string");
-  assert.ok(storedFloor.sigB64.length > 0, "the accepted set signature is recorded (Audit R4 #3 equivocation detection)");
+  assert.equal(typeof storedFloor.binding, "string");
+  assert.ok(storedFloor.binding.length > 0, "the accepted authority content is bound for same-revision equivocation detection");
 });
 
-test("Audit R4 #3: a same-revision device set with a DIFFERENT signature is rejected as equivocation", async () => {
+test("Audit R4 #3: different authority content at the same revision is rejected as equivocation", async () => {
   const crypto = new BrowserCryptoProvider();
   const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
   const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
   await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
-  const { record } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
+  const { record } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId, nowMs: 1_000 });
 
-  // Accept the revision-1 set once (records its signature in the floor).
-  await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record });
-  // Tamper the recorded floor signature so the SAME revision now appears to have
-  // been accepted with DIFFERENT content — i.e. a second, conflicting set was
-  // published at one revision (peer key compromise / tampered replay).
-  const floorKey = "peer-link:device-set-floor:" + bob.accountId + ":" + alice.accountId;
-  await bob.sp.getKeyValueStore().set(floorKey, { revision: 1, sigB64: "AAAAconflicting" });
+  // Accept the revision-1 set once (records its stable authority binding).
+  await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record, nowMs: 1_000 });
+
+  // Produce a second FULLY VALID account/device-signed set at revision 1 that
+  // rebinds the existing device to another inbox. Freshness is later too, but
+  // the authority-content change is what must make this equivocation.
+  alice.svc.inviteBinding = { mailboxId: "rez:inbox:alice-conflict", capabilityId: "rez:inbox:alice-conflict" };
+  const conflictingRecord = (await alice.svc.buildDeviceSetRecordForPeer({
+    peerAccountId: bob.accountId,
+    nowMs: 2_000,
+  })).record;
   await assert.rejects(
-    () => bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record }),
+    () => bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record: conflictingRecord, nowMs: 2_000 }),
     (err) => err && err.code === "DEVICE_SET_REVISION_EQUIVOCATION" && err.revision === 1,
   );
 });
 
-test("review P2: ingesting against a LEGACY (sig-less) floor at the same revision backfills the signature so equivocation becomes detectable", async () => {
+test("device-set floor migration: a legacy signature floor accepts a refresh and anchors stable authority content", async () => {
   const crypto = new BrowserCryptoProvider();
   const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
   const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
@@ -410,29 +414,50 @@ test("review P2: ingesting against a LEGACY (sig-less) floor at the same revisio
   const { record } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
 
   const floorKey = "peer-link:device-set-floor:" + bob.accountId + ":" + alice.accountId;
-  // A floor persisted before the R4 #3 hardening stored only { revision } — no
-  // signature. At the SAME revision the equivocation check is skipped (nothing to
-  // compare) AND the advance branch never ran (revision not > persistedFloor), so
-  // the floor could never learn the accepted signature: an upgraded client would
-  // accept conflicting same-revision sets forever.
-  await bob.sp.getKeyValueStore().set(floorKey, { revision: 1 });
+  // This is the exact floor shape shipped before stable authority bindings. Its
+  // signature may differ from an honest timestamp refresh at the SAME revision;
+  // upgrading must repair that state without forcing an IndexedDB/account wipe.
+  await bob.sp.getKeyValueStore().set(floorKey, { revision: 1, sigB64: "legacy-signature" });
 
-  // Ingesting the genuine revision-1 set is accepted, and the missing signature is
-  // backfilled onto the legacy floor (monotonic: same revision, adds only the sig).
+  // The genuine set is accepted and the legacy signature is replaced by the
+  // stable authority-content binding (monotonic: revision remains unchanged).
   const ok = await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record });
   assert.equal(ok.revision, 1);
   const backfilled = await bob.sp.getKeyValueStore().get(floorKey);
   assert.equal(backfilled.revision, 1, "floor stays at the same revision (monotonic)");
-  assert.equal(typeof backfilled.sigB64, "string");
-  assert.ok(backfilled.sigB64.length > 0, "the accepted set signature is now anchored on the formerly sig-less floor");
+  assert.equal(typeof backfilled.binding, "string");
+  assert.ok(backfilled.binding.length > 0, "the verified authority content is anchored on the legacy floor");
+  assert.equal(Object.hasOwn(backfilled, "sigB64"), false, "the incompatible signature binding is removed");
 
-  // With the signature anchored, a conflicting same-revision set is now rejected
-  // (the protection that the sig-less legacy floor could never provide).
-  await bob.sp.getKeyValueStore().set(floorKey, { revision: 1, sigB64: "AAAAconflicting" });
+  // Once migrated, conflicting same-revision authority content is rejected.
+  await bob.sp.getKeyValueStore().set(floorKey, { revision: 1, binding: "conflicting-authority-content" });
   await assert.rejects(
     () => bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record }),
     (err) => err && err.code === "DEVICE_SET_REVISION_EQUIVOCATION" && err.revision === 1,
   );
+});
+
+test("device-set refresh: new timestamps and signature at the same revision preserve the authority binding", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
+  await crossLink(alice, bob, { aLinkId: "pl_alice_bob", bLinkId: "pl_bob_alice" });
+
+  const firstRecord = (await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId, nowMs: 1_000 })).record;
+  const first = await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record: firstRecord, nowMs: 1_000 });
+  assert.equal(first.established.length, 1);
+
+  const floorKey = "peer-link:device-set-floor:" + bob.accountId + ":" + alice.accountId;
+  const firstFloor = await bob.sp.getKeyValueStore().get(floorKey);
+  const refreshedRecord = (await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId, nowMs: 2_000 })).record;
+  const refreshed = await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record: refreshedRecord, nowMs: 2_000 });
+  const refreshedFloor = await bob.sp.getKeyValueStore().get(floorKey);
+
+  assert.notEqual(firstRecord.sigB64, refreshedRecord.sigB64, "the refreshed durable record is genuinely re-signed");
+  assert.equal(refreshed.revision, 1);
+  assert.equal(refreshed.established.length, 0, "the existing device session is not reset");
+  assert.equal(refreshed.reused.length, 1);
+  assert.equal(refreshedFloor.binding, firstFloor.binding, "freshness changes do not change authority content");
 });
 
 test("Audit R4 #3: concurrent ingests of one set serialize — exactly one establishment, floor consistent", async () => {
@@ -568,7 +593,7 @@ test("S8 L5: a DELEGATED device-set record (C2-signed, B→C2 chain) ingests thr
   assert.equal(storedFloor.revision, 2, "the delegated set advances the durable floor");
 });
 
-test("S8 L5: a delegated RE-SIGN at an already-accepted revision is rejected as equivocation (bump-on-resign contract)", async () => {
+test("S8 L5: a delegated refresh with unchanged authority content is accepted at the same revision", async () => {
   const crypto = new BrowserCryptoProvider();
   const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
   const bob = await makeAccount(crypto, { mailboxId: "rez:inbox:bob" });
@@ -577,12 +602,12 @@ test("S8 L5: a delegated RE-SIGN at an already-accepted revision is rejected as 
   const { record: directRecord } = await alice.svc.buildDeviceSetRecordForPeer({ peerAccountId: bob.accountId });
   await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record: directRecord });
 
-  // Same revision (1), same device list, but re-signed by the delegated key —
-  // a DIFFERENT inner signature at an accepted revision. Any re-sign (B or C)
-  // must bump the revision; the floor rejects this as equivocation.
+  // Same revision and device list, but freshly signed by an authorized delegated
+  // key. Signer/timestamp rotation is not an authority change; the stable device
+  // membership remains identical and the existing session must be reused.
   const { record } = await buildDelegatedRecordFrom(crypto, alice, bob, { revision: 1 });
-  await assert.rejects(
-    () => bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record }),
-    (err) => err && err.code === "DEVICE_SET_REVISION_EQUIVOCATION" && err.revision === 1,
-  );
+  const refreshed = await bob.svc.ingestPeerDeviceSet({ peerAccountId: alice.accountId, record });
+  assert.equal(refreshed.revision, 1);
+  assert.equal(refreshed.established.length, 0);
+  assert.equal(refreshed.reused.length, 1);
 });
