@@ -37,6 +37,9 @@ export class ConnectivityCapability {
   }
 
   onReconnected(handler) {
+    if (this.#pool && typeof this.#pool.onReconnected === "function") {
+      return this.#pool.onReconnected(handler);
+    }
     return this.#eventBus.on(SDK_EVENTS.TRANSPORT_RECONNECTED, handler);
   }
 

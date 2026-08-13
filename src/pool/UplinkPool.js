@@ -46,6 +46,7 @@ export class UplinkPool {
   #sessionInfo = null;
   #events = new Map(); // frameType -> handlers
   #stateHandlers = new Set();
+  #reconnectedHandlers = new Set();
   #ready = false;
   #promotePromise = null;
   #spareEnsurePromise = null;
@@ -167,6 +168,18 @@ export class UplinkPool {
     if (typeof handler !== "function") throw new Error("onState(handler) requires handler");
     this.#stateHandlers.add(handler);
     return () => this.#stateHandlers.delete(handler);
+  }
+
+  /**
+   * Register an awaited session-restoration hook. A transport becoming ready
+   * is not enough to make a replacement session usable: callers may need to
+   * replay authenticated, session-scoped bindings before owner operations can
+   * resume. Hooks run in registration order before the reconnect is announced.
+   */
+  onReconnected(handler) {
+    if (typeof handler !== "function") throw new Error("onReconnected(handler) requires handler");
+    this.#reconnectedHandlers.add(handler);
+    return () => this.#reconnectedHandlers.delete(handler);
   }
 
   async sendRequest({
@@ -300,6 +313,16 @@ export class UplinkPool {
       this.#setActive(candidate);
       this.#ready = true;
       this.#emitState({ phase: "failover", from, to: candidate, reason, activeUplink: candidate });
+      try {
+        await this.#notifyReconnected();
+      } catch (err) {
+        this.#ready = false;
+        this.#activeUrl = null;
+        this.#sessionInfo = null;
+        this.#emitState({ phase: "offline", reason: err && err.message ? err.message : "session restore failed" });
+        this.#scheduleReconnect();
+        return false;
+      }
       this.#emitState({ phase: "connected", activeUplink: candidate });
       await this.#ensureWarmSpareTarget();
       return true;
@@ -388,7 +411,16 @@ export class UplinkPool {
       this.#reconnectTimer = null;
       if (this.#closed) return;
       this.connect().then(
-        () => { this.#reconnectAttempts = 0; },
+        async () => {
+          try {
+            await this.#notifyReconnected();
+            this.#reconnectAttempts = 0;
+          } catch (err) {
+            await this.#closeConnections();
+            this.#emitState({ phase: "offline", reason: err && err.message ? err.message : "session restore failed" });
+            this.#scheduleReconnect();
+          }
+        },
         () => {
           this.#emitState({ phase: "offline", reason: "reconnect failed" });
           this.#scheduleReconnect();
@@ -465,6 +497,13 @@ export class UplinkPool {
     for (const handler of [...this.#stateHandlers]) {
       try { handler(payload); } catch { /* ignore */ }
     }
+  }
+
+  async #notifyReconnected() {
+    for (const handler of [...this.#reconnectedHandlers]) {
+      await handler();
+    }
+    this.#eventBus.emit(SDK_EVENTS.TRANSPORT_RECONNECTED, {});
   }
 
   async #runPromotion(fn) {
