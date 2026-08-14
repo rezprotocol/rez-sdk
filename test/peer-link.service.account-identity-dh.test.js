@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { bytesToBase64, deriveAccountIdFromPublicKey, DeviceRegistrationV1 } from "@rezprotocol/core";
+import { bytesToBase64, canonicalJSONStringify, deriveAccountIdFromPublicKey, DeviceRegistrationV1 } from "@rezprotocol/core";
 import { SeedKeys } from "@rezprotocol/core/src/crypto/seedDerivation.js";
 import { createKeyValueBackedPeerLinkStorage } from "../src/peer-link/createKeyValueBackedPeerLinkStorage.js";
-import { PeerLinkService } from "../src/peer-link/PeerLinkService.js";
+import { PeerLinkService, x3dhBindingPayload } from "../src/peer-link/PeerLinkService.js";
 import { derivePeerScopedKey } from "../src/peer-link/peerScopedSeal.js";
 import { BrowserCryptoProvider } from "../src/e2ee/BrowserCryptoProvider.js";
 
@@ -18,6 +18,15 @@ import { BrowserCryptoProvider } from "../src/e2ee/BrowserCryptoProvider.js";
 const enc = (s) => new TextEncoder().encode(s);
 const FAR_FUTURE = 10_000_000_000_000;
 const DH_LABEL = "rez/identity/x3dh-dh/v1";
+
+function bindingBytes(accountId, x3dhIdentityPublicKeyB64) {
+  return enc(canonicalJSONStringify(x3dhBindingPayload({
+    accountId,
+    x3dhIdentityPublicKeyB64,
+    issuedAtMs: 1,
+    expiresAtMs: FAR_FUTURE,
+  })));
+}
 
 function makeStorageProvider() {
   const m = new Map();
@@ -57,7 +66,10 @@ async function makeDevice(crypto, b, accountId, accountPubB64, { accountIdentity
   // Materialize + bind the account identity (loads/persists the DH key, then
   // B vouches for the X3DH signing subkey so _requireBoundX3dhIdentity resolves).
   const challenge = await svc.getOrCreateAccountBindingChallenge({ ownerAccountId: accountId });
-  const bindingSig = await crypto.sign({ privateKey: b.privateKey, msg: enc("x3dh-subkey-binding:" + challenge.x3dhIdentityPublicKeyB64) });
+  const bindingSig = await crypto.sign({
+    privateKey: b.privateKey,
+    msg: bindingBytes(accountId, challenge.x3dhIdentityPublicKeyB64),
+  });
   await svc.upsertAccountBinding({
     ownerAccountId: accountId,
     accountBinding: {
@@ -140,7 +152,10 @@ test("no in-place migration (Audit R2 #3): an injected key that mismatches a sto
   };
   const legacy = new PeerLinkService({ ...common });
   const challenge = await legacy.getOrCreateAccountBindingChallenge({ ownerAccountId: accountId });
-  const bindingSig = await crypto.sign({ privateKey: b.privateKey, msg: enc("x3dh-subkey-binding:" + challenge.x3dhIdentityPublicKeyB64) });
+  const bindingSig = await crypto.sign({
+    privateKey: b.privateKey,
+    msg: bindingBytes(accountId, challenge.x3dhIdentityPublicKeyB64),
+  });
   await legacy.upsertAccountBinding({
     ownerAccountId: accountId,
     accountBinding: {
@@ -164,4 +179,190 @@ test("no in-place migration (Audit R2 #3): an injected key that mismatches a sto
   // already-linked peers): the persisted DH pub is still the original random one.
   const rec = await sp.peerLinkStorage.keys.getAccountIdentity(accountId);
   assert.equal(rec.x3dhIdentityDhKeyMaterial.publicKeyB64, randomDhPub, "the stored DH key was NOT silently replaced");
+});
+
+test("explicit compatibility migration adopts a fully validated legacy identity-DH key without rotating it", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const b = await crypto.generateSigningKeyPair();
+  const accountPubB64 = bytesToBase64(b.publicKey);
+  const accountId = deriveAccountIdFromPublicKey(b.publicKey);
+  const sp = makeStorageProvider();
+  const authority = {
+    signer: {
+      getSignerRef() { return { accountId, keyId: "invite-ed25519-v1", alg: "ed25519", signerPublicKeyB64: accountPubB64 }; },
+      async sign(bytes) { return crypto.sign({ privateKey: b.privateKey, msg: bytes }); },
+    },
+    verifier: { async verify() { return true; } },
+  };
+  const common = {
+    storageProvider: sp,
+    clock: () => 1,
+    ownerAccountId: accountId,
+    getInviteAuthority: () => authority,
+    inviteBinding: { mailboxId: "rez:inbox:m", capabilityId: "rez:inbox:m" },
+    cryptoProvider: crypto,
+    hasAdminRoot: true,
+  };
+  const legacy = new PeerLinkService(common);
+  const challenge = await legacy.getOrCreateAccountBindingChallenge({ ownerAccountId: accountId });
+  const bindingSig = await crypto.sign({
+    privateKey: b.privateKey,
+    msg: bindingBytes(accountId, challenge.x3dhIdentityPublicKeyB64),
+  });
+  await legacy.upsertAccountBinding({
+    ownerAccountId: accountId,
+    accountBinding: {
+      accountId,
+      accountIdentityPublicKeyB64: accountPubB64,
+      x3dhIdentityPublicKeyB64: challenge.x3dhIdentityPublicKeyB64,
+      issuedAtMs: 1,
+      expiresAtMs: FAR_FUTURE,
+      accountBindingSigB64: bytesToBase64(bindingSig),
+    },
+  });
+  const legacyBound = await legacy._requireBoundX3dhIdentity(accountId);
+  const legacyKeyPair = {
+    publicKeyB64: bytesToBase64(legacyBound.identityDhKeyPair.publicKey),
+    privateKeyB64: bytesToBase64(legacyBound.identityDhKeyPair.privateKey),
+  };
+  const seededDh = SeedKeys.deriveX25519({ seed: Buffer.alloc(64, 88), label: DH_LABEL });
+  assert.notEqual(legacyKeyPair.publicKeyB64, seededDh.publicKeyB64);
+
+  const upgraded = new PeerLinkService({
+    ...common,
+    accountIdentityDhKeyPair: seededDh,
+    allowLegacyAccountIdentityDhAdoption: true,
+  });
+  const rebound = await upgraded._requireBoundX3dhIdentity(accountId);
+  assert.equal(bytesToBase64(rebound.identityDhKeyPair.publicKey), legacyKeyPair.publicKeyB64);
+  assert.deepEqual(upgraded.getAdoptedLegacyAccountIdentityDhKeyPair(), legacyKeyPair);
+  assert.equal(
+    (await sp.peerLinkStorage.keys.getAccountIdentity(accountId)).x3dhIdentityDhKeyMaterial.publicKeyB64,
+    legacyKeyPair.publicKeyB64,
+    "adoption preserves the already-published key",
+  );
+});
+
+test("compatibility migration refuses a legacy key whose root binding was tampered", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const b = await crypto.generateSigningKeyPair();
+  const accountPubB64 = bytesToBase64(b.publicKey);
+  const accountId = deriveAccountIdFromPublicKey(b.publicKey);
+  const sp = makeStorageProvider();
+  const authority = {
+    signer: {
+      getSignerRef() { return { accountId, keyId: "invite-ed25519-v1", alg: "ed25519", signerPublicKeyB64: accountPubB64 }; },
+      async sign(bytes) { return crypto.sign({ privateKey: b.privateKey, msg: bytes }); },
+    },
+    verifier: { async verify() { return true; } },
+  };
+  const common = {
+    storageProvider: sp,
+    clock: () => 1,
+    ownerAccountId: accountId,
+    getInviteAuthority: () => authority,
+    inviteBinding: { mailboxId: "rez:inbox:m", capabilityId: "rez:inbox:m" },
+    cryptoProvider: crypto,
+    hasAdminRoot: true,
+  };
+  const legacy = new PeerLinkService(common);
+  const challenge = await legacy.getOrCreateAccountBindingChallenge({ ownerAccountId: accountId });
+  const wrong = await crypto.generateSigningKeyPair();
+  await legacy.upsertAccountBinding({
+    ownerAccountId: accountId,
+    accountBinding: {
+      accountId,
+      accountIdentityPublicKeyB64: accountPubB64,
+      x3dhIdentityPublicKeyB64: challenge.x3dhIdentityPublicKeyB64,
+      issuedAtMs: 1,
+      expiresAtMs: FAR_FUTURE,
+      accountBindingSigB64: bytesToBase64(await crypto.sign({
+        privateKey: wrong.privateKey,
+        msg: bindingBytes(accountId, challenge.x3dhIdentityPublicKeyB64),
+      })),
+    },
+  });
+  const seededDh = SeedKeys.deriveX25519({ seed: Buffer.alloc(64, 77), label: DH_LABEL });
+  const upgraded = new PeerLinkService({
+    ...common,
+    accountIdentityDhKeyPair: seededDh,
+    allowLegacyAccountIdentityDhAdoption: true,
+  });
+  await assert.rejects(
+    () => upgraded._requireBoundX3dhIdentity(accountId),
+    (err) => err && err.code === "ACCOUNT_IDENTITY_DH_MIGRATION_INVALID",
+  );
+  assert.equal(upgraded.getAdoptedLegacyAccountIdentityDhKeyPair(), null);
+});
+
+test("compatibility migration refuses a mismatched private key and a forged identity-DH signature", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const b = await crypto.generateSigningKeyPair();
+  const accountPubB64 = bytesToBase64(b.publicKey);
+  const accountId = deriveAccountIdFromPublicKey(b.publicKey);
+  const sp = makeStorageProvider();
+  const authority = {
+    signer: {
+      getSignerRef() { return { accountId, keyId: "invite-ed25519-v1", alg: "ed25519", signerPublicKeyB64: accountPubB64 }; },
+      async sign(bytes) { return crypto.sign({ privateKey: b.privateKey, msg: bytes }); },
+    },
+    verifier: { async verify() { return true; } },
+  };
+  const common = {
+    storageProvider: sp,
+    clock: () => 1,
+    ownerAccountId: accountId,
+    getInviteAuthority: () => authority,
+    inviteBinding: { mailboxId: "rez:inbox:m", capabilityId: "rez:inbox:m" },
+    cryptoProvider: crypto,
+    hasAdminRoot: true,
+  };
+  const legacy = new PeerLinkService(common);
+  const challenge = await legacy.getOrCreateAccountBindingChallenge({ ownerAccountId: accountId });
+  const bindingSig = await crypto.sign({
+    privateKey: b.privateKey,
+    msg: bindingBytes(accountId, challenge.x3dhIdentityPublicKeyB64),
+  });
+  await legacy.upsertAccountBinding({
+    ownerAccountId: accountId,
+    accountBinding: {
+      accountId,
+      accountIdentityPublicKeyB64: accountPubB64,
+      x3dhIdentityPublicKeyB64: challenge.x3dhIdentityPublicKeyB64,
+      issuedAtMs: 1,
+      expiresAtMs: FAR_FUTURE,
+      accountBindingSigB64: bytesToBase64(bindingSig),
+    },
+  });
+  const validRecord = await sp.peerLinkStorage.keys.getAccountIdentity(accountId);
+  const unrelatedDh = await crypto.dhGenerateKeyPair();
+  await sp.peerLinkStorage.keys.putAccountIdentity(accountId, {
+    ...validRecord,
+    x3dhIdentityDhKeyMaterial: {
+      ...validRecord.x3dhIdentityDhKeyMaterial,
+      privateKeyB64: bytesToBase64(unrelatedDh.privateKey),
+    },
+  });
+  const seededDh = SeedKeys.deriveX25519({ seed: Buffer.alloc(64, 66), label: DH_LABEL });
+  await assert.rejects(
+    () => new PeerLinkService({
+      ...common,
+      accountIdentityDhKeyPair: seededDh,
+      allowLegacyAccountIdentityDhAdoption: true,
+    })._requireBoundX3dhIdentity(accountId),
+    (err) => err && err.code === "ACCOUNT_IDENTITY_DH_MIGRATION_INVALID",
+  );
+
+  await sp.peerLinkStorage.keys.putAccountIdentity(accountId, {
+    ...validRecord,
+    identityDhSignatureB64: bytesToBase64(new Uint8Array(64)),
+  });
+  await assert.rejects(
+    () => new PeerLinkService({
+      ...common,
+      accountIdentityDhKeyPair: seededDh,
+      allowLegacyAccountIdentityDhAdoption: true,
+    })._requireBoundX3dhIdentity(accountId),
+    (err) => err && err.code === "ACCOUNT_IDENTITY_DH_MIGRATION_INVALID",
+  );
 });

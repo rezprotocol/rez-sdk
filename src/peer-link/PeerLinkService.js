@@ -221,6 +221,22 @@ function cloneJson(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function constantTimeBytesEqual(left, right) {
+  if (!(left instanceof Uint8Array) || !(right instanceof Uint8Array)) return false;
+  if (left.length !== right.length) return false;
+  let diff = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    diff |= left[index] ^ right[index];
+  }
+  return diff === 0;
+}
+
+function legacyIdentityDhMigrationError(reason) {
+  const err = new Error("PeerLinkService: legacy account identity-DH adoption refused (" + reason + ")");
+  err.code = "ACCOUNT_IDENTITY_DH_MIGRATION_INVALID";
+  return err;
+}
+
 export function x3dhBindingPayload({ accountId, x3dhIdentityPublicKeyB64, issuedAtMs, expiresAtMs } = {}) {
   return {
     kind: "x3dh-subkey-binding",
@@ -296,6 +312,8 @@ export class PeerLinkService {
   // account shares ONE identity-DH key — the requirement for the peer-scoped
   // device-set seal (peerScopedSeal) to be openable by all of a peer's devices.
   #accountIdentityDhKeyPair;
+  #allowLegacyAccountIdentityDhAdoption;
+  #adoptedLegacyAccountIdentityDhKeyPair;
   // S2.5 S8 L6: the AccountDeviceCapabilityV1 chain (JSON, B→…→C) that makes
   // THIS device a DELEGATED inviter — it signs invite envelopes + records with
   // the device key C instead of the account key B. Null = direct mode (the
@@ -325,6 +343,7 @@ export class PeerLinkService {
     deviceKeyPair = null,
     deviceId = null,
     accountIdentityDhKeyPair = null,
+    allowLegacyAccountIdentityDhAdoption = false,
     accountCapabilityCertChain = null,
     hasAdminRoot = null,
   } = {}) {
@@ -399,6 +418,11 @@ export class PeerLinkService {
         privateKeyB64: nonEmpty(accountIdentityDhKeyPair.privateKeyB64),
       };
     }
+    if (allowLegacyAccountIdentityDhAdoption !== true && allowLegacyAccountIdentityDhAdoption !== false) {
+      throw new Error("PeerLinkService allowLegacyAccountIdentityDhAdoption must be boolean");
+    }
+    this.#allowLegacyAccountIdentityDhAdoption = allowLegacyAccountIdentityDhAdoption === true;
+    this.#adoptedLegacyAccountIdentityDhKeyPair = null;
 
     // S2.5 S8 L6: a delegated-inviter cert chain. Intrinsic to construction
     // (one-constructor rule): when supplied it must be a usable chain AND the
@@ -439,12 +463,21 @@ export class PeerLinkService {
       throw new Error("PeerLinkService hasAdminRoot=false requires accountCapabilityCertChain + deviceKeyPair + deviceId + cryptoProvider (a delegated device signs with its device key under a cert chain)");
     }
     this.#hasAdminRoot = hasAdminRoot === null ? this.#inviteCertChain === null : hasAdminRoot;
+    if (this.#allowLegacyAccountIdentityDhAdoption && this.#hasAdminRoot !== true) {
+      throw new Error("PeerLinkService legacy account identity-DH adoption requires the account admin root");
+    }
   }
 
   // The signing mode this service was constructed in. true = direct (account
   // admin root); false = cert-mode (delegated device key under a chain).
   get hasAdminRoot() {
     return this.#hasAdminRoot;
+  }
+
+  getAdoptedLegacyAccountIdentityDhKeyPair() {
+    return this.#adoptedLegacyAccountIdentityDhKeyPair
+      ? cloneJson(this.#adoptedLegacyAccountIdentityDhKeyPair)
+      : null;
   }
 
   // True when this service was constructed with a device key and can run
@@ -1621,36 +1654,45 @@ export class PeerLinkService {
     const normalized = this._normalizeStoredAccountKeyRecord(stored);
     const injectedDh = this.#accountIdentityDhKeyPair;
     const hasSigning = normalized.x3dhKeyMaterial.publicKeyB64 && normalized.x3dhKeyMaterial.privateKeyB64;
-    // A seed-derived account identity-DH key, when supplied, is AUTHORITATIVE:
-    // a stored DH key is only valid if it matches it. A legacy vault that
-    // generated a random DH key (or a fresh device) is rebuilt + re-persisted to
-    // the seed-derived key so every device of the account shares ONE identity-DH
-    // key (the peer-scoped seal requirement). Without an injected key, any stored
-    // DH key is accepted (unchanged legacy behaviour).
+    // A seed-derived account identity-DH key is authoritative for fresh
+    // accounts. An already-bound legacy key is never replaced: by default a
+    // mismatch fails loud, while the explicit primary-device migration path may
+    // validate and preserve that established key as the account compatibility
+    // key. Without an injected key, any stored key retains legacy behaviour.
     const storedHasDh = Boolean(normalized.x3dhIdentityDhKeyMaterial.publicKeyB64
       && normalized.x3dhIdentityDhKeyMaterial.privateKeyB64
       && normalized.identityDhSignatureB64);
     const storedDhMatchesInjected = !injectedDh
       || (normalized.x3dhIdentityDhKeyMaterial.publicKeyB64 === injectedDh.publicKeyB64
         && normalized.x3dhIdentityDhKeyMaterial.privateKeyB64 === injectedDh.privateKeyB64);
-    // No in-place key migration (Audit R2 #3). The seed-derived identity-DH key is
-    // intrinsic from account creation, so a fresh account persists it on first
-    // load and thereafter stored === injected. A stored key that DIFFERS from the
-    // injected seed key means this account predates seed-derivation. The prior
-    // behaviour silently REPLACED it — rotating the account's long-term DH key out
-    // from under already-linked peers, who still hold the old pubkey and would
-    // compute a different device-set slot (a silent half-migration). Refuse
-    // fail-loud instead: the account must be re-created / re-linked to adopt the
-    // seed-derived key.
+    // No key rotation during migration (Audit R2 #3). A fresh account persists
+    // its seed-derived identity-DH key on first load and thereafter stored ===
+    // injected. A mismatch means the account predates seed derivation. Replacing
+    // the stored key would strand already-linked peers on the old public key and
+    // change the device-set slot. The default remains fail-loud; the opt-in path
+    // validates the root-bound stored key and adopts that exact key instead.
     if (storedHasDh && injectedDh && !storedDhMatchesInjected) {
-      const err = new Error(
-        "PeerLinkService: persisted account identity-DH key does not match the seed-derived key "
-        + "(this account predates seed-derived identity-DH — no in-place migration; re-create/re-link to adopt it)",
-      );
-      err.code = "ACCOUNT_IDENTITY_DH_MISMATCH";
-      throw err;
+      if (!this.#allowLegacyAccountIdentityDhAdoption) {
+        const err = new Error(
+          "PeerLinkService: persisted account identity-DH key does not match the seed-derived key "
+          + "(this account predates seed-derived identity-DH — explicit compatibility-key adoption is required)",
+        );
+        err.code = "ACCOUNT_IDENTITY_DH_MISMATCH";
+        throw err;
+      }
+      await this.#validateLegacyAccountIdentityDhForAdoption(owner, normalized);
+      const adopted = {
+        publicKeyB64: normalized.x3dhIdentityDhKeyMaterial.publicKeyB64,
+        privateKeyB64: normalized.x3dhIdentityDhKeyMaterial.privateKeyB64,
+      };
+      this.#accountIdentityDhKeyPair = adopted;
+      this.#adoptedLegacyAccountIdentityDhKeyPair = adopted;
     }
-    const hasDh = storedHasDh && storedDhMatchesInjected;
+    const effectiveInjectedDh = this.#accountIdentityDhKeyPair;
+    const effectiveDhMatchesStored = !effectiveInjectedDh
+      || (normalized.x3dhIdentityDhKeyMaterial.publicKeyB64 === effectiveInjectedDh.publicKeyB64
+        && normalized.x3dhIdentityDhKeyMaterial.privateKeyB64 === effectiveInjectedDh.privateKeyB64);
+    const hasDh = storedHasDh && effectiveDhMatchesStored;
     if (hasSigning && hasDh) {
       const persistMissing = !stored
         || !stored.x3dhKeyMaterial
@@ -1715,6 +1757,90 @@ export class PeerLinkService {
     };
     await this.peerLinkStorage.keys.putAccountIdentity(owner, record);
     return record;
+  }
+
+  async #validateLegacyAccountIdentityDhForAdoption(owner, record) {
+    try {
+      await this.#validateLegacyAccountIdentityDhRecord(owner, record);
+    } catch (err) {
+      if (err && err.code === "ACCOUNT_IDENTITY_DH_MIGRATION_INVALID") throw err;
+      throw legacyIdentityDhMigrationError("stored identity-DH record is malformed or unverifiable");
+    }
+  }
+
+  async #validateLegacyAccountIdentityDhRecord(owner, record) {
+    const binding = record.accountBinding && typeof record.accountBinding === "object"
+      ? record.accountBinding
+      : null;
+    const signingPublicKeyB64 = record.x3dhKeyMaterial.publicKeyB64;
+    const dhPublicKeyB64 = record.x3dhIdentityDhKeyMaterial.publicKeyB64;
+    const dhPrivateKeyB64 = record.x3dhIdentityDhKeyMaterial.privateKeyB64;
+    if (!binding || !signingPublicKeyB64 || !dhPublicKeyB64 || !dhPrivateKeyB64
+      || !record.identityDhSignatureB64) {
+      throw legacyIdentityDhMigrationError("stored identity-DH record is incomplete");
+    }
+    if (binding.accountId !== owner
+      || binding.x3dhIdentityPublicKeyB64 !== signingPublicKeyB64
+      || deriveAccountIdFromPublicKey(base64ToBytes(binding.accountIdentityPublicKeyB64)) !== owner) {
+      throw legacyIdentityDhMigrationError("stored account binding does not match the account");
+    }
+    if (binding.accountBindingSignerPublicKeyB64
+      && binding.accountBindingSignerPublicKeyB64 !== binding.accountIdentityPublicKeyB64) {
+      throw legacyIdentityDhMigrationError("stored account binding was delegated");
+    }
+    const bindingVerified = await this.cryptoProvider.verify({
+      publicKey: base64ToBytes(binding.accountIdentityPublicKeyB64),
+      msg: signedPayloadBytes(x3dhBindingPayload({
+        accountId: owner,
+        x3dhIdentityPublicKeyB64: signingPublicKeyB64,
+        issuedAtMs: Number(binding.issuedAtMs) || 0,
+        expiresAtMs: Number(binding.expiresAtMs) || 0,
+      })),
+      sig: base64ToBytes(binding.accountBindingSigB64),
+    });
+    if (bindingVerified !== true) {
+      throw legacyIdentityDhMigrationError("stored account binding signature is invalid");
+    }
+    const dhSignatureVerified = await this.cryptoProvider.verify({
+      publicKey: base64ToBytes(signingPublicKeyB64),
+      msg: base64ToBytes(dhPublicKeyB64),
+      sig: base64ToBytes(record.identityDhSignatureB64),
+    });
+    if (dhSignatureVerified !== true) {
+      throw legacyIdentityDhMigrationError("stored identity-DH signature is invalid");
+    }
+    if (typeof this.cryptoProvider.dhGenerateKeyPair !== "function"
+      || typeof this.cryptoProvider.dhDerive !== "function") {
+      throw legacyIdentityDhMigrationError("crypto provider cannot validate the stored X25519 keypair");
+    }
+    let probe = null;
+    let fromLegacyPrivate = null;
+    let fromProbePrivate = null;
+    try {
+      probe = await this.cryptoProvider.dhGenerateKeyPair();
+      fromLegacyPrivate = await this.cryptoProvider.dhDerive({
+        privateKey: base64ToBytes(dhPrivateKeyB64),
+        publicKey: probe.publicKey,
+        alg: "X25519",
+        fmt: "spki",
+      });
+      fromProbePrivate = await this.cryptoProvider.dhDerive({
+        privateKey: probe.privateKey,
+        publicKey: base64ToBytes(dhPublicKeyB64),
+        alg: "X25519",
+        fmt: "spki",
+      });
+      if (!constantTimeBytesEqual(fromLegacyPrivate, fromProbePrivate)) {
+        throw legacyIdentityDhMigrationError("stored X25519 public/private keys do not correspond");
+      }
+    } catch (err) {
+      if (err && err.code === "ACCOUNT_IDENTITY_DH_MIGRATION_INVALID") throw err;
+      throw legacyIdentityDhMigrationError("stored X25519 keypair is invalid");
+    } finally {
+      if (probe && probe.privateKey instanceof Uint8Array) probe.privateKey.fill(0);
+      if (fromLegacyPrivate instanceof Uint8Array) fromLegacyPrivate.fill(0);
+      if (fromProbePrivate instanceof Uint8Array) fromProbePrivate.fill(0);
+    }
   }
 
   async _ensureIdentityKeyPair(accountId) {
