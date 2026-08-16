@@ -1,4 +1,4 @@
-import { REZ_CONTRACT_TYPES, CONTRACT_VERSION, deriveAccountIdFromPublicKey, canonicalJSONStringify, bytesToBase64 } from "@rezprotocol/core";
+import { REZ_CONTRACT_TYPES, CONTRACT_VERSION, deriveAccountIdFromPublicKey, canonicalJSONStringify, bytesToBase64, relayKeyIdForNodePublicKeyB64, nodeKeyIdForNodePublicKeyB64 } from "@rezprotocol/core";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -10,10 +10,13 @@ async function getTestNodeIdentity() {
   if (TEST_NODE_IDENTITY) return TEST_NODE_IDENTITY;
   const keyPair = await globalThis.crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]);
   const publicKeyBytes = new Uint8Array(await globalThis.crypto.subtle.exportKey("spki", keyPair.publicKey));
+  const nodePublicKeyB64 = bytesToBase64(publicKeyBytes);
+  // ADR-RELAY-IDENTITY: the SDK now validates the challenge's identity
+  // binding, so the fake server derives its IDs like a real node.
   TEST_NODE_IDENTITY = {
-    nodeKeyId: "test-node-key",
-    nodePublicKeyB64: bytesToBase64(publicKeyBytes),
-    relayKeyId: "test-relay-key",
+    nodeKeyId: nodeKeyIdForNodePublicKeyB64(nodePublicKeyB64),
+    nodePublicKeyB64,
+    relayKeyId: relayKeyIdForNodePublicKeyB64(nodePublicKeyB64),
     privateCryptoKey: keyPair.privateKey,
   };
   return TEST_NODE_IDENTITY;

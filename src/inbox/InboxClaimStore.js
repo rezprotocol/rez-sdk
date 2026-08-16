@@ -7,6 +7,7 @@ import {
   RCapability,
   INBOX_ID_RANDOM_BYTES,
   requireCanonicalInboxId,
+  validateRelayIdentityBinding,
 } from "@rezprotocol/core";
 
 const STORE_KEY = "sdk:inbox:claims:v1";
@@ -202,6 +203,16 @@ export class InboxClaimStore {
     }
     if (typeof relayKeyId !== "string" || !relayKeyId.trim()) {
       throw new Error("createNodeDelegation requires relayKeyId");
+    }
+    // ADR-RELAY-IDENTITY: never sign a delegation to a relay identity that is
+    // not the self-certifying identity of the node key it names.
+    const identityBinding = validateRelayIdentityBinding({
+      relayKeyId: relayKeyId.trim(),
+      nodeKeyId: nodeKeyId.trim(),
+      nodePublicKeyB64: nodePublicKeyB64.trim(),
+    });
+    if (identityBinding.ok !== true) {
+      throw new Error("createNodeDelegation relay identity binding invalid: " + identityBinding.reason);
     }
     const record = this.#claims.get(inboxId.trim());
     if (!record) {

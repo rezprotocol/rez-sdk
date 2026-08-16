@@ -1,7 +1,7 @@
 import { SDK_EVENTS } from "../events/SdkEvents.js";
 import { AuthFailure } from "../errors/index.js";
 import { signPayload, verifyPayload } from "./signing.js";
-import { REZ_CONTRACT_TYPES } from "@rezprotocol/core";
+import { REZ_CONTRACT_TYPES, validateRelayIdentityBinding } from "@rezprotocol/core";
 
 const T = REZ_CONTRACT_TYPES;
 const SESSION_CHALLENGE_TYPE = T.SESSION_CHALLENGE;
@@ -145,6 +145,13 @@ export class AuthStateMachine {
         || !Number.isFinite(issuedAtMs) || !Number.isFinite(expiresAtMs)
         || !challengeWsPath || !challengeSignatureB64) {
         throw new AuthFailure("session challenge incomplete");
+      }
+      // ADR-RELAY-IDENTITY: the node's relayKeyId must be the self-certifying
+      // identity of the node key it authenticates with. The client refuses to
+      // proceed against a node presenting a free-string or stolen relay id.
+      const identityBinding = validateRelayIdentityBinding({ relayKeyId, nodeKeyId, nodePublicKeyB64 });
+      if (identityBinding.ok !== true) {
+        throw new AuthFailure("session challenge relay identity invalid: " + identityBinding.reason);
       }
       if (Date.now() > expiresAtMs) {
         throw new AuthFailure("session challenge expired");

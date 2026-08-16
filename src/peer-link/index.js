@@ -10,6 +10,10 @@
 // callers should not import from here.
 
 export { PeerLinkService } from "./PeerLinkService.js";
+// DT-007: the owned result record a decrypt carries on `commitError`. Exported
+// so consumers can `instanceof` / decode / contract-test the degraded-commit
+// result instead of duck-typing an anonymous shape.
+export { PeerLinkCommitErrorV1, PEER_LINK_COMMIT_STAGES } from "./PeerLinkCommitErrorV1.js";
 export { createKeyValueBackedPeerLinkStorage } from "./createKeyValueBackedPeerLinkStorage.js";
 export { canonicalPayloadBytesV1 } from "./inviteCodeV1.js";
 export {

@@ -6,6 +6,8 @@ import {
   AccountDeviceCapabilityV1,
   ACCOUNT_DEVICE_CAPABILITY_PURPOSE,
   DeviceRegistrationV1,
+  relayKeyIdForNodePublicKeyB64,
+  nodeKeyIdForNodePublicKeyB64,
 } from "@rezprotocol/core";
 import { AuthStateMachine } from "../src/auth/AuthStateMachine.js";
 import { signPayload, verifyPayload } from "../src/auth/signing.js";
@@ -65,9 +67,11 @@ function makeTransport({ node, captured }) {
           nonceB64: Buffer.from(crypto.randomBytes(16)).toString("base64"),
           issuedAtMs: now,
           expiresAtMs: now + 60_000,
-          nodeKeyId: "nk-1",
+          // ADR-RELAY-IDENTITY: the SDK validates the challenge binding, so
+          // the fake node's IDs must derive from its real key.
+          nodeKeyId: nodeKeyIdForNodePublicKeyB64(node.publicKeyB64),
           nodePublicKeyB64: node.publicKeyB64,
-          relayKeyId: "rk-1",
+          relayKeyId: relayKeyIdForNodePublicKeyB64(node.publicKeyB64),
           wsPath: "/ws",
         };
         const signatureB64 = await signPayload({

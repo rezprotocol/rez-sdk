@@ -5,5 +5,5 @@
 // Consumers should import those directly from "@rezprotocol/node".
 //
 // This entry keeps only protocol/codec primitives that are sdk-shaped.
-export { encodeOuterPacket, decodeOuterPacket, bytesToRoutingKey, assertContractTree, JsonCodec, verifyReceiptV1, Hash } from "@rezprotocol/core";
+export { encodeOuterPacket, decodeOuterPacket, bytesToRoutingKey, assertContractTree, JsonCodec, Hash } from "@rezprotocol/core";
 export { createFrameCodec as createJsonFrameCodec } from "../transport/FrameCodec.js";

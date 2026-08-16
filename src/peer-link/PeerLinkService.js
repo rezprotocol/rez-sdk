@@ -39,6 +39,7 @@ import { buildSealedDeviceSetRecord, openSealedDeviceSetRecord, DEVICE_SET_PUBLI
 import { derivePeerScopedKey } from "./peerScopedSeal.js";
 import { deriveAccountStateKey, sealAccountStateEvent, openAccountStateEvent } from "./accountStateSeal.js";
 import { runtimeUuid } from "../util/runtimeUuid.js";
+import { PeerLinkCommitErrorV1 } from "./PeerLinkCommitErrorV1.js";
 import {
   PEER_LINK_STATE,
   SESSION_STATUS,
@@ -51,6 +52,11 @@ const PEER_LINK_INVITE_HASH_PREFIX = "app:peer-links:inviteHash/";
 const INVITE_CLAIM_LOCKS = new Map();
 const HANDSHAKE_ACK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 const REHANDSHAKE_DECRYPT_FAILURE_THRESHOLD = 3;
+// DT-007: bounded identical-rewrite attempts used to CONFIRM a session write
+// whose first call never returned. Bounded by the repo's two-retry policy
+// (CLAUDE.md §6); exceeding it means the store is faulted, which this interim
+// layer must not try to reason through.
+const SESSION_REWRITE_ATTEMPTS = 2;
 // A session that successfully decrypted authenticated traffic within this window
 // is treated as HEALTHY: undecryptable packets arriving alongside it are noise
 // or replay, NOT a desync, and must NOT arm a destructive re-handshake. Defeats
@@ -1510,6 +1516,7 @@ export class PeerLinkService {
     eventSummary = null,
     eventDetails = {},
     atMs = null,
+    progress = null,
   } = {}) {
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const remote = requireId(peerAccountId, "peerAccountId");
@@ -1535,7 +1542,7 @@ export class PeerLinkService {
         ? existingSession.createdAtMs
         : now;
       const sessionVersion = existingSession && existingSession.version ? existingSession.version : 1;
-      storedSession = await this.peerLinkStorage.sessions.put({
+      const sessionPutInput = {
         ...(existingSession && typeof existingSession === "object" ? existingSession : {}),
         sessionId,
         peerLinkId,
@@ -1546,7 +1553,18 @@ export class PeerLinkService {
         createdAtMs,
         updatedAtMs: now,
         version: sessionVersion,
-      });
+      };
+      // Retained so the after-decrypt recovery path can re-drive a
+      // BYTE-IDENTICAL write when the first put never returned (see
+      // #confirmAdvancedRatchetDurable). Identical INPUT means a successful
+      // rewrite records the same logical ratchet advance — NOT a second
+      // advance. The persisted record is not byte-identical: the session
+      // store bumps `version` on every put (createKeyValueBackedPeerLinkStorage
+      // sessions.put), so a rewrite is an idempotent re-assertion of one
+      // advance, not a byte-for-byte replay of one write.
+      if (progress) progress.sessionPutInput = sessionPutInput;
+      storedSession = await this.peerLinkStorage.sessions.put(sessionPutInput);
+      if (progress) progress.sessionPersisted = true;
     }
 
     // 4. Validate (log-and-allow) then apply the peer-link state transition.
@@ -1562,6 +1580,7 @@ export class PeerLinkService {
       lastErrorCode: null,
       lastErrorMessage: null,
     }, peerLinkRecord.version);
+    if (progress) progress.peerLinkUpdated = true;
 
     // 5. Append the lifecycle event. peerAccountId + sessionId are common to
     //    every establish event, so they are merged in here; the caller passes
@@ -1578,6 +1597,7 @@ export class PeerLinkService {
       },
       atMs: now,
     });
+    if (progress) progress.eventAppended = true;
 
     // 6. A successful establish clears stale decrypt/recovery accounting AND
     // marks the link healthy (an X3DH establish is authenticated traffic). This
@@ -1599,6 +1619,194 @@ export class PeerLinkService {
       event,
       sessionRecord: storedSession,
       peerLinkRecord: nextPeerLinkRecord,
+    };
+  }
+
+  // DT-007 (RISK REDUCTION ONLY — open until DT-302's durable commit intent):
+  // #commitSession persists the advanced ratchet (sessions.put) BEFORE the
+  // peer-link CAS that can throw on a stale snapshot. If a decrypt caller let
+  // that throw escape, the caller would report decrypt-failed, the deposit
+  // would stay buffered, and every retry would decrypt against the
+  // already-advanced ratchet — permanent silent plaintext loss.
+  //
+  // STAGE-AWARE recovery contract (rev-2/rev-3 review): plaintext is returned
+  // ONLY after BOTH durability facts hold — the session write RETURNED
+  // SUCCESSFULLY at least once, and the canonical record reads back holding
+  // EXACTLY this decrypt's advanced ratchet snapshot. If either fails, the
+  // ratchet advance was never proven durable (or a concurrent writer
+  // clobbered it), so the original error is re-thrown and the deposit stays
+  // buffered.
+  //
+  // WHAT RE-THROWING DOES AND DOES NOT SAVE. If the write never reached
+  // storage, the stored ratchet is unchanged and a later drain decrypts this
+  // same packet cleanly — nothing is lost. If the write LANDED and was then
+  // REJECTED (readable but not proven durable — e.g. rename succeeds, the
+  // directory fsync fails), the stored ratchet HAS advanced: re-throwing is
+  // still correct, because the system must never report a delivery it cannot
+  // prove, but this packet can no longer decrypt and its plaintext is gone.
+  // DT-007 does not close that hole — it only guarantees the failure is loud
+  // instead of silent. Closing it is DT-302's durable commit intent.
+  //
+  // When the ratchet IS verified durable, the peer-link
+  // transition is retried once against a fresh read (two attempts total,
+  // repo retry policy); any transition/event stage that still cannot land is
+  // surfaced as an owned PeerLinkCommitErrorV1 with the failed stage —
+  // including an event-append failure AFTER a successful CAS, which is never
+  // silently dropped. A crash between the ratchet persist and the caller
+  // staging the plaintext remains unrecoverable here by design (DT-302).
+  async #commitSessionAfterDecrypt(args) {
+    const progress = { sessionPersisted: false, peerLinkUpdated: false, eventAppended: false, sessionPutInput: null };
+    try {
+      return await this.#commitSession({ ...args, progress });
+    } catch (firstErr) {
+      return await this.#recoverCommitAfterDecrypt(args, progress, firstErr);
+    }
+  }
+
+  // Read back the canonical session record and require byte-exact equality of
+  // its ratchetSnapshot with this decrypt's advanced state. exportSnapshot()
+  // is a pure serialization of the in-memory ratchet, which has not advanced
+  // since the decrypt, so equality proves the durable record is OURS — not a
+  // pre-advance leftover and not a concurrent writer's clobber.
+  //
+  // NOT SUFFICIENT ON ITS OWN: a backend may make the bytes READABLE and
+  // still reject the write as non-durable (FsKeyValueStore renames the temp
+  // file, then fails its directory fsync and rejects — the record reads back
+  // byte-equal but can vanish on power loss). Callers must pair this with the
+  // "the write returned successfully" fact — see #confirmAdvancedRatchetDurable.
+  async #storedRatchetMatches({ ownerAccountId, existingSession, secureChannelManager }, progress) {
+    if (!secureChannelManager) return false;
+    const putInput = progress && progress.sessionPutInput ? progress.sessionPutInput : null;
+    const sessionId = putInput && putInput.sessionId
+      ? putInput.sessionId
+      : (existingSession && existingSession.sessionId ? existingSession.sessionId : null);
+    if (!sessionId) return false;
+    const stored = await this.peerLinkStorage.sessions.getById(ownerAccountId, sessionId);
+    if (!stored || !stored.ratchetSnapshot) return false;
+    const expected = secureChannelManager.exportSnapshot();
+    return canonicalJSONStringify(stored.ratchetSnapshot) === canonicalJSONStringify(expected);
+  }
+
+  // Durability proof gating EVERY plaintext return out of a failed commit.
+  // TWO facts are required, and read-back is only the second of them:
+  //   (a) the durability-owning write RETURNED SUCCESSFULLY at least once. A
+  //       write that threw is REJECTED, and a rejected write can never be
+  //       upgraded to "durable" by observing its bytes (see #storedRatchetMatches).
+  //   (b) the canonical record holds byte-exactly THIS decrypt's advanced
+  //       ratchet — guards a concurrent writer having clobbered it.
+  // When (a) is missing, a BOUNDED identical rewrite is attempted (repo
+  // two-retry policy). The input is byte-identical to the original put, so a
+  // successful rewrite asserts the SAME logical ratchet advance rather than a
+  // new one (the stored record itself differs: the session store increments
+  // `version` per put). If no attempt
+  // returns successfully, this interim layer cannot safely classify the
+  // result — it fails closed (the caller re-throws, the deposit stays
+  // buffered) and leaves final recovery to DT-302's durable commit intent.
+  async #confirmAdvancedRatchetDurable(args, progress) {
+    if (!progress) return false;
+    if (!progress.sessionPersisted) {
+      if (!progress.sessionPutInput) return false;
+      let lastRewriteErr = null;
+      for (let attempt = 0; attempt < SESSION_REWRITE_ATTEMPTS; attempt += 1) {
+        try {
+          await this.peerLinkStorage.sessions.put(progress.sessionPutInput);
+          progress.sessionPersisted = true;
+          lastRewriteErr = null;
+          break;
+        } catch (rewriteErr) {
+          lastRewriteErr = rewriteErr;
+        }
+      }
+      if (!progress.sessionPersisted) {
+        // Handled, not swallowed: the caller re-throws its ORIGINAL error and
+        // the deposit stays buffered. Logged so the unclassifiable state is
+        // diagnosable rather than invisible.
+        // eslint-disable-next-line no-console
+        console.warn(
+          "[PeerLinkService] session write could not be confirmed durable after "
+          + SESSION_REWRITE_ATTEMPTS + " identical rewrites; failing closed: "
+          + (lastRewriteErr && lastRewriteErr.message ? lastRewriteErr.message : String(lastRewriteErr)),
+        );
+        return false;
+      }
+    }
+    return await this.#storedRatchetMatches(args, progress);
+  }
+
+  async #recoverCommitAfterDecrypt(args, progress, firstErr) {
+    const owner = args.ownerAccountId;
+    const peerLinkId = args.peerLinkRecord.peerLinkId;
+    const describe = (err) => (err && err.message ? err.message : String(err));
+    const failedStage = (p) => {
+      if (!p.sessionPersisted) return "session-write";
+      if (!p.peerLinkUpdated) return "peer-link-transition";
+      return "event-append";
+    };
+
+    // Gate EVERYTHING on durability proof for THIS decrypt's ratchet advance.
+    if (!(await this.#confirmAdvancedRatchetDurable(args, progress))) {
+      throw firstErr;
+    }
+
+    const fresh = await this.peerLinkStorage.peerLinks.getById(owner, peerLinkId);
+    if (fresh && fresh.state === PEER_LINK_STATE.SESSION_ESTABLISHED) {
+      if (progress.peerLinkUpdated && !progress.eventAppended) {
+        // OUR CAS landed and the lifecycle event append failed after it —
+        // surfaced explicitly, never treated as "nothing left to commit".
+        return {
+          snapshot: await this._buildSnapshot(fresh),
+          event: null,
+          sessionRecord: null,
+          peerLinkRecord: fresh,
+          commitError: new PeerLinkCommitErrorV1({ stage: "event-append", message: describe(firstErr) }),
+        };
+      }
+      // A concurrent commit established the link and our ratchet is verified
+      // durable on the canonical record — the transition is genuinely done.
+      return {
+        snapshot: await this._buildSnapshot(fresh),
+        event: null,
+        sessionRecord: null,
+        peerLinkRecord: fresh,
+      };
+    }
+
+    if (fresh) {
+      const retryProgress = { sessionPersisted: false, peerLinkUpdated: false, eventAppended: false, sessionPutInput: null };
+      try {
+        return await this.#commitSession({ ...args, peerLinkRecord: fresh, progress: retryProgress });
+      } catch (retryErr) {
+        // Durability was already PROVEN above (successful write + byte-exact
+        // read-back) before this retry ran. If the retry's own sessions.put
+        // returned, re-prove through it; if the retry failed before/at the
+        // write, the earlier proof still stands and only the no-clobber
+        // read-back needs re-checking. Either way plaintext never escapes
+        // without a write that returned successfully.
+        const stillDurable = retryProgress.sessionPersisted
+          ? await this.#confirmAdvancedRatchetDurable(args, retryProgress)
+          : await this.#storedRatchetMatches(args, progress);
+        if (!stillDurable) {
+          throw retryErr;
+        }
+        return {
+          snapshot: await this._buildSnapshot(fresh),
+          event: null,
+          sessionRecord: null,
+          peerLinkRecord: fresh,
+          commitError: new PeerLinkCommitErrorV1({ stage: failedStage(retryProgress), message: describe(retryErr) }),
+        };
+      }
+    }
+
+    // The peer link vanished between decrypt and commit (teardown raced us).
+    // The ratchet is verified durable, so the plaintext still wins; the
+    // caller gets the stale snapshot it started from plus the typed marker.
+    return {
+      snapshot: await this._buildSnapshot(args.peerLinkRecord),
+      event: null,
+      sessionRecord: null,
+      peerLinkRecord: args.peerLinkRecord,
+      commitError: new PeerLinkCommitErrorV1({ stage: failedStage(progress), message: describe(firstErr) }),
     };
   }
 
@@ -2312,7 +2520,13 @@ export class PeerLinkService {
     // #commitSession path. Steady-state decrypts (already established, no status
     // change) only persist the advanced ratchet — no peer-link write/event.
     if (peerLinkRecord.state !== "session_established" || nextSessionStatus !== sessionStatus) {
-      const commit = await this.#commitSession({
+      // DT-007: the decrypt has succeeded and the ratchet advance is about to
+      // be persisted inside the commit. From here on a commit failure must not
+      // surface as a decrypt failure ONCE the advance is proven durable; while
+      // it is unproven the error still propagates (fail closed), which can
+      // lose this packet's plaintext if the write landed and was then rejected
+      // — the accepted DT-302 gap. See #commitSessionAfterDecrypt.
+      const commit = await this.#commitSessionAfterDecrypt({
         ownerAccountId: owner,
         peerLinkRecord,
         peerAccountId: remote,
@@ -2330,6 +2544,7 @@ export class PeerLinkService {
         encrypted: result.encrypted === true,
         snapshot: commit.snapshot,
         event: commit.event,
+        ...(commit.commitError ? { commitError: commit.commitError } : {}),
       };
     }
 
@@ -2437,7 +2652,11 @@ export class PeerLinkService {
       // establishment write through the single #commitSession path. Steady-state
       // trial decrypts only persist the advanced ratchet (no peer-link write).
       if (row.state !== "session_established" || nextSessionStatus !== sessionStatus) {
-        const commit = await this.#commitSession({
+        // DT-007: same rule as decryptDirectMessage — a successful decrypt's
+        // plaintext survives any peer-link commit failure whose ratchet advance
+        // is PROVEN durable; an unproven advance still fails closed (and can
+        // lose this packet — the accepted DT-302 gap).
+        const commit = await this.#commitSessionAfterDecrypt({
           ownerAccountId: owner,
           peerLinkRecord: row,
           peerAccountId: row.peerAccountId,
@@ -2455,6 +2674,7 @@ export class PeerLinkService {
           encrypted: result.encrypted === true,
           snapshot: commit.snapshot,
           event: commit.event,
+          ...(commit.commitError ? { commitError: commit.commitError } : {}),
         };
       }
 
