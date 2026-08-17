@@ -265,7 +265,17 @@ export class AuthStateMachine {
       return this.#sessionInfo;
     } catch (err) {
       this.#transition(AUTH_STATES.FAILED, { error: err && err.message });
-      throw err instanceof AuthFailure ? err : new AuthFailure((err && err.message) || "auth failed", { cause: err });
+      if (err instanceof AuthFailure) throw err;
+      const failure = new AuthFailure((err && err.message) || "auth failed", { cause: err });
+      // Carry the node's own error code forward. AuthFailure's `code` is fixed at
+      // AUTH_FAILURE by contract, so without this the reason the node gave is
+      // reduced to a message string — and callers that need to distinguish "wrong
+      // credentials" from "this home structurally cannot serve you" are left
+      // parsing prose (rez-node#2). Kept as a separate field so AuthFailure's
+      // existing shape is unchanged.
+      const serverCode = err && typeof err.code === "string" ? err.code.trim() : "";
+      if (serverCode) failure.serverCode = serverCode;
+      throw failure;
     }
   }
 

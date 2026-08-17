@@ -16,6 +16,39 @@ const RETRYABLE_FAILOVER_CODES = Object.freeze([
   "SEND_FAILED",
 ]);
 
+/**
+ * Failures that describe the HOME, not the connection: the node answered and
+ * refused on the merits. Reconnecting cannot change the answer, and relabelling
+ * it `UNREACHABLE` (a retryable, network-shaped code) actively misleads —
+ * rez-node#2, where a single-device home made a running node look unreachable.
+ *
+ * Kept as an explicit list rather than "any non-retryable error": a code this
+ * pool has never heard of should keep the old conservative behaviour, not be
+ * silently promoted to terminal.
+ */
+const TERMINAL_HOME_REJECTION_CODES = Object.freeze([
+  "DELEGATED_DEVICES_UNSUPPORTED",
+]);
+
+/**
+ * The terminal code this error carries, or "" if it is not a terminal refusal.
+ *
+ * Returns the MATCHING code rather than a boolean: the auth machine wraps
+ * transport errors in an AuthFailure whose own `code` is fixed at AUTH_FAILURE
+ * and puts the node's code on `serverCode`, so "is it terminal" and "what do we
+ * report" have different answers. Returning a boolean here and then re-reading
+ * `err.code` at the throw site reports AUTH_FAILURE — the original bug, one
+ * layer up.
+ */
+function terminalHomeRejectionCode(err) {
+  if (!err) return "";
+  for (const candidate of [err.code, err.serverCode]) {
+    const code = String(candidate || "").trim();
+    if (TERMINAL_HOME_REJECTION_CODES.includes(code)) return code;
+  }
+  return "";
+}
+
 function errObj({ code, message, retryable }) {
   const err = new Error(message || code || "UPLINK_ERR");
   err.code = code || "UPLINK_ERR";
@@ -116,6 +149,14 @@ export class UplinkPool {
     }
 
     if (!this.#ready || !this.#activeUrl) {
+      // A home that refused on the merits is not an unreachable home. Surface its own code and
+      // stop reconnecting: retrying a structural refusal burns the socket forever and buries the
+      // one message that would have told the user what is actually wrong (rez-node#2).
+      const terminalCode = terminalHomeRejectionCode(firstErr);
+      if (terminalCode) {
+        this.#emitState({ phase: "offline", reason: firstErr.message });
+        throw errObj({ code: terminalCode, message: firstErr.message, retryable: false });
+      }
       this.#emitState({ phase: "offline", reason: firstErr && firstErr.message || "no uplinks available" });
       this.#scheduleReconnect();
       throw errObj({ code: "UNREACHABLE", message: firstErr && firstErr.message || "no uplinks available", retryable: true });
