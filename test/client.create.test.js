@@ -199,6 +199,7 @@ test("RezClient sends generic payloads as opaque mailbox deposits", async () => 
     deliverInboxId: "inbox-remote",
     receiptInboxId: "inbox-local",
     payloadBytes: new Uint8Array([1, 2, 3]),
+    preSealed: true,
   });
 
   assert.equal(sent.length, 1);

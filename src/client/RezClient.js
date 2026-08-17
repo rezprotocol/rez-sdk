@@ -13,17 +13,61 @@ import { AccountOutboxCapability } from "../capabilities/AccountOutboxCapability
 import { MeshCapability } from "../capabilities/MeshCapability.js";
 import { bytesToBase64, base64ToBytes } from "../util/bytes.js";
 import { requireResponseBody } from "../util/responseBody.js";
+import { randomToken } from "../util/randomId.js";
 import { buildRezClientRuntime } from "./buildRezClientRuntime.js";
 import { RezPayloadSendParams } from "./RezPayloadSendParams.js";
 
 const T = REZ_CONTRACT_TYPES;
 
 /**
+ * The mailbox operations an application may reach (SDK-3). Everything here
+ * DRAINS a mailbox; nothing here puts anything into one.
+ *
+ * `deposit` is deliberately absent. It takes a `ciphertextB64` and will encode
+ * whatever bytes it is handed, so an app holding it can deposit plaintext while
+ * believing the SDK encrypted something — and it sat on the public client at the
+ * same level as the sealed `mesh.dispatch` seam, with nothing marking the
+ * difference. It has exactly one legitimate caller in the whole polyrepo
+ * (`MeshCapability.#dispatchToInbox`, which seals first), and that caller holds
+ * the full capability directly. Making the app surface drain-only removes the
+ * footgun structurally rather than by convention — an app cannot misuse a method
+ * it was never handed.
+ */
+export const MAILBOX_APP_OPS = Object.freeze(["list", "fetch", "ack", "cursorAck"]);
+
+/**
+ * Bind the app-facing subset of a MailboxCapability.
+ *
+ * Fails loud if an op is missing rather than returning a view with a hole in it:
+ * a silently absent `cursorAck` would read to a durable-inbox caller as "this
+ * node does not support cursors", which is a wrong answer, not a missing one.
+ */
+function _mailboxAppView(mailbox) {
+  const view = {};
+  for (const op of MAILBOX_APP_OPS) {
+    if (typeof mailbox[op] !== "function") {
+      throw new Error("RezClient: MailboxCapability is missing app op '" + op + "'");
+    }
+    view[op] = (...args) => mailbox[op](...args);
+  }
+  return Object.freeze(view);
+}
+
+/**
  * RezClient — high-level facade composing pool + event bus + auth + capabilities.
  *
- * Access pattern: rez.mailbox.deposit(...), rez.subscriptions.onMailboxDeposited(...).
- * Peer-link create/accept/get/list moved to chat-server-local PeerLinkService
- * in Shape A; the SDK no longer exposes a peerLinks capability.
+ * Access pattern: rez.mesh.dispatch(sealed.object, sealed.address) to SEND,
+ * rez.mailbox.list/fetch/ack to DRAIN, rez.subscriptions.onMailboxDeposited(...)
+ * to observe. Peer-link create/accept/get/list moved to chat-server-local
+ * PeerLinkService in Shape A; the SDK no longer exposes a peerLinks capability.
+ *
+ * PRIVILEGED SURFACE (SDK-3): `durableRecords`, `node` and `accountOutbox` are
+ * low-level and app-reachable by design — chat's server services genuinely need
+ * them (signed record publication, node status, account authority propagation).
+ * They are not sealed-by-default paths and callers own the authorization
+ * semantics. What they are NOT is a way to put unsealed bytes on the wire: the
+ * only two producers are `mesh.dispatch(inbox)` (seals, then deposits) and
+ * `mesh.dispatch(rendezvous)` (signed records that self-bind to their slot).
  */
 export class RezClient {
   #pool;
@@ -39,6 +83,7 @@ export class RezClient {
 
   // Capabilities
   #mailbox;
+  #mailboxAppView;
   #durableRecords;
   #node;
   #subscriptions;
@@ -88,6 +133,7 @@ export class RezClient {
     // Initialize capabilities
     this.#meshHandlers = new Set();
     this.#mailbox = new MailboxCapability({ pool });
+    this.#mailboxAppView = _mailboxAppView(this.#mailbox);
     this.#durableRecords = new DurableRecordsCapability({ pool });
     this.#node = new NodeCapability({ pool });
     this.#subscriptions = new SubscriptionCapability({ pool, eventBus });
@@ -292,9 +338,22 @@ export class RezClient {
     }
   }
 
+  /**
+   * Deposit ALREADY-SEALED bytes straight into a peer's mailbox.
+   *
+   * **This method encrypts nothing.** It base64s `payloadBytes` into the wire
+   * field `ciphertextB64` — a name that describes the mailbox contract, not this
+   * path — and hands them to the node. Bytes in, bytes out; if they were
+   * plaintext going in, they are plaintext at rest on the relay. Callers must
+   * pass `preSealed: true` to say they know that (SDK-4).
+   *
+   * FROZEN, RezNet-only, no new callers (DT-003 / `architecture.carrier-boundary`):
+   * it bypasses the mesh seam, so there is no delivery planning and no carrier
+   * boundary. The route for new sends is `sealForPeer()` then `mesh.dispatch()`.
+   */
   async sendPayload(args = {}) {
     const params = args instanceof RezPayloadSendParams ? args : new RezPayloadSendParams(args);
-    const objectId = params.objectId || "payload_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
+    const objectId = params.objectId || "payload_" + Date.now() + "_" + randomToken();
     const response = await this.#pool.sendRequest({
       type: T.MAILBOX_DEPOSIT,
       body: {
@@ -598,8 +657,13 @@ export class RezClient {
 
   // --- Capabilities ---
 
+  /**
+   * Drain-only mailbox view — list / fetch / ack / cursorAck. No `deposit`:
+   * see MAILBOX_APP_OPS above. To send, seal with `sealForPeer` and hand the
+   * result to `mesh.dispatch`.
+   */
   get mailbox() {
-    return this.#mailbox;
+    return this.#mailboxAppView;
   }
 
   get durableRecords() {

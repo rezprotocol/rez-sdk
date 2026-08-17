@@ -1,5 +1,6 @@
 import { REZ_CONTRACT_TYPES, MESH_ADDRESS_KINDS, assertValidMeshAddress } from "@rezprotocol/core";
 import { bytesToBase64 } from "../util/bytes.js";
+import { randomToken } from "../util/randomId.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -67,7 +68,7 @@ export class MeshCapability {
     }
     const objectId = typeof o.objectId === "string" && o.objectId.trim().length > 0
       ? o.objectId
-      : "obj_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
+      : "obj_" + Date.now() + "_" + randomToken();
     return this.#mailbox.deposit({
       mailboxId: address.inboxId,
       objectId,

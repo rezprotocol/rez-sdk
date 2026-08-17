@@ -20,6 +20,16 @@ export class RezPayloadSendParams extends RRecord {
     this.deliverInboxId = normalizeString(raw.deliverInboxId);
     this.receiptInboxId = normalizeString(raw.receiptInboxId);
     this.objectId = normalizeString(raw.objectId);
+    // SDK-4. `sendPayload` puts these bytes on the wire in a field named
+    // `ciphertextB64` and encrypts NOTHING — the name describes what the mailbox
+    // contract expects to receive, not what this path does. A caller who reads
+    // the wire shape and infers the SDK seals for them deposits plaintext.
+    //
+    // So the caller states it, in one word, at the call site. `preSealed` is not
+    // a feature flag and enables no behaviour: its only job is to make the
+    // assumption impossible to hold silently. Strict `=== true` — a truthy
+    // string or 1 is someone passing data through, not someone asserting.
+    this.preSealed = raw.preSealed === true;
     this._seal();
   }
 
@@ -31,5 +41,10 @@ export class RezPayloadSendParams extends RRecord {
       this.assert(Number.isInteger(value) && value >= 0 && value <= 255, "payloadBytes must contain bytes");
     }
     this.assert(this.deliverInboxId.length > 0, "deliverInboxId must be non-empty");
+    this.assert(
+      this.preSealed === true,
+      "payloadBytes are deposited verbatim into `ciphertextB64` — this call encrypts nothing. "
+      + "Pass preSealed: true to confirm the bytes are already sealed, or use sealForPeer() + mesh.dispatch().",
+    );
   }
 }

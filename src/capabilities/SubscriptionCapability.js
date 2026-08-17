@@ -1,5 +1,6 @@
 import { REZ_CONTRACT_TYPES } from "@rezprotocol/core";
 import { SDK_EVENTS } from "../events/SdkEvents.js";
+import { randomToken } from "../util/randomId.js";
 
 const T = REZ_CONTRACT_TYPES;
 
@@ -38,7 +39,7 @@ export class SubscriptionCapability {
 
   #subscribe(eventType, handler) {
     if (typeof handler !== "function") throw new Error("handler required");
-    const key = `${eventType}:${Date.now()}:${Math.random()}`;
+    const key = `${eventType}:${Date.now()}:${randomToken()}`;
     this.#subscriptions.set(key, { eventType, handler });
     const off = this.#pool.on(eventType, handler);
     return () => {

@@ -4,6 +4,7 @@ import { AuthStateMachine } from "../auth/AuthStateMachine.js";
 import { UplinkPool } from "../pool/UplinkPool.js";
 import { WsTransport } from "../transport/WsTransport.js";
 import { createFrameCodec } from "../transport/FrameCodec.js";
+import { randomUuid } from "../util/randomId.js";
 
 const RETRYABLE_FAILOVER_CODES = Object.freeze([
   "RATE_LIMITED",
@@ -22,11 +23,14 @@ function createError({ code, message, retryable }) {
   return err;
 }
 
+// SDK-5: this id participates in session identity metadata — it is sent in
+// session.hello, signed into the session-auth payload, and echoed back in
+// session.ready. The old `Math.random()` fallback made it predictable on
+// precisely the runtimes that lack Web Crypto; `randomUuid` throws there
+// instead, which is the honest answer for an SDK that cannot do its crypto
+// on that runtime anyway.
 function makeDeviceId() {
-  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
-    return `rez-sdk:${globalThis.crypto.randomUUID()}`;
-  }
-  return `rez-sdk:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`;
+  return `rez-sdk:${randomUuid()}`;
 }
 
 function normalizeSessionHello(sessionHello) {

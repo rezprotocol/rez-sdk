@@ -127,7 +127,10 @@ test("RezClient.sendPayload THROWS on drift instead of reporting a delivery it c
       identity: { accountId: "rez:acct:test", publicKeyB64: "p", privateKeyB64: "s" },
     });
   }
-  const args = { peerAccountId: "rez:acct:peer", payloadBytes: [1, 2, 3], deliverInboxId: MAILBOX };
+  // preSealed: sendPayload encrypts nothing — the caller states that the bytes
+  // are already sealed (SDK-4). Required, so this frozen path cannot be used
+  // by someone who assumed otherwise.
+  const args = { peerAccountId: "rez:acct:peer", payloadBytes: [1, 2, 3], deliverInboxId: MAILBOX, preSealed: true };
 
   const ok = await clientWith({ mailboxId: MAILBOX, eventId: EVENT }).sendPayload(args);
   assert.equal(ok.eventId, EVENT);
