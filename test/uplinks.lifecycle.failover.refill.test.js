@@ -116,10 +116,32 @@ test("lifecycle: connect, failover, continue requests, refill warm spares", asyn
     (evt) => evt.phase === "failover" && evt.from === "ws://a" && evt.to === "ws://b" && evt.reason === "request_retryable_error"
   );
 
-  // No-broadcast invariant:
-  // each wire request id is never sent concurrently to multiple uplinks.
-  // If an id repeats across uplinks (possible due per-connection id generators),
-  // the later occurrence must be after failover.
+  // These invariants used to be expressed by comparing a frame's `atMs` against
+  // `failoverEvent.atMs`. That comparison was UNSOUND and is deliberately gone —
+  // do not restore it. The two stamps come from different clocks on different
+  // ticks: a frame is stamped synchronously in the server message handler
+  // (installServer), while the state event is stamped in an `onState` callback
+  // that dispatches later. Both are millisecond resolution, so the assertion
+  // only ever passed by landing in the same millisecond and comparing equal.
+  //
+  // Re-running it with a shared monotonic counter in place of both `Date.now()`
+  // calls failed 12/12 under load: the retry frame genuinely PRECEDES the
+  // failover state event in causal order, so the assertion had the direction
+  // backwards. It was a load-flaky check of an ordering the pool never promised.
+  //
+  // What the two invariants actually mean is expressed below without comparing
+  // clocks at all — by IDENTITY (which uplink) rather than by timing. Frame-to-
+  // frame ordering is still used where it appears, and that IS sound: those
+  // stamps share one clock and one code path.
+  const labelForUrl = { "ws://a": "A", "ws://b": "B", "ws://c": "C" };
+  const promotedLabel = labelForUrl[failoverEvent.to];
+  assert.equal(promotedLabel, "B", "failover promoted the uplink this test expects");
+
+  // No-broadcast invariant: a wire request id is never in flight to more than one
+  // uplink at a time. Ids can repeat across uplinks because id generators are
+  // per-connection, so a repeat is allowed — but only as a HANDOFF, never a fan-out.
+  // Stated as: the occurrences sit on distinct uplinks, and the last one is the
+  // uplink failover promoted.
   const allByRequestId = new Map();
   for (const frames of Object.values(stats.receivedByUrl)) {
     for (const frame of frames) {
@@ -130,10 +152,15 @@ test("lifecycle: connect, failover, continue requests, refill warm spares", asyn
   }
   for (const entries of allByRequestId.values()) {
     if (entries.length === 1) continue;
-    const sorted = [...entries].sort((a, b) => a.atMs - b.atMs);
-    for (let i = 1; i < sorted.length; i += 1) {
-      assert.equal(sorted[i].atMs >= failoverEvent.atMs, true);
-    }
+    const uplinks = [...entries].sort((a, b) => a.atMs - b.atMs).map((f) => f.uplink);
+    assert.equal(
+      new Set(uplinks).size, uplinks.length,
+      "a wire id reached the same uplink twice — that is a resend, not a handoff: " + uplinks.join(","),
+    );
+    assert.equal(
+      uplinks[uplinks.length - 1], promotedLabel,
+      "a repeated wire id must end on the promoted uplink, not fan out: " + uplinks.join(","),
+    );
   }
 
   // Retry ordering invariant on logical request key.
@@ -142,8 +169,13 @@ test("lifecycle: connect, failover, continue requests, refill warm spares", asyn
     ...stats.receivedByUrl.B.filter((f) => f.reqKey === "retryable-once"),
     ...stats.receivedByUrl.C.filter((f) => f.reqKey === "retryable-once"),
   ].sort((a, b) => a.atMs - b.atMs);
+  // Sorted by atMs, both stamps from the same handler — sound, and this is the
+  // real ordering claim: A saw it first, B saw the retry second.
   assert.deepEqual(retryFrames.map((f) => f.uplink), ["A", "B"]);
-  assert.equal(retryFrames[1].atMs >= failoverEvent.atMs, true);
+  // ...and the retry landed on the uplink the failover promoted, which is what
+  // ties the retry to the failover DECISION rather than to a wall clock.
+  assert.equal(retryFrames[1].uplink, promotedLabel, "the retry went to the promoted uplink");
+  assert.equal(client.getActiveUplink(), failoverEvent.to, "and that uplink is the active one");
   const singleFrames = [
     ...stats.receivedByUrl.A.filter((f) => f.reqKey === "single-a"),
     ...stats.receivedByUrl.B.filter((f) => f.reqKey === "single-a"),
