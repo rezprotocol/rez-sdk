@@ -1,4 +1,4 @@
-import { KeyValueStore, RRecord, base64ToBytes, bytesToBase64 } from "@rezprotocol/core";
+import { KeyValueStore, KeyValueUnreadableError, RRecord, base64ToBytes, bytesToBase64 } from "@rezprotocol/core";
 import { createKeyValueBackedPeerLinkStorage } from "../peer-link/createKeyValueBackedPeerLinkStorage.js";
 
 const DEFAULT_DB_NAME = "rez";
@@ -216,6 +216,15 @@ class IndexedDbKeyValueStore extends KeyValueStore {
     if (stored === null) return undefined;
     if (!this.#encryptionKey) return stored;
     return this.#decrypt(physicalKey, stored);
+  }
+
+  async getStrict(key) {
+    try {
+      return await this.get(key);
+    } catch (err) {
+      if (err instanceof KeyValueUnreadableError) throw err;
+      throw new KeyValueUnreadableError({ key, cause: err });
+    }
   }
 
   async delete(key) {

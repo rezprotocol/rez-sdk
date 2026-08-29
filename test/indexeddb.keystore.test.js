@@ -189,6 +189,13 @@ test("IndexedDbStorageProvider exposes owner-partitioned encrypted key-value sto
     assert.deepEqual(await alice.get("app:chat:thread/one"), { plaintext: "secret message" });
     assert.deepEqual(await bob.get("app:chat:thread/one"), { plaintext: "different secret" });
     assert.deepEqual(await alice.keys("app:chat:"), ["app:chat:thread/one"]);
+    assert.equal(await alice.getStrict("app:chat:missing"), undefined);
+
+    await provider.put("kv/alice/app:chat:corrupt", { nonceB64: "", ciphertextB64: "" });
+    await assert.rejects(
+      () => alice.getStrict("app:chat:corrupt"),
+      (err) => err && err.code === "KEY_VALUE_UNREADABLE" && err.key === "app:chat:corrupt",
+    );
 
     const stored = await provider.get("kv/alice/app:chat:thread/one");
     assert.equal(JSON.stringify(stored).includes("secret message"), false);
