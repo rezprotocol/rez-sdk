@@ -89,25 +89,44 @@ export class UplinkPoolClient {
     sessionHello = null,
     accountIdentityPublicKeyB64 = null,
     accountIdentityPrivateKeyB64 = null,
+    claimantIdentity = null,
+    relayContractFloor = null,
     maxRequestAttempts = 3,
   } = {}) {
     if (!Array.isArray(uplinks) || uplinks.length === 0) {
       throw new Error("UplinkPoolClient requires uplinks[]");
     }
+    // SESSION_AUTH_V5: one mode per client. A claimant pool is constructed
+    // with claimantIdentity ONLY — supplying account identity too is a
+    // construction error (AuthStateMachine enforces it), and there is no
+    // fallback between the modes.
+    if (claimantIdentity !== null
+      && (accountIdentityPublicKeyB64 !== null || accountIdentityPrivateKeyB64 !== null)) {
+      throw new Error("UplinkPoolClient takes account identity OR claimantIdentity, never both");
+    }
 
     const eventBus = new TypedEventBus();
     const normalizedDeviceId = deviceId == null ? "" : String(deviceId).trim();
-    const authMachine = new AuthStateMachine({
-      identity: {
-        accountId: accountId == null ? "" : String(accountId),
-        deviceId: normalizedDeviceId || makeDeviceId(),
-        publicKeyB64: typeof accountIdentityPublicKeyB64 === "string" ? accountIdentityPublicKeyB64.trim() : "",
-        privateKeyB64: typeof accountIdentityPrivateKeyB64 === "string" ? accountIdentityPrivateKeyB64.trim() : "",
-      },
-      eventBus,
-      sessionHello: normalizeSessionHello(sessionHello),
-      clientVersion,
-    });
+    const authMachine = claimantIdentity !== null
+      ? new AuthStateMachine({
+        claimantIdentity,
+        eventBus,
+        sessionHello: normalizeSessionHello(sessionHello),
+        clientVersion,
+        relayContractFloor,
+      })
+      : new AuthStateMachine({
+        identity: {
+          accountId: accountId == null ? "" : String(accountId),
+          deviceId: normalizedDeviceId || makeDeviceId(),
+          publicKeyB64: typeof accountIdentityPublicKeyB64 === "string" ? accountIdentityPublicKeyB64.trim() : "",
+          privateKeyB64: typeof accountIdentityPrivateKeyB64 === "string" ? accountIdentityPrivateKeyB64.trim() : "",
+        },
+        eventBus,
+        sessionHello: normalizeSessionHello(sessionHello),
+        clientVersion,
+        relayContractFloor,
+      });
 
     const codec = frameCodec || createFrameCodec();
     const maxFrameBytes = Number.isFinite(Number(limits.maxFrameBytes))

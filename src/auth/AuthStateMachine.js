@@ -1,7 +1,10 @@
 import { SDK_EVENTS } from "../events/SdkEvents.js";
 import { AuthFailure } from "../errors/index.js";
 import { signPayload, verifyPayload } from "./signing.js";
-import { REZ_CONTRACT_TYPES, validateRelayIdentityBinding } from "@rezprotocol/core";
+import { permitsAccountModeAuth } from "../relay/DowngradePolicy.js";
+import { CONTRACT_VERSION, REZ_CONTRACT_TYPES, validateRelayIdentityBinding } from "@rezprotocol/core";
+
+export const AUTH_MODES = Object.freeze({ ACCOUNT: "account", CLAIMANT: "claimant" });
 
 const T = REZ_CONTRACT_TYPES;
 const SESSION_CHALLENGE_TYPE = T.SESSION_CHALLENGE;
@@ -46,6 +49,17 @@ export class AuthStateMachine {
   #sessionHello;
   #clientVersion;
   #expectedNodePublicKeyB64;
+  // SESSION_AUTH_V5: which principal mode this machine authenticates as.
+  // Fixed at construction — there is deliberately NO path from a claimant
+  // machine to an account-mode attempt (no automatic identity-disclosure
+  // fallback, Phase 0 §7); a different mode is a different machine.
+  #mode;
+  #claimantIdentity = null;
+  // SESSION_AUTH_V5 2B: optional { store, enforce } — records the verified
+  // relay's contract floor after AUTHENTICATED and, ONLY when the embedder
+  // opted into enforcement and pinned the relay identity, refuses to start an
+  // identity-bearing account-mode handshake toward a known-v5 relay.
+  #relayContractFloor = null;
 
   /**
    * @param {object} opts
@@ -61,7 +75,44 @@ export class AuthStateMachine {
    *   challenge's self-signature, but accepts whichever node identity the
    *   challenge claims.
    */
-  constructor({ identity, eventBus, sessionHello = {}, clientVersion = "rez-sdk/2.0", expectedNodePublicKeyB64 = "" } = {}) {
+  constructor({ identity, claimantIdentity, eventBus, sessionHello = {}, clientVersion = "rez-sdk/2.0", expectedNodePublicKeyB64 = "", relayContractFloor = null } = {}) {
+    // SESSION_AUTH_V5: exactly ONE mode per machine. Supplying both identity
+    // forms is a construction error, not a preference order.
+    if (claimantIdentity && identity) {
+      throw new Error("AuthStateMachine takes identity (account) OR claimantIdentity (claimant), never both");
+    }
+    if (relayContractFloor !== null) {
+      if (!relayContractFloor.store || typeof relayContractFloor.store.recordObserved !== "function"
+        || typeof relayContractFloor.store.floorFor !== "function") {
+        throw new Error("relayContractFloor requires a RelayContractFloorStore-shaped store");
+      }
+      this.#relayContractFloor = {
+        store: relayContractFloor.store,
+        enforce: relayContractFloor.enforce === true,
+      };
+    }
+    if (claimantIdentity) {
+      if (!claimantIdentity.claimantPublicKeyB64 || !claimantIdentity.privateKeyB64) {
+        throw new Error("AuthStateMachine claimant mode requires claimantIdentity.claimantPublicKeyB64 and privateKeyB64");
+      }
+      if (!eventBus) throw new Error("AuthStateMachine requires eventBus");
+      this.#mode = AUTH_MODES.CLAIMANT;
+      this.#claimantIdentity = {
+        claimantPublicKeyB64: String(claimantIdentity.claimantPublicKeyB64).trim(),
+        privateKeyB64: String(claimantIdentity.privateKeyB64),
+      };
+      this.#identity = null;
+      this.#eventBus = eventBus;
+      this.#clientVersion = String(clientVersion || "rez-sdk/2.0");
+      this.#expectedNodePublicKeyB64 = typeof expectedNodePublicKeyB64 === "string" ? expectedNodePublicKeyB64.trim() : "";
+      this.#sessionHello = {
+        requestType: String((sessionHello && sessionHello.requestType) || T.SESSION_HELLO),
+        responseType: String((sessionHello && sessionHello.responseType) || T.SESSION_READY),
+        body: {},
+      };
+      return;
+    }
+    this.#mode = AUTH_MODES.ACCOUNT;
     if (!identity || !identity.publicKeyB64) {
       throw new Error("AuthStateMachine requires identity with publicKeyB64");
     }
@@ -100,9 +151,114 @@ export class AuthStateMachine {
     return this.#sessionInfo ? { ...this.#sessionInfo } : null;
   }
 
+  get mode() {
+    return this.#mode;
+  }
+
+  /**
+   * Shared challenge intake: response-type check, field extraction,
+   * completeness, ADR-RELAY-IDENTITY binding, expiry, and the CRITICAL-2
+   * pinned-node check. Mode-specific work (which payload the self-signature
+   * covers, which key signs back) stays with each mode's flow.
+   */
+  #parseAndValidateChallenge(helloResponse) {
+    const responseType = String((helloResponse && helloResponse.t) || "");
+    if (responseType !== SESSION_CHALLENGE_TYPE) {
+      throw new AuthFailure(`unexpected response type: ${responseType || "unknown"}`);
+    }
+    this.#transition(AUTH_STATES.CHALLENGE_RECEIVED);
+    const challengeBody = helloResponse && helloResponse.body && typeof helloResponse.body === "object"
+      ? helloResponse.body
+      : {};
+    const challenge = {
+      challengeId: String(challengeBody.challengeId || ""),
+      nonceB64: String(challengeBody.nonceB64 || ""),
+      nodeKeyId: String(challengeBody.nodeKeyId || ""),
+      nodePublicKeyB64: String(challengeBody.nodePublicKeyB64 || ""),
+      relayKeyId: String(challengeBody.relayKeyId || ""),
+      issuedAtMs: Number(challengeBody.issuedAtMs),
+      expiresAtMs: Number(challengeBody.expiresAtMs),
+      wsPath: String(challengeBody.wsPath || ""),
+      signatureB64: String(challengeBody.signatureB64 || ""),
+    };
+    if (!challenge.challengeId || !challenge.nonceB64 || !challenge.nodeKeyId || !challenge.nodePublicKeyB64
+      || !challenge.relayKeyId || !Number.isFinite(challenge.issuedAtMs) || !Number.isFinite(challenge.expiresAtMs)
+      || !challenge.wsPath || !challenge.signatureB64) {
+      throw new AuthFailure("session challenge incomplete");
+    }
+    // ADR-RELAY-IDENTITY: the node's relayKeyId must be the self-certifying
+    // identity of the node key it authenticates with. The client refuses to
+    // proceed against a node presenting a free-string or stolen relay id.
+    const identityBinding = validateRelayIdentityBinding({
+      relayKeyId: challenge.relayKeyId,
+      nodeKeyId: challenge.nodeKeyId,
+      nodePublicKeyB64: challenge.nodePublicKeyB64,
+    });
+    if (identityBinding.ok !== true) {
+      throw new AuthFailure("session challenge relay identity invalid: " + identityBinding.reason);
+    }
+    if (Date.now() > challenge.expiresAtMs) {
+      throw new AuthFailure("session challenge expired");
+    }
+    // CRITICAL-2 defense: if the SDK was configured with an expected node
+    // pubkey, reject any challenge whose nodePublicKeyB64 doesn't match.
+    // This prevents a MITM from relaying a different node's challenge.
+    if (this.#expectedNodePublicKeyB64
+      && this.#expectedNodePublicKeyB64 !== challenge.nodePublicKeyB64) {
+      throw new AuthFailure(
+        "session challenge from unexpected node — refusing to sign. "
+        + "Configured expectedNodePublicKeyB64 does not match the challenge.",
+      );
+    }
+    return challenge;
+  }
+
+  /**
+   * SESSION_AUTH_V5 2B: record the verified relay's contract floor after a
+   * successful authentication; surface a downgrade CONDITION (observation,
+   * never an automatic reaction) when this session's contract is below the
+   * recorded floor.
+   */
+  #recordContractFloor({ nodePublicKeyB64, contractVersion }) {
+    if (!this.#relayContractFloor) return;
+    const result = this.#relayContractFloor.store.recordObserved({
+      relayIdentityB64: nodePublicKeyB64,
+      contractVersion,
+    });
+    if (result.downgrade === true) {
+      this.#eventBus.emit(SDK_EVENTS.AUTH_DOWNGRADE_CONDITION, {
+        relayIdentityB64: nodePublicKeyB64,
+        floor: result.floor,
+        observedCurrent: result.observedCurrent,
+      });
+    }
+  }
+
   async authenticate(transport) {
+    if (this.#mode === AUTH_MODES.CLAIMANT) {
+      return this.#authenticateClaimant(transport);
+    }
     this.#sessionInfo = null;
     this.#transition(AUTH_STATES.UNAUTHENTICATED);
+
+    // SESSION_AUTH_V5 2B (opt-in enforcement only): an account-mode handshake
+    // DISCLOSES identity in the hello, so a refusal must happen BEFORE any
+    // frame — which is only possible against a PINNED relay identity. With
+    // enforcement off (the default) this always permits; recording still
+    // happens post-auth either way.
+    if (this.#relayContractFloor && this.#expectedNodePublicKeyB64) {
+      const verdict = permitsAccountModeAuth({
+        relayIdentityB64: this.#expectedNodePublicKeyB64,
+        floorStore: this.#relayContractFloor.store,
+        enforce: this.#relayContractFloor.enforce,
+      });
+      if (verdict.permitted !== true) {
+        const failure = new AuthFailure("account-mode auth refused before hello: " + verdict.reason);
+        failure.serverCode = "DOWNGRADE_REFUSED";
+        this.#transition(AUTH_STATES.FAILED, { error: failure.message });
+        throw failure;
+      }
+    }
 
     try {
       // Step 1: Send session.hello
@@ -120,53 +276,13 @@ export class AuthStateMachine {
         timeoutMs: 5000,
       });
 
-      // Step 2: Expect session.challenge
-      const responseType = String((helloResponse && helloResponse.t) || "");
-      if (responseType !== SESSION_CHALLENGE_TYPE) {
-        throw new AuthFailure(`unexpected response type: ${responseType || "unknown"}`);
-      }
-
-      this.#transition(AUTH_STATES.CHALLENGE_RECEIVED);
-      const challengeBody = helloResponse && helloResponse.body && typeof helloResponse.body === "object"
-        ? helloResponse.body
-        : {};
-
-      const challengeId = String(challengeBody.challengeId || "");
-      const nonceB64 = String(challengeBody.nonceB64 || "");
-      const nodeKeyId = String(challengeBody.nodeKeyId || "");
-      const nodePublicKeyB64 = String(challengeBody.nodePublicKeyB64 || "");
-      const relayKeyId = String(challengeBody.relayKeyId || "");
-      const issuedAtMs = Number(challengeBody.issuedAtMs);
-      const expiresAtMs = Number(challengeBody.expiresAtMs);
-      const challengeWsPath = String(challengeBody.wsPath || "");
-      const challengeSignatureB64 = String(challengeBody.signatureB64 || "");
-
-      if (!challengeId || !nonceB64 || !nodeKeyId || !nodePublicKeyB64 || !relayKeyId
-        || !Number.isFinite(issuedAtMs) || !Number.isFinite(expiresAtMs)
-        || !challengeWsPath || !challengeSignatureB64) {
-        throw new AuthFailure("session challenge incomplete");
-      }
-      // ADR-RELAY-IDENTITY: the node's relayKeyId must be the self-certifying
-      // identity of the node key it authenticates with. The client refuses to
-      // proceed against a node presenting a free-string or stolen relay id.
-      const identityBinding = validateRelayIdentityBinding({ relayKeyId, nodeKeyId, nodePublicKeyB64 });
-      if (identityBinding.ok !== true) {
-        throw new AuthFailure("session challenge relay identity invalid: " + identityBinding.reason);
-      }
-      if (Date.now() > expiresAtMs) {
-        throw new AuthFailure("session challenge expired");
-      }
-
-      // CRITICAL-2 defense: if the SDK was configured with an expected node
-      // pubkey, reject any challenge whose nodePublicKeyB64 doesn't match.
-      // This prevents a MITM from relaying a different node's challenge.
-      if (this.#expectedNodePublicKeyB64
-        && this.#expectedNodePublicKeyB64 !== nodePublicKeyB64) {
-        throw new AuthFailure(
-          "session challenge from unexpected node — refusing to sign. "
-          + "Configured expectedNodePublicKeyB64 does not match the challenge.",
-        );
-      }
+      // Step 2: Expect session.challenge (shared intake + validation)
+      const challenge = this.#parseAndValidateChallenge(helloResponse);
+      const {
+        challengeId, nonceB64, nodeKeyId, nodePublicKeyB64, relayKeyId,
+        issuedAtMs, expiresAtMs,
+        wsPath: challengeWsPath, signatureB64: challengeSignatureB64,
+      } = challenge;
 
       // Verify the challenge's self-signature so the SDK only signs back
       // against a node that genuinely holds nodeKeyId's privkey.
@@ -249,11 +365,16 @@ export class AuthStateMachine {
         : {};
       this.#sessionInfo = {
         ...readyBody,
+        // SESSION_AUTH_V5: the verified tuple the relay-contract floor keys on
+        // — node identity proven by the challenge self-signature above.
+        contractVersion: CONTRACT_VERSION,
+        authMode: AUTH_MODES.ACCOUNT,
         nodeKeyId,
         nodePublicKeyB64,
         relayKeyId,
       };
       this.#transition(AUTH_STATES.AUTHENTICATED);
+      this.#recordContractFloor({ nodePublicKeyB64, contractVersion: CONTRACT_VERSION });
       this.#eventBus.emit(SDK_EVENTS.AUTH_AUTHENTICATED, {
         publicKeyB64: this.#identity.publicKeyB64,
         deviceId: normalizedDeviceId,
@@ -273,6 +394,114 @@ export class AuthStateMachine {
       // credentials" from "this home structurally cannot serve you" are left
       // parsing prose (rez-node#2). Kept as a separate field so AuthFailure's
       // existing shape is unchanged.
+      const serverCode = err && typeof err.code === "string" ? err.code.trim() : "";
+      if (serverCode) failure.serverCode = serverCode;
+      throw failure;
+    }
+  }
+
+  /**
+   * SESSION_AUTH_V5: claimant-mode handshake (contract 5). Proves possession
+   * of ONE claimant key; carries no account identity and no deviceId (a
+   * deviceId here would smuggle correlation metadata back into the
+   * privacy-preserving path — the node rejects it as malformed). Both signed
+   * payloads are domain-separated from the account kinds so signatures can
+   * never be replayed across modes. Any failure is FINAL for this machine:
+   * there is no account-mode retry path, by construction (Phase 0 §7).
+   */
+  async #authenticateClaimant(transport) {
+    this.#sessionInfo = null;
+    this.#transition(AUTH_STATES.UNAUTHENTICATED);
+    const claimantPublicKeyB64 = this.#claimantIdentity.claimantPublicKeyB64;
+
+    try {
+      this.#transition(AUTH_STATES.HELLO_SENT);
+      const helloResponse = await transport.sendRequest({
+        type: this.#sessionHello.requestType,
+        body: {
+          contractVersion: 5,
+          authMode: AUTH_MODES.CLAIMANT,
+          clientName: "rez-sdk",
+          clientVersion: this.#clientVersion,
+          claimantPublicKeyB64,
+        },
+        expectedResponseType: null,
+        timeoutMs: 5000,
+      });
+
+      const challenge = this.#parseAndValidateChallenge(helloResponse);
+
+      const challengeVerified = await verifyPayload({
+        publicKeyB64: challenge.nodePublicKeyB64,
+        signatureB64: challenge.signatureB64,
+        payload: {
+          kind: "session-challenge-claimant",
+          challengeId: challenge.challengeId,
+          nonceB64: challenge.nonceB64,
+          issuedAtMs: challenge.issuedAtMs,
+          expiresAtMs: challenge.expiresAtMs,
+          nodeKeyId: challenge.nodeKeyId,
+          nodePublicKeyB64: challenge.nodePublicKeyB64,
+          relayKeyId: challenge.relayKeyId,
+          claimantPublicKeyB64,
+          wsPath: challenge.wsPath,
+        },
+      });
+      if (!challengeVerified) {
+        throw new AuthFailure("session challenge signature did not verify");
+      }
+
+      this.#transition(AUTH_STATES.AUTHENTICATING);
+      const signatureB64 = await signPayload({
+        privateKeyB64: this.#claimantIdentity.privateKeyB64,
+        payload: {
+          kind: "session-auth-claimant",
+          challengeId: challenge.challengeId,
+          nonceB64: challenge.nonceB64,
+          nodeKeyId: challenge.nodeKeyId,
+          nodePublicKeyB64: challenge.nodePublicKeyB64,
+          relayKeyId: challenge.relayKeyId,
+          claimantPublicKeyB64,
+          wsPath: challenge.wsPath,
+        },
+      });
+
+      const readyResponse = await transport.sendRequest({
+        type: SESSION_AUTHENTICATE_TYPE,
+        body: { challengeId: challenge.challengeId, signatureB64 },
+        expectedResponseType: this.#sessionHello.responseType || null,
+        timeoutMs: 5000,
+      });
+
+      const readyType = String((readyResponse && readyResponse.t) || "");
+      if (this.#sessionHello.responseType && readyType !== this.#sessionHello.responseType) {
+        throw new AuthFailure(`unexpected ready type: ${readyType || "unknown"}`);
+      }
+      const readyBody = readyResponse && typeof readyResponse.body === "object" && readyResponse.body !== null
+        ? readyResponse.body
+        : {};
+      this.#sessionInfo = {
+        ...readyBody,
+        contractVersion: 5,
+        authMode: AUTH_MODES.CLAIMANT,
+        nodeKeyId: challenge.nodeKeyId,
+        nodePublicKeyB64: challenge.nodePublicKeyB64,
+        relayKeyId: challenge.relayKeyId,
+      };
+      this.#transition(AUTH_STATES.AUTHENTICATED);
+      this.#recordContractFloor({ nodePublicKeyB64: challenge.nodePublicKeyB64, contractVersion: 5 });
+      this.#eventBus.emit(SDK_EVENTS.AUTH_AUTHENTICATED, {
+        claimantPublicKeyB64,
+        nodeKeyId: challenge.nodeKeyId,
+        nodePublicKeyB64: challenge.nodePublicKeyB64,
+        relayKeyId: challenge.relayKeyId,
+      });
+      return this.#sessionInfo;
+    } catch (err) {
+      // FINAL — never retried as account-mode by this machine or any code it calls.
+      this.#transition(AUTH_STATES.FAILED, { error: err && err.message });
+      if (err instanceof AuthFailure) throw err;
+      const failure = new AuthFailure((err && err.message) || "auth failed", { cause: err });
       const serverCode = err && typeof err.code === "string" ? err.code.trim() : "";
       if (serverCode) failure.serverCode = serverCode;
       throw failure;

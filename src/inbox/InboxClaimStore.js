@@ -8,6 +8,10 @@ import {
   INBOX_ID_RANDOM_BYTES,
   requireCanonicalInboxId,
   validateRelayIdentityBinding,
+  signTerminalInboxClose,
+  claimLeasePresence,
+  canonicalInboxClaimPayload,
+  canonicalNodeDelegationPayload,
 } from "@rezprotocol/core";
 
 const STORE_KEY = "sdk:inbox:claims:v1";
@@ -95,6 +99,17 @@ export class InboxClaimStore {
     }
     const claimantPublicKeyB64 = bytesToBase64(publicKey);
     const claimantPrivateKeyB64 = bytesToBase64(privateKey);
+    // Portable inbox lease L1 (plans/PORTABLE_INBOX_LEASE_SPEC.md §2): every
+    // new claim carries a CLOSE keypair — random per inbox, NEVER derived —
+    // and a generation. Compromise semantics: the claim key can renew, the
+    // close key can kill, neither can do both. The close PRIVATE key is
+    // account-custody material: it lives in this client-side store (above
+    // the provider boundary) and its only sanctioned use is
+    // createTerminalClose().
+    const closeIdentity = await Identity.generate({ cryptoProvider: this.#crypto });
+    const closePublicKeyB64 = bytesToBase64(closeIdentity.getPublicKeyBytes());
+    const closePrivateKeyB64 = bytesToBase64(closeIdentity.getPrivateKeyBytes());
+    const generation = 1;
     // P1#2 L3.5: a device-link ceremony pre-registers a SPECIFIC inbox (the one the new
     // device device-signed a binding for + the home's device.add recorded), so the linked
     // device must claim THAT exact inbox, never a freshly-minted one. An explicit inboxId
@@ -106,11 +121,17 @@ export class InboxClaimStore {
       : this.#generateInboxId();
     const claimedAtMs = Number(clock());
 
-    const signedPayload = canonicalJSONStringify({
+    // Lease-bearing claim payload: the close key and generation are INSIDE
+    // the signed bytes, so a provider cannot strip or substitute them. The
+    // shape is built by the rez-core SSOT (canonicalInboxClaimPayload) — the
+    // same builder every verifier uses, so signer and verifiers cannot drift.
+    const signedPayload = canonicalJSONStringify(canonicalInboxClaimPayload({
       inboxId,
       claimantPublicKeyB64,
+      closePublicKeyB64,
+      generation,
       claimedAtMs,
-    });
+    }));
     const sigBytes = await this.#crypto.sign({
       privateKey,
       msg: new TextEncoder().encode(signedPayload),
@@ -135,6 +156,9 @@ export class InboxClaimStore {
       inboxId,
       claimantPublicKeyB64,
       claimantPrivateKeyB64,
+      closePublicKeyB64,
+      closePrivateKeyB64,
+      generation,
       claimedAtMs,
       claimSignatureB64,
       rootCap,
@@ -156,20 +180,63 @@ export class InboxClaimStore {
     const claimantPublicKeyB64 = record.claimantPublicKeyB64;
     const privateKey = base64ToBytes(record.claimantPrivateKeyB64);
     const claimedAtMs = Number(clock());
+    // A lease-bearing claim re-attests with the SAME extended payload shape
+    // and fields — the node refuses a downgraded (legacy-shaped)
+    // reattestation of a lease-bearing claim, and refuses an in-place upgrade
+    // of a legacy one. Legacy records keep the legacy shape untouched. The
+    // shape itself comes from the rez-core SSOT builder.
+    const carriesLease = claimLeasePresence(record) === "all";
+    const payload = canonicalInboxClaimPayload({
+      inboxId,
+      claimantPublicKeyB64,
+      claimedAtMs,
+      closePublicKeyB64: carriesLease ? record.closePublicKeyB64 : undefined,
+      generation: carriesLease ? record.generation : undefined,
+    });
     const sigBytes = await this.#crypto.sign({
       privateKey,
-      msg: new TextEncoder().encode(canonicalJSONStringify({
-        inboxId,
-        claimantPublicKeyB64,
-        claimedAtMs,
-      })),
+      msg: new TextEncoder().encode(canonicalJSONStringify(payload)),
     });
-    return {
+    const attestation = {
       inboxId,
       claimantPublicKeyB64,
       claimedAtMs,
       claimSignatureB64: bytesToBase64(sigBytes),
     };
+    if (carriesLease) {
+      attestation.closePublicKeyB64 = record.closePublicKeyB64;
+      attestation.generation = record.generation;
+    }
+    return attestation;
+  }
+
+  /**
+   * Build a signed TerminalInboxClose for a stored v2 claim — the ONLY
+   * sanctioned use of the close private key. The record authorizes itself;
+   * ship it over any session via inbox.close. Throws for a legacy claim
+   * (no close key: not closable-by-record; the lease simply lapses).
+   */
+  async createTerminalClose(inboxId, { clock = () => Date.now() } = {}) {
+    this.#requireHydrated("createTerminalClose");
+    const record = this.#claims.get(typeof inboxId === "string" ? inboxId.trim() : "");
+    if (!record) {
+      throw new Error("InboxClaimStore.createTerminalClose: no claim for " + inboxId);
+    }
+    if (typeof record.closePublicKeyB64 !== "string" || record.closePublicKeyB64.length === 0
+      || typeof record.closePrivateKeyB64 !== "string" || record.closePrivateKeyB64.length === 0
+      || !Number.isInteger(record.generation)) {
+      const err = new Error("InboxClaimStore.createTerminalClose: legacy claim has no close key — not closable by record");
+      err.code = "INBOX_NOT_CLOSABLE";
+      throw err;
+    }
+    return signTerminalInboxClose({
+      inboxId: record.inboxId,
+      finalGeneration: record.generation,
+      closedAtMs: Number(clock()),
+      closePublicKeyB64: record.closePublicKeyB64,
+      crypto: this.#crypto,
+      closePrivateKey: base64ToBytes(record.closePrivateKeyB64),
+    });
   }
 
   /**
@@ -189,8 +256,15 @@ export class InboxClaimStore {
     nodePublicKeyB64,
     relayKeyId,
     ttlMs = 7 * 24 * 60 * 60 * 1000,
+    // Lease L2: the claimant SELECTS a retention class; the provider's policy
+    // fixes what each class means (grace windows etc.). "transient" is the
+    // legacy-identical default. Ignored for legacy claims (no lease fields).
+    retentionClass = "transient",
     clock = () => Date.now(),
   } = {}) {
+    if (retentionClass !== "transient" && retentionClass !== "standard") {
+      throw new Error("createNodeDelegation: unknown retentionClass " + retentionClass);
+    }
     this.#requireHydrated("createNodeDelegation");
     if (typeof inboxId !== "string" || !inboxId.trim()) {
       throw new Error("createNodeDelegation requires inboxId");
@@ -222,8 +296,13 @@ export class InboxClaimStore {
     const privateKey = base64ToBytes(record.claimantPrivateKeyB64);
     const issuedAtMs = Number(clock());
     const expiresAtMs = issuedAtMs + Number(ttlMs);
-    const payload = {
-      kind: "inbox-node-delegation",
+    // For a lease-bearing claim the delegation IS the lease — generation
+    // binds it to the claim's lineage (a pre-close lease can never resurrect
+    // a closed generation) and retentionClass selects provider retention
+    // policy. Both are INSIDE the signed bytes, whose shape comes from the
+    // rez-core SSOT builder. Legacy claims keep the legacy payload.
+    const carriesLease = Number.isInteger(record.generation);
+    const payload = canonicalNodeDelegationPayload({
       inboxId: inboxId.trim(),
       claimantPublicKeyB64,
       nodeKeyId: nodeKeyId.trim(),
@@ -231,12 +310,14 @@ export class InboxClaimStore {
       relayKeyId: relayKeyId.trim(),
       issuedAtMs,
       expiresAtMs,
-    };
+      generation: carriesLease ? record.generation : undefined,
+      retentionClass: carriesLease ? retentionClass : undefined,
+    });
     const sigBytes = await this.#crypto.sign({
       privateKey,
       msg: new TextEncoder().encode(canonicalJSONStringify(payload)),
     });
-    return {
+    const out = {
       inboxId: payload.inboxId,
       claimantPublicKeyB64,
       nodeKeyId: payload.nodeKeyId,
@@ -246,6 +327,82 @@ export class InboxClaimStore {
       expiresAtMs,
       delegationSigB64: bytesToBase64(sigBytes),
     };
+    if (carriesLease) {
+      out.generation = payload.generation;
+      out.retentionClass = payload.retentionClass;
+    }
+    return out;
+  }
+
+  /**
+   * M6 (rez-chat plans/MOBILE_LIFECYCLE_ADAPTER_PLAN.md §7e): re-mint the
+   * NEXT generation of a reclaimed inbox lifetime — same inboxId, same
+   * claimant key (peers' delivery bindings survive), FRESH random close
+   * keypair, generation = finalGeneration + 1, freshly signed claim payload.
+   * The stored lease is dropped (the dead lifetime's window means nothing);
+   * recordAcceptedLease repopulates it when the provider accepts the new
+   * claim.
+   *
+   * Provider evidence is REQUIRED, never local arithmetic: the caller passes
+   * the finalGeneration from the provider's typed INBOX_CLOSED detail, and
+   * this method refuses unless it matches the stored generation exactly —
+   * a mismatch is a conflict to surface, not a reason to guess. Terminal
+   * closures never reach here (caller policy; and the provider refuses the
+   * lineage anyway).
+   */
+  async remintGeneration({ inboxId, finalGeneration, clock = () => Date.now() } = {}) {
+    this.#requireHydrated("remintGeneration");
+    const id = typeof inboxId === "string" ? inboxId.trim() : "";
+    const record = this.#claims.get(id);
+    if (!record) {
+      throw new Error("InboxClaimStore.remintGeneration: no claim for " + inboxId);
+    }
+    if (!Number.isInteger(record.generation)) {
+      const err = new Error("InboxClaimStore.remintGeneration: legacy claim carries no generation — nothing to re-mint");
+      err.code = "INBOX_NOT_REMINTABLE";
+      throw err;
+    }
+    if (!Number.isInteger(finalGeneration) || finalGeneration < 1) {
+      throw new Error("InboxClaimStore.remintGeneration requires the provider's finalGeneration");
+    }
+    if (record.generation !== finalGeneration) {
+      const err = new Error("InboxClaimStore.remintGeneration: generation conflict — stored "
+        + record.generation + ", provider tombstone says " + finalGeneration
+        + "; refusing to guess");
+      err.code = "REMINT_GENERATION_CONFLICT";
+      throw err;
+    }
+    const closeIdentity = await Identity.generate({ cryptoProvider: this.#crypto });
+    const closePublicKeyB64 = bytesToBase64(closeIdentity.getPublicKeyBytes());
+    const closePrivateKeyB64 = bytesToBase64(closeIdentity.getPrivateKeyBytes());
+    const generation = finalGeneration + 1;
+    const claimedAtMs = Number(clock());
+    const privateKey = base64ToBytes(record.claimantPrivateKeyB64);
+    const signedPayload = canonicalJSONStringify(canonicalInboxClaimPayload({
+      inboxId: id,
+      claimantPublicKeyB64: record.claimantPublicKeyB64,
+      closePublicKeyB64,
+      generation,
+      claimedAtMs,
+    }));
+    const sigBytes = await this.#crypto.sign({
+      privateKey,
+      msg: new TextEncoder().encode(signedPayload),
+    });
+    const previous = { ...record };
+    record.closePublicKeyB64 = closePublicKeyB64;
+    record.closePrivateKeyB64 = closePrivateKeyB64;
+    record.generation = generation;
+    record.claimedAtMs = claimedAtMs;
+    record.claimSignatureB64 = bytesToBase64(sigBytes);
+    delete record.lease;
+    try {
+      await this.#persistAll();
+    } catch (err) {
+      this.#claims.set(id, previous);
+      throw err;
+    }
+    return { inboxId: id, fromGeneration: finalGeneration, toGeneration: generation };
   }
 
   /**
@@ -258,14 +415,75 @@ export class InboxClaimStore {
     if (!normalized) {
       throw new Error("InboxClaimStore.persist: invalid claim record");
     }
+    // M3: the lease is STORE-OWNED state recorded from the acceptance seam
+    // (recordAcceptedLease), not part of the claim material callers build —
+    // a re-persist of claim material must not silently drop it.
+    const existing = this.#claims.get(normalized.inboxId);
+    if (!normalized.lease && existing && existing.lease) {
+      normalized.lease = { ...existing.lease };
+    }
     this.#claims.set(normalized.inboxId, normalized);
     try {
       await this.#persistAll();
     } catch (err) {
-      this.#claims.delete(normalized.inboxId);
+      // Roll back to what durably existed: restore the previous record for
+      // an update, remove the entry for a brand-new claim.
+      if (existing) this.#claims.set(normalized.inboxId, existing);
+      else this.#claims.delete(normalized.inboxId);
       throw err;
     }
     return normalized;
+  }
+
+  /**
+   * M3 (rez-chat plans/MOBILE_LIFECYCLE_ADAPTER_PLAN.md §7c pin 1): record
+   * the lease the provider ACTUALLY ACCEPTED. Called from the claim path
+   * strictly AFTER the INBOX_CLAIM round-trip succeeds, with the exact
+   * delegation fields that were sent — never with a draft delegation built
+   * before the wire op. A failed renewal therefore never advances the
+   * client's view of its own lease (pin 3): the previous durable state stays
+   * intact and the next wake still derives "due".
+   */
+  async recordAcceptedLease({ inboxId, issuedAtMs, expiresAtMs, retentionClass = "transient" } = {}) {
+    this.#requireHydrated("recordAcceptedLease");
+    const id = typeof inboxId === "string" ? inboxId.trim() : "";
+    const record = this.#claims.get(id);
+    if (!record) {
+      throw new Error("InboxClaimStore.recordAcceptedLease: no claim for " + inboxId);
+    }
+    const issued = Number(issuedAtMs);
+    const expires = Number(expiresAtMs);
+    if (!Number.isFinite(issued) || issued <= 0 || !Number.isFinite(expires) || expires <= issued) {
+      throw new Error("InboxClaimStore.recordAcceptedLease: invalid lease window issuedAtMs=" + issuedAtMs + " expiresAtMs=" + expiresAtMs);
+    }
+    if (retentionClass !== "transient" && retentionClass !== "standard") {
+      throw new Error("InboxClaimStore.recordAcceptedLease: unknown retentionClass " + retentionClass);
+    }
+    const previous = record.lease ? { ...record.lease } : null;
+    record.lease = { issuedAtMs: issued, expiresAtMs: expires, retentionClass };
+    try {
+      await this.#persistAll();
+    } catch (err) {
+      // Roll back the in-memory view so it never claims a durability the
+      // store does not have (same discipline as persist()).
+      if (previous) record.lease = previous;
+      else delete record.lease;
+      throw err;
+    }
+    return { ...record.lease };
+  }
+
+  /**
+   * The last ACCEPTED lease for an inbox, or null when none was ever
+   * recorded. Wake-time renewal derives "due or not" from this + now —
+   * absence means the caller should renew (the safe direction), never that
+   * the lease is healthy.
+   */
+  leaseState(inboxId) {
+    this.#requireHydrated("leaseState");
+    if (typeof inboxId !== "string" || !inboxId.trim()) return null;
+    const record = this.#claims.get(inboxId.trim());
+    return record && record.lease ? { ...record.lease } : null;
   }
 
   /**
@@ -319,7 +537,7 @@ export class InboxClaimStore {
   async #persistAll() {
     const claims = [];
     for (const record of this.#claims.values()) {
-      claims.push({
+      const row = {
         inboxId: record.inboxId,
         claimantPublicKeyB64: record.claimantPublicKeyB64,
         claimantPrivateKeyB64: record.claimantPrivateKeyB64,
@@ -328,7 +546,16 @@ export class InboxClaimStore {
         rootCap: record.rootCap && typeof record.rootCap.toJSON === "function"
           ? record.rootCap.toJSON()
           : record.rootCap,
-      });
+      };
+      if (Number.isInteger(record.generation)) {
+        row.closePublicKeyB64 = record.closePublicKeyB64;
+        row.closePrivateKeyB64 = record.closePrivateKeyB64;
+        row.generation = record.generation;
+      }
+      if (record.lease) {
+        row.lease = { ...record.lease };
+      }
+      claims.push(row);
     }
     await this.#kv.set(STORE_KEY, { claims });
   }
@@ -352,7 +579,7 @@ export class InboxClaimStore {
       ? record.rootCap
       : (record.rootCap ? new RCapability(record.rootCap) : null);
     if (!rootCap) return null;
-    return {
+    const out = {
       inboxId,
       claimantPublicKeyB64,
       claimantPrivateKeyB64,
@@ -360,11 +587,37 @@ export class InboxClaimStore {
       claimSignatureB64,
       rootCap,
     };
+    // Lease L1 fields: ALL-OR-NONE. A record carrying only part of the v2
+    // triple is corrupt — treat it as invalid rather than half-adopting it.
+    const hasClosePub = typeof record.closePublicKeyB64 === "string" && record.closePublicKeyB64.trim().length > 0;
+    const hasClosePriv = typeof record.closePrivateKeyB64 === "string" && record.closePrivateKeyB64.trim().length > 0;
+    const hasGeneration = Number.isInteger(Number(record.generation)) && Number(record.generation) >= 1;
+    if (hasClosePub || hasClosePriv || hasGeneration) {
+      if (!(hasClosePub && hasClosePriv && hasGeneration)) return null;
+      out.closePublicKeyB64 = record.closePublicKeyB64.trim();
+      out.closePrivateKeyB64 = record.closePrivateKeyB64.trim();
+      out.generation = Number(record.generation);
+    }
+    // M3: the last-accepted lease window. A malformed lease sub-record is
+    // treated as ABSENT rather than invalidating the claim (the claimant keys
+    // above are irreplaceable; the lease is re-derivable) — and absence fails
+    // toward RENEWAL at the next wake, never toward a false "seven more
+    // days", so nothing is silently trusted.
+    if (record.lease && typeof record.lease === "object") {
+      const issued = Number(record.lease.issuedAtMs);
+      const expires = Number(record.lease.expiresAtMs);
+      const cls = record.lease.retentionClass;
+      if (Number.isFinite(issued) && issued > 0 && Number.isFinite(expires) && expires > issued
+        && (cls === "transient" || cls === "standard")) {
+        out.lease = { issuedAtMs: issued, expiresAtMs: expires, retentionClass: cls };
+      }
+    }
+    return out;
   }
 }
 
 function cloneClaim(record) {
-  return {
+  const out = {
     inboxId: record.inboxId,
     claimantPublicKeyB64: record.claimantPublicKeyB64,
     claimantPrivateKeyB64: record.claimantPrivateKeyB64,
@@ -372,4 +625,13 @@ function cloneClaim(record) {
     claimSignatureB64: record.claimSignatureB64,
     rootCap: record.rootCap,
   };
+  if (Number.isInteger(record.generation)) {
+    out.closePublicKeyB64 = record.closePublicKeyB64;
+    out.closePrivateKeyB64 = record.closePrivateKeyB64;
+    out.generation = record.generation;
+  }
+  if (record.lease) {
+    out.lease = { ...record.lease };
+  }
+  return out;
 }

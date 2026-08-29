@@ -41,6 +41,10 @@ export class InboxesCapability {
       body: {
         inboxId: claim.inboxId,
         claimantPublicKeyB64: claim.claimantPublicKeyB64,
+        // Lease L1: the close key + generation are part of the SIGNED claim
+        // payload — the node reconstructs the v2 shape from these fields.
+        closePublicKeyB64: claim.closePublicKeyB64,
+        generation: claim.generation,
         claimedAtMs: claim.claimedAtMs,
         signatureB64: claim.claimSignatureB64,
       },
@@ -72,14 +76,21 @@ export class InboxesCapability {
       throw new Error("InboxesCapability.reattestInbox: no stored claim for " + inboxId);
     }
     const attestation = await this.#claimStore.createReattestation(inboxId);
+    const claimBody = {
+      inboxId: attestation.inboxId,
+      claimantPublicKeyB64: attestation.claimantPublicKeyB64,
+      claimedAtMs: attestation.claimedAtMs,
+      signatureB64: attestation.claimSignatureB64,
+    };
+    // Lease L1: a v2 claim re-attests with its v2 fields (they are inside
+    // the signed bytes); a legacy claim keeps the legacy body untouched.
+    if (Number.isInteger(attestation.generation)) {
+      claimBody.closePublicKeyB64 = attestation.closePublicKeyB64;
+      claimBody.generation = attestation.generation;
+    }
     const response = await this.#pool.sendRequest({
       type: T.INBOX_CLAIM,
-      body: {
-        inboxId: attestation.inboxId,
-        claimantPublicKeyB64: attestation.claimantPublicKeyB64,
-        claimedAtMs: attestation.claimedAtMs,
-        signatureB64: attestation.claimSignatureB64,
-      },
+      body: claimBody,
       expectedResponseType: T.INBOX_CLAIM_RES,
     });
     const body = requireResponseBody({

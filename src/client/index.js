@@ -5,7 +5,9 @@ export { RezPayloadSendParams } from "./RezPayloadSendParams.js";
 export { SDK_EVENTS } from "../events/SdkEvents.js";
 export { TypedEventBus } from "../events/TypedEventBus.js";
 export { CONNECTION_STATES } from "../connection/ConnectionState.js";
-export { AUTH_STATES } from "../auth/AuthStateMachine.js";
+export { AUTH_STATES, AUTH_MODES } from "../auth/AuthStateMachine.js";
+export { RelayContractFloorStore } from "../relay/RelayContractFloorStore.js";
+export { permitsAccountModeAuth } from "../relay/DowngradePolicy.js";
 
 // Error taxonomy
 export {
@@ -83,7 +85,7 @@ export { WARN_CODES } from "../pool/WarnCodes.js";
 export { createFrameCodec as createJsonFrameCodec } from "../transport/FrameCodec.js";
 export { asInt, nonEmpty, requireId } from "../util/coerce.js";
 export { runtimeUuid } from "../util/runtimeUuid.js";
-export { deriveDeviceIdFromPublicKeyB64 } from "../device/index.js";
+export { deriveDeviceIdFromPublicKeyB64, verifyAccountAuthority } from "../device/index.js";
 
 // Bridge infrastructure (wrapped via rez-sdk/bridge to avoid direct @rezprotocol/core import)
 export {

@@ -6,10 +6,17 @@ function makeId(prefix, seq) {
   return `${prefix}:${Date.now()}:${seq}`;
 }
 
-function asError(code, message, retryable = false) {
+function asError(code, message, retryable = false, detail = null) {
   const err = new Error(message || code || "TRANSPORT_ERR");
   err.code = code || "TRANSPORT_ERR";
   err.retryable = retryable;
+  // M6 (rez-chat plans/MOBILE_LIFECYCLE_ADAPTER_PLAN.md §7e): the node's
+  // typed error detail (e.g. INBOX_CLOSED's {closeReason, finalGeneration})
+  // survives to the thrown error — clients key policy on typed fields,
+  // never parsed message text.
+  if (detail && typeof detail === "object") {
+    err.detail = detail;
+  }
   return err;
 }
 
@@ -294,6 +301,7 @@ export class WsTransport extends Transport {
           String(frameBody.code || "REMOTE_ERR"),
           frameBody.message || "remote error",
           retryable,
+          frameBody.detail && typeof frameBody.detail === "object" ? frameBody.detail : null,
         ));
         return;
       }

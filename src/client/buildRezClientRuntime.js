@@ -7,9 +7,20 @@ import { MetricsCollector } from "../observability/MetricsCollector.js";
 import { WsTransport } from "../transport/WsTransport.js";
 import { createFrameCodec } from "../transport/FrameCodec.js";
 
-function assertPublicOptions({ uplinks, identity, callerName }) {
+function assertPublicOptions({ uplinks, identity, claimantIdentity, callerName }) {
   if (!uplinks || !Array.isArray(uplinks) || uplinks.length === 0) {
     throw new Error(callerName + " requires uplinks[]");
+  }
+  // SESSION_AUTH_V5 / F8: claimant mode is a separate construction — one mode
+  // per client, never both, no fallback between them.
+  if (claimantIdentity && typeof claimantIdentity === "object") {
+    if (identity) {
+      throw new Error(callerName + " takes identity (account) OR claimantIdentity (claimant), never both");
+    }
+    if (!claimantIdentity.claimantPublicKeyB64 || !claimantIdentity.privateKeyB64) {
+      throw new Error(callerName + " claimant mode requires claimantIdentity.claimantPublicKeyB64 and privateKeyB64");
+    }
+    return;
   }
   const row = identity && typeof identity === "object" ? identity : null;
   // Dual-mode (S9): the exact AuthStateMachine predicate — PRIMARY carries the
@@ -70,6 +81,7 @@ export function normalizeRezClientOptions(options = {}, callerName = "RezClient"
   assertPublicOptions({
     uplinks: opts.uplinks,
     identity: opts.identity,
+    claimantIdentity: opts.claimantIdentity,
     callerName,
   });
 
@@ -77,6 +89,7 @@ export function normalizeRezClientOptions(options = {}, callerName = "RezClient"
   return {
     uplinks: opts.uplinks,
     identity: opts.identity,
+    claimantIdentity: opts.claimantIdentity && typeof opts.claimantIdentity === "object" ? opts.claimantIdentity : null,
     transportScheme,
     warmSpareCount: opts.warmSpareCount == null ? 2 : opts.warmSpareCount,
     timeouts: opts.timeouts && typeof opts.timeouts === "object" ? opts.timeouts : {},
@@ -93,6 +106,9 @@ export function normalizeRezClientOptions(options = {}, callerName = "RezClient"
     // nodePublicKeyB64 doesn't match. For local/in-process node deployment
     // the launcher should pass the node's published pubkey here.
     expectedNodePublicKeyB64: typeof opts.expectedNodePublicKeyB64 === "string" ? opts.expectedNodePublicKeyB64 : "",
+    // SESSION_AUTH_V5 2B: optional { store, enforce } — record-only unless
+    // the embedder opts into enforcement.
+    relayContractFloor: opts.relayContractFloor && typeof opts.relayContractFloor === "object" ? opts.relayContractFloor : null,
   };
 }
 
@@ -106,13 +122,22 @@ export function buildRezClientRuntime(options = {}, callerName = "RezClient") {
     body: { contractVersion: CONTRACT_VERSION },
   };
 
-  const authMachine = new AuthStateMachine({
-    identity: opts.identity,
-    eventBus,
-    sessionHello: resolvedSessionHello,
-    clientVersion: opts.clientVersion,
-    expectedNodePublicKeyB64: opts.expectedNodePublicKeyB64,
-  });
+  const authMachine = opts.claimantIdentity
+    ? new AuthStateMachine({
+      claimantIdentity: opts.claimantIdentity,
+      eventBus,
+      clientVersion: opts.clientVersion,
+      expectedNodePublicKeyB64: opts.expectedNodePublicKeyB64,
+      relayContractFloor: opts.relayContractFloor,
+    })
+    : new AuthStateMachine({
+      identity: opts.identity,
+      eventBus,
+      sessionHello: resolvedSessionHello,
+      clientVersion: opts.clientVersion,
+      expectedNodePublicKeyB64: opts.expectedNodePublicKeyB64,
+      relayContractFloor: opts.relayContractFloor,
+    });
 
   const codec = opts.frameCodec || createFrameCodec();
   const transportOpts = {
@@ -165,5 +190,6 @@ export function buildRezClientRuntime(options = {}, callerName = "RezClient") {
     authMachine,
     metrics,
     identity: opts.identity,
+    authMode: opts.claimantIdentity ? "claimant" : "account",
   };
 }

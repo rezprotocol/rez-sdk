@@ -43,6 +43,20 @@ export class ConnectivityCapability {
     return this.#eventBus.on(SDK_EVENTS.TRANSPORT_RECONNECTED, handler);
   }
 
+  /**
+   * M2 (mobile lifecycle): cancel any pending reconnect backoff wait and run
+   * one serialized reconnect attempt NOW — the platform-wake liveness kick.
+   * Resolves after the session-restoration hooks ran (same contract as a
+   * scheduled reconnect); rejects when the attempt failed or the pool cannot
+   * support the kick — never a silent no-op.
+   */
+  async connectNow() {
+    if (this.#pool && typeof this.#pool.connectNow === "function") {
+      return this.#pool.connectNow();
+    }
+    throw new Error("connectivity.connectNow unavailable: this pool does not implement connectNow");
+  }
+
   onUplinkChanged(handler) {
     return this.#eventBus.on(SDK_EVENTS.TRANSPORT_UPLINK_CHANGED, handler);
   }

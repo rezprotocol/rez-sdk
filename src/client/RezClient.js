@@ -102,10 +102,18 @@ export class RezClient {
   // Mesh-status subscribers (passive — fires on refreshMesh)
   #meshHandlers;
 
+  // SESSION_AUTH_V5 / F8: which principal mode this client authenticates as.
+  // Fixed at construction; a claimant client's capability surface is the
+  // DATA-PLANE subset only — account-authority capabilities do not exist on
+  // it (the wrong call is a thrown error here before it could ever become a
+  // protocol denial at the node's dispatcher).
+  #authMode;
+
   constructor(options = {}) {
     const runtime = this.#resolveRuntime(options);
     const { pool, eventBus, authMachine, metrics, identity } = runtime;
     const opts = options && typeof options === "object" ? options : {};
+    this.#authMode = runtime.authMode === "claimant" ? "claimant" : "account";
     this.#peerLinkService = opts.peerLinkService || null;
 
     this.#pool = pool;
@@ -130,7 +138,11 @@ export class RezClient {
       this.#metrics.increment("sdk.auth.attempts");
     });
 
-    // Initialize capabilities
+    // Initialize capabilities. Data plane (both modes): mailbox, durable
+    // records, node status, subscriptions, connectivity, mesh dispatch.
+    // Account-authority capabilities (identity, devices, accountOutbox) are
+    // constructed ONLY for an account-mode client — a claimant client cannot
+    // express account authority by surface, not by discipline.
     this.#meshHandlers = new Set();
     this.#mailbox = new MailboxCapability({ pool });
     this.#mailboxAppView = _mailboxAppView(this.#mailbox);
@@ -138,9 +150,15 @@ export class RezClient {
     this.#node = new NodeCapability({ pool });
     this.#subscriptions = new SubscriptionCapability({ pool, eventBus });
     this.#connectivity = new ConnectivityCapability({ pool, eventBus });
-    this.#identityCap = new IdentityCapability({ pool, eventBus, identity });
-    this.#devices = new DevicesCapability({ pool });
-    this.#accountOutbox = new AccountOutboxCapability({ pool });
+    if (this.#authMode === "account") {
+      this.#identityCap = new IdentityCapability({ pool, eventBus, identity });
+      this.#devices = new DevicesCapability({ pool });
+      this.#accountOutbox = new AccountOutboxCapability({ pool });
+    } else {
+      this.#identityCap = null;
+      this.#devices = null;
+      this.#accountOutbox = null;
+    }
     // The one mesh-dispatch verb. Delegates to mailbox / durableRecords so the
     // wire op stays single-sourced; apps call rez.mesh.dispatch(object, address).
     this.#mesh = new MeshCapability({ mailbox: this.#mailbox, durableRecords: this.#durableRecords });
@@ -158,9 +176,23 @@ export class RezClient {
         authMachine: row.authMachine,
         metrics: row.metrics,
         identity: row.identity,
+        authMode: row.authMode === "claimant" ? "claimant" : "account",
       };
     }
     return buildRezClientRuntime(row, "RezClient");
+  }
+
+  get authMode() {
+    return this.#authMode;
+  }
+
+  #requireAccountMode(capability) {
+    if (this.#authMode !== "account") {
+      throw new Error(
+        "RezClient." + capability + " requires an account-mode client — this client authenticates as a CLAIMANT"
+        + " and cannot express account authority (F8: account-control work goes through an account-mode connection)",
+      );
+    }
   }
 
   // --- Lifecycle ---
@@ -233,6 +265,13 @@ export class RezClient {
       try {
         if (this.#connected) {
           await this.disconnect();
+        } else {
+          // M2 (mobile lifecycle): a client that never reached connected can
+          // still hold live pool machinery — a failed first connect leaves a
+          // scheduled background reconnect armed. close() must terminate it
+          // unconditionally, or a stopped client comes back later from a
+          // stale timer as a half-alive session nobody owns.
+          await this.#pool.close();
         }
         if (!this.#started) return this;
         this.#started = false;
@@ -566,6 +605,7 @@ export class RezClient {
    * targets for an account-state event. @returns {Promise<Array<{deviceId,inboxId}>>}
    */
   async listSiblingDeviceInboxes() {
+    this.#requireAccountMode("listSiblingDeviceInboxes");
     const identity = this.getIdentity();
     const ownInboxId = identity && typeof identity.localInboxId === "string" ? identity.localInboxId : "";
     const ownDeviceId = this.#peerLinkService && typeof this.#peerLinkService.deviceId === "string"
@@ -683,10 +723,12 @@ export class RezClient {
   }
 
   get identity() {
+    this.#requireAccountMode("identity");
     return this.#identityCap;
   }
 
   get devices() {
+    this.#requireAccountMode("devices");
     return this.#devices;
   }
 
@@ -696,6 +738,7 @@ export class RezClient {
    * account-signed record on the account's behalf.
    */
   get accountOutbox() {
+    this.#requireAccountMode("accountOutbox");
     return this.#accountOutbox;
   }
 

@@ -93,6 +93,11 @@ export class UplinkPool {
   #reconnectBackoffMs;
   #reconnectBackoffCapMs;
   #closed = false;
+  // M2 (mobile lifecycle): serialization for the connect machinery. Two
+  // concurrent connects would close each other's transports mid-handshake,
+  // so a caller joins the in-flight attempt instead of racing it.
+  #connectPromise = null;
+  #attemptReconnectPromise = null;
 
   constructor({
     uplinks,
@@ -131,6 +136,38 @@ export class UplinkPool {
   }
 
   async connect() {
+    if (this.#connectPromise) return this.#connectPromise;
+    this.#connectPromise = this.#runConnect();
+    try {
+      return await this.#connectPromise;
+    } finally {
+      this.#connectPromise = null;
+    }
+  }
+
+  /**
+   * M2 (mobile lifecycle): the app-level liveness kick — "the network is
+   * back, connect NOW". Cancels the future scheduled backoff attempt and
+   * runs one reconnect attempt immediately, SERIALIZED with the pool's own
+   * machinery: an attempt already in flight (a scheduled callback that has
+   * entered its reconnect path, or a concurrent connectNow) is JOINED, never
+   * raced. A ready pool is a no-op. The awaited restoration hooks
+   * (onReconnected) run before this resolves, exactly as on a scheduled
+   * reconnect; on failure the standard path stands — offline state + the
+   * next scheduled backoff attempt — and the error is rethrown so the caller
+   * can short-circuit its wake sequence.
+   */
+  async connectNow() {
+    if (this.#closed) {
+      throw errObj({ code: "CLOSED", message: "uplink pool is closed", retryable: false });
+    }
+    if (this.#attemptReconnectPromise) return this.#attemptReconnectPromise;
+    if (this.#ready && this.#activeUrl) return;
+    this.#stopReconnectTimer();
+    return this.#attemptReconnect();
+  }
+
+  async #runConnect() {
     this.#closed = false;
     this.#stopReconnectTimer();
     await this.#closeConnections();
@@ -451,24 +488,45 @@ export class UplinkPool {
     this.#reconnectTimer = setTimeout(() => {
       this.#reconnectTimer = null;
       if (this.#closed) return;
-      this.connect().then(
-        async () => {
-          try {
-            await this.#notifyReconnected();
-            this.#reconnectAttempts = 0;
-          } catch (err) {
-            await this.#closeConnections();
-            this.#emitState({ phase: "offline", reason: err && err.message ? err.message : "session restore failed" });
-            this.#scheduleReconnect();
-          }
-        },
-        () => {
-          this.#emitState({ phase: "offline", reason: "reconnect failed" });
-          this.#scheduleReconnect();
-        },
-      );
+      // Outcomes (offline + reschedule on failure) are handled inside; the
+      // rejection is re-surfaced only to connectNow() callers who joined.
+      this.#attemptReconnect().catch(() => {});
     }, delayMs);
     if (this.#reconnectTimer.unref) this.#reconnectTimer.unref();
+  }
+
+  /**
+   * One reconnect attempt: connect, then replay the awaited restoration
+   * hooks. Shared by the scheduled backoff path and connectNow() so the two
+   * SERIALIZE (a second caller joins the in-flight attempt). Failure
+   * handling is the scheduled path's, unchanged: offline state + the next
+   * scheduled backoff attempt; the error is rethrown for joined callers.
+   */
+  async #attemptReconnect() {
+    if (this.#attemptReconnectPromise) return this.#attemptReconnectPromise;
+    this.#attemptReconnectPromise = (async () => {
+      try {
+        await this.connect();
+      } catch (err) {
+        this.#emitState({ phase: "offline", reason: "reconnect failed" });
+        this.#scheduleReconnect();
+        throw err;
+      }
+      try {
+        await this.#notifyReconnected();
+        this.#reconnectAttempts = 0;
+      } catch (err) {
+        await this.#closeConnections();
+        this.#emitState({ phase: "offline", reason: err && err.message ? err.message : "session restore failed" });
+        this.#scheduleReconnect();
+        throw err;
+      }
+    })();
+    try {
+      return await this.#attemptReconnectPromise;
+    } finally {
+      this.#attemptReconnectPromise = null;
+    }
   }
 
   async #ensureWarmSpareTarget() {

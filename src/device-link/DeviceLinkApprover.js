@@ -263,7 +263,12 @@ export class DeviceLinkApprover {
   /**
    * The HUMAN-GATED step: mint the leaf cert for the pinned device key, seal
    * + publish the delegation bundle, and wait for the key-confirmation
-   * record. → { newDeviceId, certId }
+   * record. → { newDeviceId, certId, inboxId } — inboxId is the ceremony
+   * inbox the home COMMITTED for this device (validated against the request's
+   * device-signed binding), returned so the caller can address the new
+   * device directly during activation: until the READY→ACTIVE commit the
+   * device publishes no bundle, so DeviceSet-derived resolution structurally
+   * cannot reach it.
    */
   #onJournalWarning(op, err) {
     const message = "DeviceLinkApprover: registration journal " + op + " failed after the ceremony"
@@ -450,7 +455,7 @@ export class DeviceLinkApprover {
             // Deliberately non-fatal, and deliberately not silent.
             this.#onJournalWarning("markConfirmed", err);
           }
-          const result = { newDeviceId: pinned.newDeviceId, certId: leafCert.certId };
+          const result = { newDeviceId: pinned.newDeviceId, certId: leafCert.certId, inboxId: bindingInboxId };
           this.#terminate("done");
           return result;
         }

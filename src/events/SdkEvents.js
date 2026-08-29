@@ -15,6 +15,10 @@ export const SDK_EVENTS = Object.freeze({
   AUTH_STATE_CHANGED: "sdk.auth.stateChanged",
   AUTH_AUTHENTICATED: "sdk.auth.authenticated",
   AUTH_REAUTH_REQUIRED: "sdk.auth.reauthRequired",
+  // SESSION_AUTH_V5 2B: a relay whose recorded contract floor is higher than
+  // the contract this session authenticated at — a security OBSERVATION,
+  // surfaced to the embedder; policy (refusal) is separate and opt-in.
+  AUTH_DOWNGRADE_CONDITION: "sdk.auth.downgradeCondition",
 
   // Transport
   TRANSPORT_UPLINK_CHANGED: "sdk.transport.uplinkChanged",

@@ -331,3 +331,51 @@ test("direct regression: the shipped publish shape is unchanged — B signs inne
   });
   assert.equal(setOk, true, "direct mode: the inner set is B-signed");
 });
+
+// M4 (rez-chat plans/MOBILE_LIFECYCLE_ADAPTER_PLAN.md §7b): the OWN-account
+// authority-state readers — the claimant-clean revocation source a mobile wake
+// composes with the durable device roster. Same shared verification body as the
+// peer path, anchored on the LOCALLY bound account key: no peer link, no
+// account authority, pure data-plane fetch + local crypto.
+
+test("M4: ownAuthorityStateCoordinates + openOwnAuthorityStateRecord round-trip the account's OWN published state with full verification", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+
+  const coords = await alice.svc.ownAuthorityStateCoordinates();
+  assert.equal(coords.recordKind, "account-authority-state");
+  assert.equal(coords.recordId, "v1");
+  assert.equal(coords.publisherPublicKeyB64, alice.accountPubB64,
+    "the coordinates are the SAME public slot every peer reads");
+
+  const { record } = await alice.svc.buildAccountAuthorityStateRecord({ epoch: 4, revokedCertIds: [], nowMs: 5 });
+  const opened = await alice.svc.openOwnAuthorityStateRecord({ record, nowMs: 6 });
+  assert.equal(opened.epoch, 4);
+  assert.deepEqual(opened.revocationState, { revokedCertIds: [], minValidIssuedAtMs: 0 });
+});
+
+test("M4: openOwnAuthorityStateRecord REJECTS a record owned by a different account (a planted foreign record cannot spoof own revocation state)", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+  const mallory = await makeAccount(crypto, { mailboxId: "rez:inbox:mallory" });
+
+  const { record } = await mallory.svc.buildAccountAuthorityStateRecord({ epoch: 99, revokedCertIds: [], nowMs: 5 });
+  await assert.rejects(
+    () => alice.svc.openOwnAuthorityStateRecord({ record, nowMs: 6 }),
+    /owner is not the expected account identity/,
+  );
+});
+
+test("M4: openOwnAuthorityStateRecord REJECTS a tampered payload (signature verification is not skippable on the own path)", async () => {
+  const crypto = new BrowserCryptoProvider();
+  const alice = await makeAccount(crypto, { mailboxId: "rez:inbox:alice" });
+
+  const { record } = await alice.svc.buildAccountAuthorityStateRecord({ epoch: 2, revokedCertIds: [], nowMs: 5 });
+  const stateJson = JSON.parse(new TextDecoder().decode(base64ToBytes(record.payloadB64)));
+  stateJson.epoch = 7; // an attacker inflating the epoch would force endless defers (or hide a rollback)
+  const tampered = { ...record, payloadB64: bytesToBase64(enc(JSON.stringify(stateJson))) };
+  await assert.rejects(
+    () => alice.svc.openOwnAuthorityStateRecord({ record: tampered, nowMs: 6 }),
+    (err) => /verification failed|signature failed/.test(err.message),
+  );
+});

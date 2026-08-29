@@ -88,12 +88,15 @@ test("createClaim produces a self-consistent signed record", async () => {
   assert.equal(claim.claimedAtMs, 1700000000000);
   assert.ok(claim.rootCap instanceof RCapability);
 
-  // Signature verifies against the supplied claimant pubkey
+  // Signature verifies against the supplied claimant pubkey — over the v2
+  // payload (lease L1: close key + generation are INSIDE the signed bytes).
   const verified = await cryptoProvider.verify({
     publicKey: base64ToBytes(claim.claimantPublicKeyB64),
     msg: new TextEncoder().encode(canonicalJSONStringify({
       inboxId: claim.inboxId,
       claimantPublicKeyB64: claim.claimantPublicKeyB64,
+      closePublicKeyB64: claim.closePublicKeyB64,
+      generation: claim.generation,
       claimedAtMs: claim.claimedAtMs,
     })),
     sig: base64ToBytes(claim.claimSignatureB64),
@@ -200,12 +203,15 @@ test("createReattestation produces a fresh signature using the stored privkey", 
   // Different claimedAtMs ⇒ different signature
   assert.notEqual(reattest.claimSignatureB64, claim.claimSignatureB64);
 
-  // Verifies against the same claimant pubkey
+  // Verifies against the same claimant pubkey — a v2 claim re-attests with
+  // the v2 payload shape (lease L1).
   const verified = await cryptoProvider.verify({
     publicKey: base64ToBytes(claim.claimantPublicKeyB64),
     msg: new TextEncoder().encode(canonicalJSONStringify({
       inboxId: claim.inboxId,
       claimantPublicKeyB64: claim.claimantPublicKeyB64,
+      closePublicKeyB64: claim.closePublicKeyB64,
+      generation: claim.generation,
       claimedAtMs: 9999,
     })),
     sig: base64ToBytes(reattest.claimSignatureB64),

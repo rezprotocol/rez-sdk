@@ -815,11 +815,19 @@ export class PeerLinkService {
    *
    * @returns {Promise<DevicePrekeyBundleV1>}
    */
-  async buildAndRetainAccountDeviceBundle({ ownerAccountId = this.ownerAccountId, nowMs } = {}) {
+  async buildAndRetainAccountDeviceBundle({ ownerAccountId = this.ownerAccountId, nowMs, inboxId: inboxIdOverride = null } = {}) {
     this.#requireDeviceSessions();
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const at = asPositiveInt(nowMs, this.clock());
-    const inboxId = nonEmpty(this.inviteBinding && this.inviteBinding.mailboxId);
+    // P1.3b (rez-chat plans/MOBILE_PLATFORM_INTEGRATION_PLAN.md): the bundle's
+    // inboxId is THE address the world learns for this device. The split-
+    // transport activation publishes a PORTABLE per-device inbox that is NOT
+    // the session's claimed (bootstrap) inbox, so the caller may name it
+    // explicitly; the default remains the invite binding's mailbox — the
+    // shipped single-transport behavior, byte-identical.
+    const inboxId = inboxIdOverride !== null && inboxIdOverride !== undefined
+      ? nonEmpty(inboxIdOverride)
+      : nonEmpty(this.inviteBinding && this.inviteBinding.mailboxId);
     if (!inboxId) {
       throw new Error("buildAndRetainAccountDeviceBundle requires inviteBinding.mailboxId (this device's inbox)");
     }
@@ -1046,28 +1054,78 @@ export class PeerLinkService {
     }
     const at = asPositiveInt(nowMs, this.clock());
     const { peerAccountPublicKeyB64 } = await this._requirePeerDeviceSetContext(owner, peer);
+    return this.#openAuthorityStateRecordAgainst({ accountPublicKeyB64: peerAccountPublicKeyB64, record, nowMs: at });
+  }
+
+  /**
+   * The OWN account's authority-state coordinates — the SAME public slot every
+   * peer reads (M4, rez-chat plans/MOBILE_LIFECYCLE_ADAPTER_PLAN.md). The
+   * account PUBLIC key comes from the locally bound account identity, so a
+   * CLAIMANT/data-plane runtime can construct these without expressing any
+   * account authority.
+   */
+  async ownAuthorityStateCoordinates({ ownerAccountId = this.ownerAccountId } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    const { accountBinding } = await this._requireBoundX3dhIdentity(owner);
+    const accountPublicKeyB64 = nonEmpty(accountBinding && accountBinding.accountIdentityPublicKeyB64);
+    if (!accountPublicKeyB64) {
+      throw new Error("ownAuthorityStateCoordinates requires a bound account identity");
+    }
+    return { recordKind: ACCOUNT_AUTHORITY_STATE_RECORD_KIND, recordId: "v1", publisherPublicKeyB64: accountPublicKeyB64 };
+  }
+
+  /**
+   * OPEN + verify the OWN account's authority-state record — identical
+   * verification to the peer path (same shared body: same-owner binding,
+   * DurableRecordV2 verification, same-signer binding, inner signature),
+   * anchored on the locally bound account public key instead of a peer-link
+   * lookup. Pure local crypto over a data-plane fetch: this is how a claimant
+   * wake learns CURRENT verified revocations without an ACCOUNT session (the
+   * frozen M4 security rule: stale revocations must never fail open).
+   */
+  async openOwnAuthorityStateRecord({ ownerAccountId = this.ownerAccountId, record, nowMs } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    if (!record || typeof record !== "object") {
+      throw new Error("openOwnAuthorityStateRecord requires a record");
+    }
+    const at = asPositiveInt(nowMs, this.clock());
+    const { accountBinding } = await this._requireBoundX3dhIdentity(owner);
+    const accountPublicKeyB64 = nonEmpty(accountBinding && accountBinding.accountIdentityPublicKeyB64);
+    if (!accountPublicKeyB64) {
+      throw new Error("openOwnAuthorityStateRecord requires a bound account identity");
+    }
+    return this.#openAuthorityStateRecordAgainst({ accountPublicKeyB64, record, nowMs: at });
+  }
+
+  // The one verification body both authority-state readers share (peer + own):
+  // the record must be an authority-state record OWNED by the given account
+  // key, pass DurableRecordV2 verification, carry an inner state naming the
+  // same account whose signer matches the envelope signer, and verify against
+  // that signer. Deliberately uses NO revocationState — this record BOOTSTRAPS
+  // the revocation source; a record cannot revoke itself.
+  async #openAuthorityStateRecordAgainst({ accountPublicKeyB64, record, nowMs }) {
     if (String(record.recordKind) !== ACCOUNT_AUTHORITY_STATE_RECORD_KIND) {
-      throw new Error("openPeerAuthorityStateRecord: record is not an authority-state record");
+      throw new Error("openAuthorityStateRecord: record is not an authority-state record");
     }
-    if (String(record.ownerPublicKeyB64) !== peerAccountPublicKeyB64) {
-      throw new Error("openPeerAuthorityStateRecord: owner is not the peer account identity");
+    if (String(record.ownerPublicKeyB64) !== accountPublicKeyB64) {
+      throw new Error("openAuthorityStateRecord: owner is not the expected account identity");
     }
-    const verdict = await verifyDurableRecordV2({ record, crypto: this.cryptoProvider, nowMs: at });
+    const verdict = await verifyDurableRecordV2({ record, crypto: this.cryptoProvider, nowMs });
     if (!verdict.ok) {
-      throw new Error("openPeerAuthorityStateRecord: durable record verification failed (" + verdict.reason + ")");
+      throw new Error("openAuthorityStateRecord: durable record verification failed (" + verdict.reason + ")");
     }
     let stateJson;
     try {
       stateJson = JSON.parse(new TextDecoder().decode(base64ToBytes(String(record.payloadB64 || ""))));
     } catch (err) {
-      throw new Error("openPeerAuthorityStateRecord: payload is not valid JSON");
+      throw new Error("openAuthorityStateRecord: payload is not valid JSON");
     }
     const authorityState = new AccountAuthorityStateV1(stateJson);
-    if (authorityState.accountIdentityPublicKeyB64 !== peerAccountPublicKeyB64) {
-      throw new Error("openPeerAuthorityStateRecord: authority state is not the peer account's");
+    if (authorityState.accountIdentityPublicKeyB64 !== accountPublicKeyB64) {
+      throw new Error("openAuthorityStateRecord: authority state is not the expected account's");
     }
     if (authorityState.signerPublicKeyB64 !== String(record.signerPublicKeyB64)) {
-      throw new Error("openPeerAuthorityStateRecord: authority state signer disagrees with the envelope signer");
+      throw new Error("openAuthorityStateRecord: authority state signer disagrees with the envelope signer");
     }
     const setOk = await this.cryptoProvider.verify({
       publicKey: base64ToBytes(authorityState.signerPublicKeyB64),
@@ -1075,7 +1133,7 @@ export class PeerLinkService {
       sig: base64ToBytes(authorityState.sig.sigB64),
     });
     if (setOk !== true) {
-      throw new Error("openPeerAuthorityStateRecord: authority state signature failed");
+      throw new Error("openAuthorityStateRecord: authority state signature failed");
     }
     return { authorityState, revocationState: authorityState.toRevocationState(), epoch: authorityState.epoch };
   }
@@ -2244,6 +2302,40 @@ export class PeerLinkService {
     } catch (err) {
       return false;
     }
+  }
+
+  /**
+   * Resolve this device's ACCOUNT-AUTHORITY signer — the dual-mode seam an
+   * account-attributed application fact (rez-chat AE-1 OriginalMessage)
+   * signs through. DIRECT mode (hasAdminRoot): the account root B signs,
+   * no chain. CERT mode (delegated): the device key C signs under the
+   * account capability chain. Returns the authorship identity the caller
+   * embeds INSIDE its signed bytes plus a reusable sign() closure.
+   * Fails loud when the identity material is absent — a caller must never
+   * silently downgrade to a weaker signer.
+   * @returns {Promise<{mode:"direct"|"delegated", signerPublicKeyB64:string, senderDeviceId:string|null, certChain:object[]|null, sign:(bytes:Uint8Array)=>Promise<Uint8Array>}>}
+   */
+  async accountAuthoritySigner() {
+    if (this.#hasAdminRoot === false) {
+      if (!this.#deviceSigningKeyPair || !this.devicePublicKeyB64 || !this.deviceId) {
+        throw new Error("accountAuthoritySigner: delegated mode requires the device signing key");
+      }
+      return {
+        mode: "delegated",
+        signerPublicKeyB64: this.devicePublicKeyB64,
+        senderDeviceId: this.deviceId,
+        certChain: cloneJson(this.#inviteCertChain),
+        sign: async (bytes) => this.cryptoProvider.sign({ privateKey: this.#deviceSigningKeyPair.privateKey, msg: bytes }),
+      };
+    }
+    const signerInfo = await this._resolveAccountIdentitySigner(this.ownerAccountId);
+    return {
+      mode: "direct",
+      signerPublicKeyB64: signerInfo.accountPublicKeyB64,
+      senderDeviceId: typeof this.deviceId === "string" && this.deviceId.length > 0 ? this.deviceId : null,
+      certChain: null,
+      sign: async (bytes) => signerInfo.accountSign(bytes),
+    };
   }
 
   // Verifies the account↔x3dh-identity subkey binding. DUAL-MODE (S8 L6): the

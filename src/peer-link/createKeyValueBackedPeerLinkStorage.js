@@ -618,15 +618,45 @@ class KeyValueNodeKeyMaterialStore {
   }
 }
 
+// P1.3b (rez-chat plans/MOBILE_PLATFORM_INTEGRATION_PLAN.md §8 log): the two
+// host KV contracts encode ABSENCE differently — IndexedDB-backed stores
+// return `undefined` for a missing key, while the mobile host contract
+// (SQLite-shaped: the P1.1 frozen "host KV is generic" seam) returns `null`.
+// Every existence check in this file was written against the `undefined`
+// encoding, so on a null-returning store `create` saw `null !== undefined`
+// and reported "already exists" ON AN EMPTY STORE — which wedged the
+// activation baseline apply forever (presence ≠ contract, again). Normalize
+// at the ONE read seam so every check sees one encoding. Nothing here ever
+// stores a bare `null` (records/ids/arrays only), so `null` can only mean
+// absence.
+function absenceNormalizingStore(keyValueStore) {
+  return {
+    async get(key) {
+      const value = await keyValueStore.get(key);
+      return value === null ? undefined : value;
+    },
+    set(key, value) {
+      return keyValueStore.set(key, value);
+    },
+    delete(key) {
+      return keyValueStore.delete(key);
+    },
+    keys(prefix) {
+      return keyValueStore.keys(prefix);
+    },
+  };
+}
+
 export function createKeyValueBackedPeerLinkStorage({ keyValueStore } = {}) {
   if (!keyValueStore) {
     throw new Error("createKeyValueBackedPeerLinkStorage requires keyValueStore");
   }
+  const normalized = absenceNormalizingStore(keyValueStore);
   return {
-    peerLinks: new KeyValuePeerLinkStore({ keyValueStore }),
-    sessions: new KeyValueSecureSessionStore({ keyValueStore }),
-    handshakeAttempts: new KeyValueHandshakeAttemptStore({ keyValueStore }),
-    events: new KeyValuePeerLinkEventStore({ keyValueStore }),
-    keys: new KeyValueNodeKeyMaterialStore({ keyValueStore }),
+    peerLinks: new KeyValuePeerLinkStore({ keyValueStore: normalized }),
+    sessions: new KeyValueSecureSessionStore({ keyValueStore: normalized }),
+    handshakeAttempts: new KeyValueHandshakeAttemptStore({ keyValueStore: normalized }),
+    events: new KeyValuePeerLinkEventStore({ keyValueStore: normalized }),
+    keys: new KeyValueNodeKeyMaterialStore({ keyValueStore: normalized }),
   };
 }
