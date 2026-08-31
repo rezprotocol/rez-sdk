@@ -24,6 +24,7 @@
     "./profile": "./src/profile/index.js",
     "./peer-link": "./src/peer-link/index.js",
     "./device-link": "./src/device-link/index.js",
+    "./delivery": "./src/delivery/index.js",
     "./crypto/bip39": "./src/crypto/bip39.js",
     "./crypto/seedDerivation": "./src/crypto/seedDerivation.js"
   },
