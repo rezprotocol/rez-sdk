@@ -34,20 +34,24 @@ export class InboxesCapability {
    * Returns the persisted claim record. The caller is now the inbox owner;
    * use the returned `rootCap` to authorize subsequent owner-scoped ops.
    */
-  async claimInbox() {
-    const claim = await this.#claimStore.createClaim();
+  async claimInbox({ portableLease = true } = {}) {
+    const claim = await this.#claimStore.createClaim({ portableLease });
+    const claimBody = {
+      inboxId: claim.inboxId,
+      claimantPublicKeyB64: claim.claimantPublicKeyB64,
+      claimedAtMs: claim.claimedAtMs,
+      signatureB64: claim.claimSignatureB64,
+    };
+    // Lease L1: the close key + generation are part of the SIGNED v2 claim
+    // payload. A caller configured for the frozen F9 Option-B shared-home
+    // path sends the legacy wire shape with neither field.
+    if (Number.isInteger(claim.generation)) {
+      claimBody.closePublicKeyB64 = claim.closePublicKeyB64;
+      claimBody.generation = claim.generation;
+    }
     const response = await this.#pool.sendRequest({
       type: T.INBOX_CLAIM,
-      body: {
-        inboxId: claim.inboxId,
-        claimantPublicKeyB64: claim.claimantPublicKeyB64,
-        // Lease L1: the close key + generation are part of the SIGNED claim
-        // payload — the node reconstructs the v2 shape from these fields.
-        closePublicKeyB64: claim.closePublicKeyB64,
-        generation: claim.generation,
-        claimedAtMs: claim.claimedAtMs,
-        signatureB64: claim.claimSignatureB64,
-      },
+      body: claimBody,
       expectedResponseType: T.INBOX_CLAIM_RES,
     });
     // The echoed inboxId is the field this ceremony turns on, so it must be PRESENT before it can

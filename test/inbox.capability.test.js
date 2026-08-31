@@ -86,6 +86,24 @@ test("claimInbox sends inbox.claim, persists on success, returns the claim recor
   assert.equal(typeof stored.claimantPrivateKeyB64, "string");
 });
 
+test("claimInbox can send the explicit F9 Option-B legacy wire shape", async () => {
+  const { claimStore } = await makeCapability();
+  let sent = null;
+  const inboxes = new InboxesCapability({
+    pool: makeFakePool(async (request) => {
+      sent = request;
+      return { body: { inboxId: request.body.inboxId } };
+    }),
+    claimStore,
+  });
+
+  const result = await inboxes.claimInbox({ portableLease: false });
+  assert.equal(Object.prototype.hasOwnProperty.call(sent.body, "closePublicKeyB64"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(sent.body, "generation"), false);
+  assert.equal(result.generation, undefined);
+  assert.equal(claimStore.get(result.inboxId).generation, undefined);
+});
+
 test("claimInbox throws if response inboxId mismatches request", async () => {
   const { claimStore } = await makeCapability();
   const pool = makeFakePool(async () => ({ body: { inboxId: "inbox:wrong" } }));

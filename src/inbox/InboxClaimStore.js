@@ -85,8 +85,11 @@ export class InboxClaimStore {
    * Does NOT yet send the wire op or persist the claim — call `persist()`
    * after the node confirms acceptance.
    */
-  async createClaim({ clock = () => Date.now(), identity = null, inboxId = null } = {}) {
+  async createClaim({ clock = () => Date.now(), identity = null, inboxId = null, portableLease = true } = {}) {
     this.#requireHydrated("createClaim");
+    if (typeof portableLease !== "boolean") {
+      throw new Error("InboxClaimStore.createClaim portableLease must be boolean");
+    }
     let publicKey;
     let privateKey;
     if (identity && typeof identity.publicKeyB64 === "string" && typeof identity.privateKeyB64 === "string") {
@@ -99,17 +102,21 @@ export class InboxClaimStore {
     }
     const claimantPublicKeyB64 = bytesToBase64(publicKey);
     const claimantPrivateKeyB64 = bytesToBase64(privateKey);
-    // Portable inbox lease L1 (plans/PORTABLE_INBOX_LEASE_SPEC.md §2): every
-    // new claim carries a CLOSE keypair — random per inbox, NEVER derived —
-    // and a generation. Compromise semantics: the claim key can renew, the
-    // close key can kill, neither can do both. The close PRIVATE key is
-    // account-custody material: it lives in this client-side store (above
-    // the provider boundary) and its only sanctioned use is
-    // createTerminalClose().
-    const closeIdentity = await Identity.generate({ cryptoProvider: this.#crypto });
-    const closePublicKeyB64 = bytesToBase64(closeIdentity.getPublicKeyBytes());
-    const closePrivateKeyB64 = bytesToBase64(closeIdentity.getPrivateKeyBytes());
-    const generation = 1;
+    // Portable inbox lease L1 (plans/PORTABLE_INBOX_LEASE_SPEC.md §2): a
+    // portable claim carries a CLOSE keypair — random per inbox, NEVER
+    // derived — and a generation. Shared durable homes deliberately remain
+    // on the frozen F9 Option-B legacy contract, so their caller explicitly
+    // requests a legacy-shaped claim instead. This is a topology decision at
+    // bootstrap, never a retry/downgrade after a provider rejects v2.
+    let closePublicKeyB64;
+    let closePrivateKeyB64;
+    let generation;
+    if (portableLease) {
+      const closeIdentity = await Identity.generate({ cryptoProvider: this.#crypto });
+      closePublicKeyB64 = bytesToBase64(closeIdentity.getPublicKeyBytes());
+      closePrivateKeyB64 = bytesToBase64(closeIdentity.getPrivateKeyBytes());
+      generation = 1;
+    }
     // P1#2 L3.5: a device-link ceremony pre-registers a SPECIFIC inbox (the one the new
     // device device-signed a binding for + the home's device.add recorded), so the linked
     // device must claim THAT exact inbox, never a freshly-minted one. An explicit inboxId
@@ -152,17 +159,20 @@ export class InboxClaimStore {
       privateKeyBytes: privateKey,
     });
 
-    return {
+    const claim = {
       inboxId,
       claimantPublicKeyB64,
       claimantPrivateKeyB64,
-      closePublicKeyB64,
-      closePrivateKeyB64,
-      generation,
       claimedAtMs,
       claimSignatureB64,
       rootCap,
     };
+    if (portableLease) {
+      claim.closePublicKeyB64 = closePublicKeyB64;
+      claim.closePrivateKeyB64 = closePrivateKeyB64;
+      claim.generation = generation;
+    }
+    return claim;
   }
 
   /**

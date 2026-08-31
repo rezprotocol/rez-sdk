@@ -68,6 +68,45 @@ test("L1: createClaim mints a distinct random close keypair + generation 1, sign
   assert.equal(verified, true, "v2 claim payload signature verifies");
 });
 
+test("F9 Option B: an explicitly legacy claim is signed and persisted without portable lease fields", async () => {
+  const storageProvider = new MemoryStorageProvider();
+  const store = await makeStore(storageProvider);
+  const claim = await store.persist(await store.createClaim({
+    clock: () => 1_700_000_000_000,
+    portableLease: false,
+  }));
+
+  assert.equal(claim.closePublicKeyB64, undefined);
+  assert.equal(claim.closePrivateKeyB64, undefined);
+  assert.equal(claim.generation, undefined);
+  assert.equal(await CRYPTO.verify({
+    publicKey: base64ToBytes(claim.claimantPublicKeyB64),
+    msg: new TextEncoder().encode(canonicalJSONStringify({
+      inboxId: claim.inboxId,
+      claimantPublicKeyB64: claim.claimantPublicKeyB64,
+      claimedAtMs: claim.claimedAtMs,
+    })),
+    sig: base64ToBytes(claim.claimSignatureB64),
+  }), true, "legacy claim signature covers the legacy payload, not a stripped v2 payload");
+
+  const reloaded = await makeStore(storageProvider);
+  const attestation = await reloaded.createReattestation(claim.inboxId);
+  assert.equal(attestation.generation, undefined);
+  assert.equal(attestation.closePublicKeyB64, undefined);
+  await assert.rejects(
+    () => reloaded.createTerminalClose(claim.inboxId),
+    (err) => err.code === "INBOX_NOT_CLOSABLE",
+  );
+});
+
+test("F9 Option B: portableLease is an explicit boolean, never a truthy downgrade toggle", async () => {
+  const store = await makeStore();
+  await assert.rejects(
+    () => store.createClaim({ portableLease: "false" }),
+    /portableLease must be boolean/,
+  );
+});
+
 test("L1: v2 fields survive persist + rehydrate; reattestation carries them; the delegation carries generation + retentionClass", async () => {
   const storageProvider = new MemoryStorageProvider();
   const store = await makeStore(storageProvider);
