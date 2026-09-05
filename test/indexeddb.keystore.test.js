@@ -119,6 +119,19 @@ function createFakeIndexedDb() {
   };
 }
 
+function createFakeWebLocks() {
+  const held = new Set();
+  return {
+    request(name, options, callback) {
+      assert.equal(options.mode, "exclusive");
+      assert.equal(options.ifAvailable, true);
+      if (held.has(name)) return Promise.resolve().then(() => callback(null));
+      held.add(name);
+      return Promise.resolve().then(() => callback({ name, mode: "exclusive" })).finally(() => held.delete(name));
+    },
+  };
+}
+
 test("IndexedDbStorageProvider put/get round-trip and del removes key", async () => {
   const prev = globalThis.indexedDB;
   globalThis.indexedDB = createFakeIndexedDb();
@@ -222,5 +235,39 @@ test("IndexedDbStorageProvider exposes the peer-link storage contract", async ()
     assert.equal(typeof first.keys.getAccountIdentity, "function");
   } finally {
     globalThis.indexedDB = prev;
+  }
+});
+
+test("IndexedDB runtime ownership holds an exclusive Web Lock and advances the epoch on takeover", async () => {
+  const previousIndexedDb = globalThis.indexedDB;
+  const previousNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  globalThis.indexedDB = createFakeIndexedDb();
+  Object.defineProperty(globalThis, "navigator", {
+    value: { locks: createFakeWebLocks() },
+    configurable: true,
+  });
+  try {
+    const first = new IndexedDbStorageProvider({ dbName: "rez-runtime-lock-test", storeName: "runtime" });
+    const second = new IndexedDbStorageProvider({ dbName: "rez-runtime-lock-test", storeName: "runtime" });
+    const firstGrant = await first.acquireRuntimeOwnership({ namespace: "sdk-delivery" });
+    assert.equal(firstGrant.runtimeEpoch, 1);
+
+    await assert.rejects(second.acquireRuntimeOwnership({ namespace: "sdk-delivery" }), { code: "DELIVERY_RUNTIME_ALREADY_ACTIVE" });
+    firstGrant.assertActive();
+    await firstGrant.release();
+    assert.throws(() => firstGrant.assertActive(), /ownership is inactive/);
+    const secondGrant = await second.acquireRuntimeOwnership({ namespace: "sdk-delivery" });
+    assert.equal(secondGrant.runtimeEpoch, 2);
+    await secondGrant.release();
+    const reacquired = await second.acquireRuntimeOwnership({ namespace: "sdk-delivery" });
+    assert.equal(reacquired.runtimeEpoch, 3);
+    await reacquired.release();
+  } finally {
+    globalThis.indexedDB = previousIndexedDb;
+    if (previousNavigator) {
+      Object.defineProperty(globalThis, "navigator", previousNavigator);
+    } else {
+      delete globalThis.navigator;
+    }
   }
 });

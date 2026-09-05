@@ -50,6 +50,7 @@ export class IndexedDbStorageProvider {
     this._cryptoProvider = cryptoProvider;
     this._keyValueStores = new Map();
     this._peerLinkStores = new Map();
+    this._runtimeOwnershipPromises = new Map();
     if ((this._encryptionKey && !this._cryptoProvider) || (!this._encryptionKey && this._cryptoProvider)) {
       throw new Error("IndexedDbStorageProvider encryptionKey and cryptoProvider must be provided together");
     }
@@ -155,6 +156,75 @@ export class IndexedDbStorageProvider {
       tx.onabort = () => reject(tx.error || new Error("IndexedDB clear transaction aborted"));
       tx.onerror = () => reject(tx.error || new Error("IndexedDB clear transaction failed"));
     });
+  }
+
+  acquireRuntimeOwnership({ namespace = "sdk-delivery" } = {}) {
+    const normalizedNamespace = String(namespace || "").trim();
+    if (!normalizedNamespace) throw new Error("IndexedDbStorageProvider runtime namespace is required");
+    const existing = this._runtimeOwnershipPromises.get(normalizedNamespace);
+    if (existing) return existing;
+    const locks = globalThis.navigator && globalThis.navigator.locks;
+    if (!locks || typeof locks.request !== "function") {
+      throw new Error("Web Locks API is required for IndexedDB delivery runtime ownership");
+    }
+    const lockName = "rez:" + this._dbName + ":" + this._storeName + ":" + normalizedNamespace;
+    let releaseHold;
+    const hold = new Promise((resolve) => { releaseHold = resolve; });
+    let resolveGrant;
+    let rejectGrant;
+    const grantPromise = new Promise((resolve, reject) => {
+      resolveGrant = resolve;
+      rejectGrant = reject;
+    });
+    let cachedPromise;
+    let active = false;
+    let releasePromise = null;
+    const requestPromise = locks.request(lockName, { mode: "exclusive", ifAvailable: true }, async (lock) => {
+      try {
+        if (!lock) {
+          const err = new Error("Delivery storage is already owned by a live runtime");
+          err.code = "DELIVERY_RUNTIME_ALREADY_ACTIVE";
+          throw err;
+        }
+        const kv = this.getKeyValueStore(null);
+        const key = "sdk:delivery:runtime-epoch:v1";
+        const raw = await kv.getStrict(key);
+        const prior = raw === undefined ? 0 : Number(raw);
+        if (!Number.isSafeInteger(prior) || prior < 0 || prior === Number.MAX_SAFE_INTEGER) throw new Error("Invalid delivery runtime epoch");
+        const runtimeEpoch = prior + 1;
+        await kv.set(key, runtimeEpoch);
+        active = true;
+        resolveGrant({
+          runtimeEpoch,
+          assertActive: () => {
+            if (!active) throw new Error("delivery runtime ownership is inactive");
+          },
+          release: () => {
+            if (releasePromise) return releasePromise;
+            active = false;
+            releaseHold();
+            releasePromise = requestPromise.then(() => {
+              if (this._runtimeOwnershipPromises.get(normalizedNamespace) === cachedPromise) {
+                this._runtimeOwnershipPromises.delete(normalizedNamespace);
+              }
+            });
+            return releasePromise;
+          },
+        });
+        await hold;
+      } catch (err) {
+        rejectGrant(err);
+        throw err;
+      }
+    }).catch((err) => {
+      if (this._runtimeOwnershipPromises.get(normalizedNamespace) === cachedPromise) {
+        this._runtimeOwnershipPromises.delete(normalizedNamespace);
+      }
+      rejectGrant(err);
+    });
+    cachedPromise = grantPromise;
+    this._runtimeOwnershipPromises.set(normalizedNamespace, cachedPromise);
+    return cachedPromise;
   }
 
   getKeyValueStore(ownerAccountId = null) {

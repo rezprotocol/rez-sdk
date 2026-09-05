@@ -1,8 +1,20 @@
+import { Hash, canonicalJSONStringify } from "@rezprotocol/core";
+import {
+  LifecycleEventIntentV1,
+  PeerLinkEventIndexEntryV1,
+  PeerLinkTransitionIntentV1,
+  SessionCommitIntentV1,
+} from "../delivery/records/DeliveryCommitRecordsV1.js";
+
 function cloneJsonValue(value) {
   if (value === undefined) {
     return undefined;
   }
   return JSON.parse(JSON.stringify(value));
+}
+
+function canonicalDigest(value) {
+  return Hash.sha256Hex(new TextEncoder().encode(canonicalJSONStringify(cloneJsonValue(value))));
 }
 
 function assertNonEmptyString(value, label) {
@@ -154,6 +166,42 @@ class KeyValuePeerLinkStore {
     return cloneJsonValue(nextRecord);
   }
 
+  async prepareUpdate(record, expectedVersion) {
+    assertRecord(record, "peerLinkRecord");
+    const peerLinkId = assertNonEmptyString(record.peerLinkId, "peerLinkId");
+    const localAccountId = assertNonEmptyString(record.localAccountId, "localAccountId");
+    const peerAccountId = assertNonEmptyString(record.peerAccountId, "peerAccountId");
+    const recordKey = this._recordKey(localAccountId, peerLinkId);
+    const current = await this.keyValueStore.getStrict(recordKey);
+    if (current === undefined) {
+      throw new Error(`Peer link not found for ${peerLinkId}`);
+    }
+    const normalizedExpectedVersion = Number(expectedVersion);
+    if (!Number.isInteger(normalizedExpectedVersion) || normalizedExpectedVersion < 1) {
+      throw new Error("expectedVersion must be a positive integer");
+    }
+    const currentVersion = normalizeVersion(current);
+    if (currentVersion !== normalizedExpectedVersion) {
+      throw new Error(`Peer link version mismatch for ${peerLinkId}`);
+    }
+    if (current.localAccountId !== localAccountId
+        || pairKeyFor(current.localAccountId, current.peerAccountId) !== pairKeyFor(localAccountId, peerAccountId)) {
+      throw new Error("Peer link account pair cannot change");
+    }
+    const nextRecord = cloneJsonValue(record);
+    nextRecord.version = currentVersion + 1;
+    return new PeerLinkTransitionIntentV1({
+      peerLinkId,
+      recordKey,
+      pairIndexKey: this._pairKey(localAccountId, peerAccountId),
+      pairIndexValue: peerLinkId,
+      expectedPeerLinkVersion: currentVersion,
+      nextPeerLinkVersion: nextRecord.version,
+      nextPeerLinkDigest: canonicalDigest(nextRecord),
+      nextPeerLinkRecord: nextRecord,
+    });
+  }
+
   async listByOwner(ownerAccountId) {
     const normalizedOwnerAccountId = assertNonEmptyString(ownerAccountId, "ownerAccountId");
     const keys = await this.keyValueStore.keys(this.recordPrefix);
@@ -280,6 +328,38 @@ class KeyValueSecureSessionStore {
       await this.keyValueStore.set(this._indexKey(ownerAccountId, peerLinkId), sessionId);
     }
     return cloneJsonValue(nextRecord);
+  }
+
+  async preparePut(record, expectedVersion) {
+    assertRecord(record, "secureSessionRecord");
+    const sessionId = assertNonEmptyString(record.sessionId, "sessionId");
+    const ownerAccountId = assertNonEmptyString(record.localAccountId, "localAccountId");
+    const peerLinkId = assertNonEmptyString(record.peerLinkId, "peerLinkId");
+    const peerDeviceId = typeof record.peerDeviceId === "string" ? record.peerDeviceId.trim() : "";
+    const recordKey = this._recordKey(ownerAccountId, sessionId);
+    const current = await this.keyValueStore.getStrict(recordKey);
+    const currentVersion = current === undefined ? 0 : normalizeVersion(current);
+    const normalizedExpectedVersion = Number(expectedVersion);
+    if (!Number.isInteger(normalizedExpectedVersion) || normalizedExpectedVersion < 0) {
+      throw new Error("expectedVersion must be a non-negative integer");
+    }
+    if (currentVersion !== normalizedExpectedVersion) {
+      throw new Error(`Secure session version mismatch for ${sessionId}`);
+    }
+    const nextRecord = cloneJsonValue(record);
+    nextRecord.version = currentVersion + 1;
+    const indexKey = peerDeviceId
+      ? this._deviceIndexKey(ownerAccountId, peerLinkId, peerDeviceId)
+      : this._indexKey(ownerAccountId, peerLinkId);
+    return new SessionCommitIntentV1({
+      recordKey,
+      indexKey,
+      indexValue: sessionId,
+      expectedSessionVersion: currentVersion,
+      nextSessionVersion: nextRecord.version,
+      nextSnapshotDigest: canonicalDigest(nextRecord),
+      nextSessionRecord: nextRecord,
+    });
   }
 
   async delete(ownerAccountId, sessionId) {
@@ -444,7 +524,9 @@ class KeyValuePeerLinkEventStore {
     }
     this.keyValueStore = keyValueStore;
     this.recordPrefix = "peer-link:events:";
-    this.indexPrefix = "peer-link:events:index:";
+    this.legacyIndexPrefix = "peer-link:events:index:";
+    this.indexPrefix = "peer-link:events-index:";
+    this.migrationPrefix = "peer-link:events-index-migrated:v1:";
   }
 
   _recordKey(ownerAccountId, eventId) {
@@ -453,10 +535,127 @@ class KeyValuePeerLinkEventStore {
     return `${this.recordPrefix}${owner}::${normalized}`;
   }
 
-  _indexKey(ownerAccountId, peerLinkId) {
+  _legacyIndexKey(ownerAccountId, peerLinkId) {
     const owner = assertNonEmptyString(ownerAccountId, "ownerAccountId");
     const normalized = assertNonEmptyString(peerLinkId, "peerLinkId");
-    return `${this.indexPrefix}${owner}::${normalized}`;
+    return `${this.legacyIndexPrefix}${owner}::${normalized}`;
+  }
+
+  _indexPrefix(ownerAccountId, peerLinkId) {
+    const owner = assertNonEmptyString(ownerAccountId, "ownerAccountId");
+    const normalized = assertNonEmptyString(peerLinkId, "peerLinkId");
+    return `${this.indexPrefix}${owner}::${normalized}::`;
+  }
+
+  _entryKey(ownerAccountId, peerLinkId, eventId) {
+    return this._indexPrefix(ownerAccountId, peerLinkId) + assertNonEmptyString(eventId, "eventId");
+  }
+
+  _migrationKey(ownerAccountId, peerLinkId) {
+    const owner = assertNonEmptyString(ownerAccountId, "ownerAccountId");
+    const normalized = assertNonEmptyString(peerLinkId, "peerLinkId");
+    return `${this.migrationPrefix}${owner}::${normalized}`;
+  }
+
+  async migrateLegacyIndex(ownerAccountId, peerLinkId) {
+    const owner = assertNonEmptyString(ownerAccountId, "ownerAccountId");
+    const link = assertNonEmptyString(peerLinkId, "peerLinkId");
+    const migrationKey = this._migrationKey(owner, link);
+    const legacyKey = this._legacyIndexKey(owner, link);
+    const marker = await this.keyValueStore.getStrict(migrationKey);
+    if (marker === "v1") {
+      if ((await this.keyValueStore.getStrict(legacyKey)) !== undefined) {
+        await this.keyValueStore.delete(legacyKey);
+      }
+      return false;
+    }
+    if (marker !== undefined) {
+      throw new Error(`Unsupported peer-link event index migration marker for ${link}`);
+    }
+    const legacy = await this.keyValueStore.getStrict(legacyKey);
+    if (legacy === undefined) return false;
+    if (!Array.isArray(legacy)) {
+      throw new Error(`Legacy peer-link event index is unreadable for ${link}`);
+    }
+    for (let seq = 0; seq < legacy.length; seq += 1) {
+      const eventId = assertNonEmptyString(legacy[seq], "legacy eventId");
+      const eventRecord = await this.keyValueStore.getStrict(this._recordKey(owner, eventId));
+      if (!eventRecord || typeof eventRecord !== "object") {
+        throw new Error(`Legacy peer-link event record missing for ${eventId}`);
+      }
+      const entry = new PeerLinkEventIndexEntryV1({
+        ownerAccountId: owner,
+        peerLinkId: link,
+        eventId,
+        atMs: eventRecord.atMs,
+        seq,
+      });
+      await this.keyValueStore.set(this._entryKey(owner, link, eventId), entry.toJSON());
+    }
+    await this.keyValueStore.set(migrationKey, "v1");
+    await this.keyValueStore.delete(legacyKey);
+    return true;
+  }
+
+  async migrateLegacyIndexesForOwner(ownerAccountId) {
+    const owner = assertNonEmptyString(ownerAccountId, "ownerAccountId");
+    const prefix = this.legacyIndexPrefix + owner + "::";
+    const keys = await this.keyValueStore.keys(prefix);
+    let migrated = 0;
+    for (const key of keys) {
+      const peerLinkId = key.slice(prefix.length);
+      if (!peerLinkId) {
+        throw new Error(`Malformed legacy peer-link event index key: ${key}`);
+      }
+      if (await this.migrateLegacyIndex(owner, peerLinkId)) migrated += 1;
+    }
+    return migrated;
+  }
+
+  async _listEntries(ownerAccountId, peerLinkId) {
+    await this.migrateLegacyIndex(ownerAccountId, peerLinkId);
+    const prefix = this._indexPrefix(ownerAccountId, peerLinkId);
+    const keys = await this.keyValueStore.keys(prefix);
+    const entries = [];
+    for (const key of keys) {
+      const raw = await this.keyValueStore.getStrict(key);
+      if (raw === undefined) {
+        throw new Error(`Peer-link event index entry disappeared after enumeration: ${key}`);
+      }
+      const entry = PeerLinkEventIndexEntryV1.fromJSON(raw);
+      if (this._entryKey(entry.ownerAccountId, entry.peerLinkId, entry.eventId) !== key) {
+        throw new Error(`Peer-link event index key/content mismatch: ${key}`);
+      }
+      entries.push(entry);
+    }
+    entries.sort((left, right) => left.seq - right.seq || left.eventId.localeCompare(right.eventId));
+    return entries;
+  }
+
+  async prepareAppend(eventRecord) {
+    assertRecord(eventRecord, "peerLinkEventRecord");
+    const ownerAccountId = assertNonEmptyString(eventRecord.ownerAccountId, "ownerAccountId");
+    const eventId = assertNonEmptyString(eventRecord.eventId, "eventId");
+    const peerLinkId = assertNonEmptyString(eventRecord.peerLinkId, "peerLinkId");
+    const entries = await this._listEntries(ownerAccountId, peerLinkId);
+    const existingEntry = entries.find((entry) => entry.eventId === eventId);
+    const seq = existingEntry
+      ? existingEntry.seq
+      : entries.reduce((max, entry) => Math.max(max, entry.seq), -1) + 1;
+    const indexEntry = new PeerLinkEventIndexEntryV1({
+      ownerAccountId,
+      peerLinkId,
+      eventId,
+      atMs: eventRecord.atMs,
+      seq,
+    });
+    return new LifecycleEventIntentV1({
+      eventId,
+      recordKey: this._recordKey(ownerAccountId, eventId),
+      entryKey: this._entryKey(ownerAccountId, peerLinkId, eventId),
+      eventRecord: cloneJsonValue(eventRecord),
+      indexEntry,
+    });
   }
 
   async append(eventRecord) {
@@ -464,21 +663,19 @@ class KeyValuePeerLinkEventStore {
     const ownerAccountId = assertNonEmptyString(eventRecord.ownerAccountId, "ownerAccountId");
     const eventId = assertNonEmptyString(eventRecord.eventId, "eventId");
     const peerLinkId = assertNonEmptyString(eventRecord.peerLinkId, "peerLinkId");
-    const recordKey = this._recordKey(ownerAccountId, eventId);
+    const intent = await this.prepareAppend(eventRecord);
+    const recordKey = intent.recordKey;
     const existing = await this.keyValueStore.get(recordKey);
     if (existing !== undefined) {
       if (existing && typeof existing === "object" && existing.peerLinkId === peerLinkId) {
+        await this.keyValueStore.set(intent.entryKey, intent.indexEntry.toJSON());
         return cloneJsonValue(existing);
       }
       throw new Error(`Peer link event already exists for ${eventId}`);
     }
     const nextRecord = cloneJsonValue(eventRecord);
     await this.keyValueStore.set(recordKey, nextRecord);
-    const indexKey = this._indexKey(ownerAccountId, peerLinkId);
-    const index = await this.keyValueStore.get(indexKey);
-    const nextIndex = Array.isArray(index) ? index.slice() : [];
-    nextIndex.push(eventId);
-    await this.keyValueStore.set(indexKey, nextIndex);
+    await this.keyValueStore.set(intent.entryKey, intent.indexEntry.toJSON());
     return cloneJsonValue(nextRecord);
   }
 
@@ -486,8 +683,8 @@ class KeyValuePeerLinkEventStore {
     const normalizedOwnerAccountId = assertNonEmptyString(ownerAccountId, "ownerAccountId");
     const normalizedPeerLinkId = assertNonEmptyString(peerLinkId, "peerLinkId");
     const normalizedOptions = normalizeListOptions(options);
-    const index = await this.keyValueStore.get(this._indexKey(normalizedOwnerAccountId, normalizedPeerLinkId));
-    const ids = Array.isArray(index) ? index.slice() : [];
+    const entries = await this._listEntries(normalizedOwnerAccountId, normalizedPeerLinkId);
+    const ids = entries.map((entry) => entry.eventId);
     let start = 0;
     if (normalizedOptions.cursor) {
       const cursorIndex = ids.indexOf(normalizedOptions.cursor);
@@ -635,6 +832,12 @@ function absenceNormalizingStore(keyValueStore) {
       const value = await keyValueStore.get(key);
       return value === null ? undefined : value;
     },
+    async getStrict(key) {
+      const value = typeof keyValueStore.getStrict === "function"
+        ? await keyValueStore.getStrict(key)
+        : await keyValueStore.get(key);
+      return value === null ? undefined : value;
+    },
     set(key, value) {
       return keyValueStore.set(key, value);
     },
@@ -653,6 +856,7 @@ export function createKeyValueBackedPeerLinkStorage({ keyValueStore } = {}) {
   }
   const normalized = absenceNormalizingStore(keyValueStore);
   return {
+    __sdkCanonical: true,
     peerLinks: new KeyValuePeerLinkStore({ keyValueStore: normalized }),
     sessions: new KeyValueSecureSessionStore({ keyValueStore: normalized }),
     handshakeAttempts: new KeyValueHandshakeAttemptStore({ keyValueStore: normalized }),

@@ -116,6 +116,38 @@ test("the SDK never writes chat-owned KV prefixes (app:*, chat-server:*)", () =>
     + violations.join("\n"));
 });
 
+test("DT-302 session, peer-link, and event write handles have no unreviewed call sites", () => {
+  const expected = new Map([
+    ["src/peer-link/PeerLinkService.js", {
+      "sessions.put": 2,
+      "sessions.delete": 1,
+      "peerLinks.create": 1,
+      "peerLinks.update": 3,
+      "events.append": 1,
+    }],
+    ["src/peer-link/DevicePeerSessions.js", {
+      "sessions.put": 3,
+      "sessions.delete": 0,
+      "peerLinks.create": 0,
+      "peerLinks.update": 0,
+      "events.append": 0,
+    }],
+  ]);
+  const actual = new Map();
+  for (const [rel, allowed] of expected) {
+    const source = stripComments(fs.readFileSync(path.join(SDK_ROOT, rel), "utf8"));
+    const counts = {};
+    for (const mutation of Object.keys(allowed)) {
+      const escaped = mutation.replace(".", "\\.");
+      counts[mutation] = [...source.matchAll(new RegExp("peerLinkStorage\\." + escaped + "\\s*\\(", "g"))].length;
+    }
+    actual.set(rel, counts);
+  }
+  assert.deepEqual(actual, expected,
+    "A new direct canonical mutation bypassed the reviewed DT-302 lane-owned sites. "
+    + "Route it through the DependencyLaneResolver and update this guard only after reviewing its lane.");
+});
+
 // ADR naming rule (ADR-DELIVERY-TRANSPORT-LAYERS §2): the carrier directory
 // is EXEMPT from the vocabulary ban above (an SMTP adapter legitimately says
 // "smtp") but NOT from naming. Abstract interface: RDeliveryTransport.

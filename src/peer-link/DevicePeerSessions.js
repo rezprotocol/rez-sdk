@@ -1,5 +1,10 @@
-import { SecureChannelManager, X3DHKeyExchange, E2eePacketCodec, DeviceRegistrationV1, bytesToBase64 } from "@rezprotocol/core";
+import { SecureChannelManager, X3DHKeyExchange, E2eePacketCodec, DeviceRegistrationV1, base64ToBytes, bytesToBase64 } from "@rezprotocol/core";
 import { runtimeUuid } from "../util/runtimeUuid.js";
+import { DeliveryCommitStore } from "../delivery/DeliveryCommitStore.js";
+import {
+  DeliveryCommitRecordV1,
+  DecryptedDeliveryWorkV1,
+} from "../delivery/records/DeliveryCommitRecordsV1.js";
 
 const SESSION_STATUS_ACTIVE = "active";
 
@@ -35,6 +40,9 @@ export class DevicePeerSessions {
   #cryptoProvider;
   #peerLinkStorage;
   #clock;
+  #dependencyLanes;
+  #deliveryCommitStore;
+  #nextCommitGeneration;
   // Per-(owner, peerLink, peerDevice) async mutex: serializes each
   // load→advance→put so two concurrent ops on the SAME device session can't both
   // advance off one snapshot and clobber each other — the session store is
@@ -47,7 +55,14 @@ export class DevicePeerSessions {
   // process = one instance), so an in-memory mutex is sufficient.
   #locks = new Map();
 
-  constructor({ cryptoProvider, peerLinkStorage, clock } = {}) {
+  constructor({
+    cryptoProvider,
+    peerLinkStorage,
+    clock,
+    dependencyLanes = null,
+    deliveryCommitStore = null,
+    nextCommitGeneration = null,
+  } = {}) {
     if (!cryptoProvider) {
       throw new Error("DevicePeerSessions requires cryptoProvider");
     }
@@ -57,6 +72,23 @@ export class DevicePeerSessions {
     this.#cryptoProvider = cryptoProvider;
     this.#peerLinkStorage = peerLinkStorage;
     this.#clock = typeof clock === "function" ? clock : () => Date.now();
+    this.#dependencyLanes = dependencyLanes;
+    this.#deliveryCommitStore = deliveryCommitStore;
+    this.#nextCommitGeneration = nextCommitGeneration;
+    const durableConfigured = deliveryCommitStore !== null || dependencyLanes !== null || nextCommitGeneration !== null;
+    if (durableConfigured && (!deliveryCommitStore || !dependencyLanes || typeof nextCommitGeneration !== "function")) {
+      throw new Error("DevicePeerSessions durable receive integration requires deliveryCommitStore, dependencyLanes, and nextCommitGeneration");
+    }
+  }
+
+  #runOwner(ownerAccountId, legacyKey, fn) {
+    if (this.#dependencyLanes) return this.#dependencyLanes.runOwner(ownerAccountId, fn);
+    return this.#withLock(legacyKey, () => fn("owner:" + ownerAccountId));
+  }
+
+  #runSession(ownerAccountId, sessionId, legacyKey, fn) {
+    if (this.#dependencyLanes) return this.#dependencyLanes.runSession(ownerAccountId, sessionId, fn);
+    return this.#withLock(legacyKey, () => fn("ratchet:" + sessionId));
   }
 
   #scm(snapshot) {
@@ -143,7 +175,7 @@ export class DevicePeerSessions {
       initiatorIdentityDhKeyPair: identityDhKeyPair,
       initiatorIdentityDhSignature,
     });
-    const sessionId = await this.#withLock(this.#lockKey(ownerAccountId, peerLinkId, peerDeviceId), () => this.#persistDeviceSession({
+    const sessionId = await this.#runOwner(ownerAccountId, this.#lockKey(ownerAccountId, peerLinkId, peerDeviceId), () => this.#persistDeviceSession({
       ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, snapshot: scm.exportSnapshot(),
     }));
     return { handshakeData, sessionId };
@@ -196,7 +228,7 @@ export class DevicePeerSessions {
       err.code = "DEVICE_ID_MISMATCH";
       throw err;
     }
-    const sessionId = await this.#withLock(this.#lockKey(ownerAccountId, peerLinkId, peerDeviceId), () => this.#persistDeviceSession({
+    const sessionId = await this.#runOwner(ownerAccountId, this.#lockKey(ownerAccountId, peerLinkId, peerDeviceId), () => this.#persistDeviceSession({
       ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, snapshot: scm.exportSnapshot(),
     }));
     return { sessionId, authenticatedDeviceId };
@@ -214,7 +246,9 @@ export class DevicePeerSessions {
     if (!(plaintextBytes instanceof Uint8Array) || plaintextBytes.length === 0) {
       throw new Error("encryptForDevice requires non-empty plaintextBytes");
     }
-    return this.#withLock(this.#lockKey(ownerAccountId, peerLinkId, peerDeviceId), async () => {
+    const initialSession = await this.#requireDeviceSession(ownerAccountId, peerLinkId, peerDeviceId);
+    return this.#runSession(ownerAccountId, initialSession.sessionId, this.#lockKey(ownerAccountId, peerLinkId, peerDeviceId), async (laneId) => {
+      if (this.#deliveryCommitStore) this.#deliveryCommitStore.assertAvailable(ownerAccountId, laneId);
       const sessionRecord = await this.#requireDeviceSession(ownerAccountId, peerLinkId, peerDeviceId);
       const scm = this.#scm(sessionRecord.ratchetSnapshot);
       const codec = new E2eePacketCodec({ secureChannelManager: scm });
@@ -243,20 +277,25 @@ export class DevicePeerSessions {
    * Decrypt a packet known to be from a specific peer device. Throws
    * DECRYPT_FAILED if that device's ratchet cannot decrypt it.
    */
-  async decryptFromDevice({ ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, packetBytes } = {}) {
+  async decryptFromDevice({ ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, packetBytes, deliveryContext = null } = {}) {
     requireNonEmpty(ownerAccountId, "ownerAccountId");
     requireNonEmpty(peerLinkId, "peerLinkId");
     requireNonEmpty(peerDeviceId, "peerDeviceId");
     // require:true ⇒ a missing session throws THREAD_NOT_READY; a present session
     // that cannot decrypt returns null here → DECRYPT_FAILED (the two distinct
     // failure modes the callers depend on).
-    const result = await this.#attemptDeviceDecrypt(ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, packetBytes, { require: true });
+    const result = await this.#attemptDeviceDecrypt(ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, packetBytes, { require: true, deliveryContext });
     if (!result) {
       const err = new Error("E2EE decryption failed for device " + peerDeviceId);
       err.code = "DECRYPT_FAILED";
       throw err;
     }
-    return { plaintextBytes: result.plaintextBytes, sessionId: result.sessionId };
+    return {
+      plaintextBytes: result.plaintextBytes,
+      sessionId: result.sessionId,
+      deliveryWork: result.deliveryWork || null,
+      deliveryDuplicate: result.deliveryDuplicate === true,
+    };
   }
 
   /**
@@ -266,7 +305,7 @@ export class DevicePeerSessions {
    * that decrypts has its advanced snapshot persisted; a failed trial leaves
    * every other device session byte-unchanged. Returns null on no match.
    */
-  async trialDecryptAcrossDevices({ ownerAccountId, peerAccountId, peerLinkId, packetBytes } = {}) {
+  async trialDecryptAcrossDevices({ ownerAccountId, peerAccountId, peerLinkId, packetBytes, deliveryContext = null } = {}) {
     requireNonEmpty(ownerAccountId, "ownerAccountId");
     requireNonEmpty(peerLinkId, "peerLinkId");
     // Snapshot the candidate device set (a read, not under any single device's
@@ -278,9 +317,15 @@ export class DevicePeerSessions {
     for (const sessionRecord of sessions) {
       const peerDeviceId = sessionRecord && sessionRecord.peerDeviceId ? sessionRecord.peerDeviceId : null;
       if (!peerDeviceId) continue;
-      const result = await this.#attemptDeviceDecrypt(ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, packetBytes, { require: false });
+      const result = await this.#attemptDeviceDecrypt(ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, packetBytes, { require: false, deliveryContext });
       if (result) {
-        return { peerDeviceId, plaintextBytes: result.plaintextBytes, sessionId: result.sessionId };
+        return {
+          peerDeviceId,
+          plaintextBytes: result.plaintextBytes,
+          sessionId: result.sessionId,
+          deliveryWork: result.deliveryWork || null,
+          deliveryDuplicate: result.deliveryDuplicate === true,
+        };
       }
     }
     return null;
@@ -293,8 +338,33 @@ export class DevicePeerSessions {
   // success, null on a present-but-non-matching session. With require:true a
   // missing session throws THREAD_NOT_READY; with require:false it returns null
   // (so trial-decrypt can skip to the next device).
-  async #attemptDeviceDecrypt(ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, packetBytes, { require }) {
-    return this.#withLock(this.#lockKey(ownerAccountId, peerLinkId, peerDeviceId), async () => {
+  async #attemptDeviceDecrypt(ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, packetBytes, { require, deliveryContext }) {
+    const initial = await this.#peerLinkStorage.sessions.getByPeerLinkAndDevice(ownerAccountId, peerLinkId, peerDeviceId);
+    if (!initial || typeof initial !== "object") {
+      if (require) {
+        const err = new Error("No secure session for device " + peerDeviceId);
+        err.code = "THREAD_NOT_READY";
+        throw err;
+      }
+      return null;
+    }
+    return this.#runSession(ownerAccountId, initial.sessionId, this.#lockKey(ownerAccountId, peerLinkId, peerDeviceId), async (laneId) => {
+      if (this.#deliveryCommitStore) {
+        const sealedDigest = DeliveryCommitStore.sealedDigest(packetBytes);
+        const duplicate = await this.#deliveryCommitStore.lookup(ownerAccountId, sealedDigest);
+        if (duplicate) {
+          if (duplicate.replay.state === "applied") {
+            return { deliveryDuplicate: true, plaintextBytes: null, sessionId: null, deliveryWork: null };
+          }
+          return {
+            deliveryDuplicate: true,
+            plaintextBytes: base64ToBytes(duplicate.work.plaintextB64),
+            sessionId: duplicate.work.sessionId,
+            deliveryWork: duplicate.work,
+          };
+        }
+        this.#deliveryCommitStore.assertAvailable(ownerAccountId, laneId);
+      }
       const sessionRecord = await this.#peerLinkStorage.sessions.getByPeerLinkAndDevice(ownerAccountId, peerLinkId, peerDeviceId);
       if (!sessionRecord || typeof sessionRecord !== "object") {
         if (require) {
@@ -304,13 +374,24 @@ export class DevicePeerSessions {
         }
         return null;
       }
-      const result = await this.#tryDecrypt(sessionRecord, peerAccountId || sessionRecord.peerAccountId, packetBytes);
+      const result = await this.#tryDecrypt(
+        sessionRecord,
+        peerAccountId || sessionRecord.peerAccountId,
+        peerDeviceId,
+        packetBytes,
+        laneId,
+        deliveryContext,
+      );
       if (!result.ok) return null;
-      return { plaintextBytes: result.plaintextBytes, sessionId: sessionRecord.sessionId };
+      return {
+        plaintextBytes: result.plaintextBytes,
+        sessionId: sessionRecord.sessionId,
+        deliveryWork: result.deliveryWork || null,
+      };
     });
   }
 
-  async #tryDecrypt(sessionRecord, expectedPeerAccountId, packetBytes) {
+  async #tryDecrypt(sessionRecord, expectedPeerAccountId, peerDeviceId, packetBytes, laneId, deliveryContext) {
     if (!(packetBytes instanceof Uint8Array) || packetBytes.length === 0) {
       throw new Error("decrypt requires non-empty packetBytes");
     }
@@ -333,10 +414,47 @@ export class DevicePeerSessions {
       return { ok: false };
     }
     // Persist ONLY the matching session's advance (non-matches never write).
-    await this.#peerLinkStorage.sessions.put({
-      ...sessionRecord, ratchetSnapshot: scm.exportSnapshot(), updatedAtMs: this.#clock(),
+    if (!this.#deliveryCommitStore) {
+      await this.#peerLinkStorage.sessions.put({
+        ...sessionRecord, ratchetSnapshot: scm.exportSnapshot(), updatedAtMs: this.#clock(),
+      });
+      return { ok: true, plaintextBytes: result.plaintextBytes };
+    }
+    const now = this.#clock();
+    const owner = sessionRecord.localAccountId;
+    const sealedDigest = DeliveryCommitStore.sealedDigest(packetBytes);
+    const sessionIntent = await this.#peerLinkStorage.sessions.preparePut({
+      ...sessionRecord,
+      ratchetSnapshot: scm.exportSnapshot(),
+      updatedAtMs: now,
+    }, Number(sessionRecord.version));
+    const work = new DecryptedDeliveryWorkV1({
+      owner,
+      sealedDigest,
+      laneId,
+      sessionId: sessionRecord.sessionId,
+      peerLinkId: sessionRecord.peerLinkId,
+      authenticatedSenderAccountId: result.peerId,
+      authenticatedSenderDeviceId: peerDeviceId,
+      sourceMailboxId: deliveryContext && deliveryContext.mailboxId ? deliveryContext.mailboxId : null,
+      sourceEventId: deliveryContext && deliveryContext.eventId ? deliveryContext.eventId : null,
+      plaintextB64: bytesToBase64(result.plaintextBytes),
+      createdAtMs: now,
     });
-    return { ok: true, plaintextBytes: result.plaintextBytes };
+    const committedWork = await this.#deliveryCommitStore.commitAndRollForward(new DeliveryCommitRecordV1({
+      owner,
+      sealedDigest,
+      runtimeEpoch: this.#deliveryCommitStore.runtimeEpoch,
+      laneId,
+      commitGeneration: this.#nextCommitGeneration(owner, laneId),
+      sessionIntent,
+      peerLinkIntent: null,
+      lifecycleEventIntent: null,
+      work,
+      replayState: "ready-to-apply",
+      createdAtMs: now,
+    }));
+    return { ok: true, plaintextBytes: result.plaintextBytes, deliveryWork: committedWork };
   }
 
   // Persist a device session. Re-establishment for an existing

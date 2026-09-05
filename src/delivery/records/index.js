@@ -54,3 +54,14 @@ export {
   DELIVERY_TRANSPORT_DESCRIPTOR_VERSION,
   DELIVERY_IDEMPOTENCY_MODES,
 } from "./DeliveryTransportDescriptorV1.js";
+export {
+  DeliveryCommitRecordV1,
+  SessionCommitIntentV1,
+  PeerLinkTransitionIntentV1,
+  LifecycleEventIntentV1,
+  PeerLinkEventIndexEntryV1,
+  DecryptedDeliveryWorkV1,
+  ReplayIdentityRecordV1,
+  DELIVERY_COMMIT_RECORD_VERSION,
+  DELIVERY_REPLAY_STATES,
+} from "./DeliveryCommitRecordsV1.js";

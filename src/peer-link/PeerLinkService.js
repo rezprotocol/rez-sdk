@@ -39,7 +39,13 @@ import { buildSealedDeviceSetRecord, openSealedDeviceSetRecord, DEVICE_SET_PUBLI
 import { derivePeerScopedKey } from "./peerScopedSeal.js";
 import { deriveAccountStateKey, sealAccountStateEvent, openAccountStateEvent } from "./accountStateSeal.js";
 import { runtimeUuid } from "../util/runtimeUuid.js";
-import { PeerLinkCommitErrorV1 } from "./PeerLinkCommitErrorV1.js";
+import { createKeyValueBackedPeerLinkStorage } from "./createKeyValueBackedPeerLinkStorage.js";
+import { DeliveryCommitStore } from "../delivery/DeliveryCommitStore.js";
+import { DependencyLaneResolver } from "../delivery/DependencyLaneResolver.js";
+import {
+  DeliveryCommitRecordV1,
+  DecryptedDeliveryWorkV1,
+} from "../delivery/records/DeliveryCommitRecordsV1.js";
 import {
   PEER_LINK_STATE,
   SESSION_STATUS,
@@ -56,7 +62,6 @@ const REHANDSHAKE_DECRYPT_FAILURE_THRESHOLD = 3;
 // whose first call never returned. Bounded by the repo's two-retry policy
 // (CLAUDE.md §6); exceeding it means the store is faulted, which this interim
 // layer must not try to reason through.
-const SESSION_REWRITE_ATTEMPTS = 2;
 // A session that successfully decrypted authenticated traffic within this window
 // is treated as HEALTHY: undecryptable packets arriving alongside it are noise
 // or replay, NOT a desync, and must NOT arm a destructive re-handshake. Defeats
@@ -84,6 +89,8 @@ const ACCOUNT_DEVICE_BUNDLE_PEER_SENTINEL = "@self-device-bundle";
 // flapping connection without keeping old key material around indefinitely, which would work
 // against the forward secrecy rotation exists to provide.
 const ACCOUNT_DEVICE_BUNDLE_PREKEY_RETENTION = 3;
+const DELIVERY_RUNTIME_EPOCH_KEY = "sdk:delivery:runtime-epoch:v1";
+const FALLBACK_RUNTIME_GRANTS = new WeakMap();
 
 /**
  * Pick the retained prekey state an initiator computed against.
@@ -313,6 +320,12 @@ export class PeerLinkService {
   // (legacy single-device construction) — the per-device methods then fail loud.
   #deviceSigningKeyPair;
   #devicePeerSessions;
+  #deliveryCommitStore;
+  #dependencyLanes;
+  #deliveryReadyByOwner = new Map();
+  #commitGenerationByLane = new Map();
+  #runtimeOwnershipPromise = null;
+  #closed = false;
   // Seed-derived account-level identity-DH (X25519) keypair, when supplied.
   // Authoritative over any locally-generated DH key so every device of an
   // account shares ONE identity-DH key — the requirement for the peer-scoped
@@ -372,8 +385,11 @@ export class PeerLinkService {
       throw new Error("PeerLinkService requires signer+verifier or getInviteAuthority(accountId)");
     }
     this.storageProvider = storageProvider;
-    this.peerLinkStorage = storageProvider.getPeerLinkStorage(null);
     this.kv = storageProvider.getKeyValueStore(null);
+    const providedPeerLinkStorage = storageProvider.getPeerLinkStorage(null);
+    this.peerLinkStorage = providedPeerLinkStorage && providedPeerLinkStorage.__sdkCanonical === true
+      ? providedPeerLinkStorage
+      : createKeyValueBackedPeerLinkStorage({ keyValueStore: this.kv });
     this.clock = clock;
     this.ownerAccountId = nonEmpty(ownerAccountId);
     this.signer = signer;
@@ -389,6 +405,11 @@ export class PeerLinkService {
     this.#anyPeerMissCounts = new Map();
     this.#anyPeerLastSuccessAt = new Map();
     this.#strictTransitions = strictTransitions === true;
+    this.#dependencyLanes = new DependencyLaneResolver();
+    this.#deliveryCommitStore = new DeliveryCommitStore({
+      keyValueStore: this.peerLinkStorage.sessions.keyValueStore,
+      clock,
+    });
 
     // S2.5 per-device E2EE: the device key (C) is THIS device's X3DH signing
     // identity (rooted in the chat-server identity B via DeviceRegistrationV1).
@@ -409,7 +430,14 @@ export class PeerLinkService {
         publicKey: base64ToBytes(deviceKeyPair.publicKeyB64),
         privateKey: base64ToBytes(deviceKeyPair.privateKeyB64),
       };
-      this.#devicePeerSessions = new DevicePeerSessions({ cryptoProvider, peerLinkStorage: this.peerLinkStorage, clock });
+      this.#devicePeerSessions = new DevicePeerSessions({
+        cryptoProvider,
+        peerLinkStorage: this.peerLinkStorage,
+        clock,
+        dependencyLanes: this.#dependencyLanes,
+        deliveryCommitStore: this.#deliveryCommitStore,
+        nextCommitGeneration: (owner, laneId) => this.#nextCommitGeneration(owner, laneId),
+      });
     }
 
     // Seed-derived account identity-DH key (X25519 SPKI/PKCS8 base64). When the
@@ -486,6 +514,91 @@ export class PeerLinkService {
       : null;
   }
 
+  #nextCommitGeneration(owner, laneId) {
+    const key = owner + "::" + laneId;
+    const next = (this.#commitGenerationByLane.get(key) || 0) + 1;
+    this.#commitGenerationByLane.set(key, next);
+    return next;
+  }
+
+  #ensureRuntimeOwnership() {
+    if (this.#closed) throw new Error("PeerLinkService is closed");
+    if (this.#runtimeOwnershipPromise) return this.#runtimeOwnershipPromise;
+    this.#runtimeOwnershipPromise = (async () => {
+      let grant;
+      if (typeof this.storageProvider.acquireRuntimeOwnership === "function") {
+        grant = await this.storageProvider.acquireRuntimeOwnership({ namespace: "sdk-delivery" });
+      } else {
+        const keyValueStore = this.peerLinkStorage.sessions.keyValueStore;
+        let fallback = FALLBACK_RUNTIME_GRANTS.get(keyValueStore);
+        if (!fallback) {
+          fallback = (async () => {
+            const raw = await keyValueStore.getStrict(DELIVERY_RUNTIME_EPOCH_KEY);
+            const prior = raw === undefined ? 0 : Number(raw);
+            if (!Number.isSafeInteger(prior) || prior < 0) {
+              throw new Error("Invalid delivery runtime epoch");
+            }
+            const runtimeEpoch = prior + 1;
+            await keyValueStore.set(DELIVERY_RUNTIME_EPOCH_KEY, runtimeEpoch);
+            return { runtimeEpoch };
+          })();
+          FALLBACK_RUNTIME_GRANTS.set(keyValueStore, fallback);
+        }
+        grant = await fallback;
+      }
+      if (!grant || !Number.isSafeInteger(grant.runtimeEpoch) || grant.runtimeEpoch < 1) {
+        throw new Error("Storage provider returned an invalid delivery runtime grant");
+      }
+      this.#deliveryCommitStore.activateRuntimeEpoch(grant.runtimeEpoch, typeof grant.assertActive === "function" ? () => grant.assertActive() : null);
+      return grant;
+    })();
+    return this.#runtimeOwnershipPromise;
+  }
+
+  async close() {
+    if (this.#closed) return;
+    if (!this.#runtimeOwnershipPromise) return;
+    this.#closed = true;
+    await Promise.all([...this.#deliveryReadyByOwner.keys()].map((owner) => (
+      this.#dependencyLanes.closeOwner(owner)
+    )));
+    let grant = null;
+    try {
+      grant = await this.#runtimeOwnershipPromise;
+    } catch {
+      return;
+    }
+    if (grant && typeof grant.release === "function") {
+      await grant.release();
+    }
+  }
+
+  #ensureDeliveryReady(ownerAccountId) {
+    if (this.#closed) throw new Error("PeerLinkService is closed");
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    let ready = this.#deliveryReadyByOwner.get(owner);
+    if (!ready) {
+      ready = this.#ensureRuntimeOwnership().then(() => this.#dependencyLanes.runOwner(owner, async () => {
+        await this.#deliveryCommitStore.recoverOwner(owner);
+        await this.peerLinkStorage.events.migrateLegacyIndexesForOwner(owner);
+      }));
+      this.#deliveryReadyByOwner.set(owner, ready);
+    }
+    return ready;
+  }
+
+  async listPendingDeliveryWork(ownerAccountId = this.ownerAccountId) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    await this.#ensureDeliveryReady(owner);
+    return this.#dependencyLanes.runOwner(owner, () => this.#deliveryCommitStore.listPendingWork(owner));
+  }
+
+  async markDeliveryWorkApplied({ ownerAccountId = this.ownerAccountId, sealedDigest } = {}) {
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    await this.#ensureDeliveryReady(owner);
+    return this.#dependencyLanes.runOwner(owner, () => this.#deliveryCommitStore.markApplied(owner, requireId(sealedDigest, "sealedDigest")));
+  }
+
   // True when this service was constructed with a device key and can run
   // per-device sessions. The legacy single-device path works regardless.
   hasDeviceSessions() {
@@ -558,9 +671,11 @@ export class PeerLinkService {
    */
   async establishInitiatorDeviceSession({ ownerAccountId = this.ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, peerDeviceBundleJson } = {}) {
     const sessions = this.#requireDeviceSessions();
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    await this.#ensureDeliveryReady(owner);
     const { identityKeyPair, identityDhKeyPair } = await this._loadDeviceIdentity();
     return sessions.establishInitiatorDeviceSession({
-      ownerAccountId: requireId(ownerAccountId, "ownerAccountId"),
+      ownerAccountId: owner,
       peerAccountId: requireId(peerAccountId, "peerAccountId"),
       peerLinkId, peerDeviceId, peerDeviceBundleJson, identityKeyPair, identityDhKeyPair,
     });
@@ -572,9 +687,11 @@ export class PeerLinkService {
    */
   async establishResponderDeviceSession({ ownerAccountId = this.ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, preKeyState, handshakeData } = {}) {
     const sessions = this.#requireDeviceSessions();
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    await this.#ensureDeliveryReady(owner);
     const { identityDhKeyPair } = await this._loadDeviceIdentity();
     return sessions.establishResponderDeviceSession({
-      ownerAccountId: requireId(ownerAccountId, "ownerAccountId"),
+      ownerAccountId: owner,
       peerAccountId: requireId(peerAccountId, "peerAccountId"),
       peerLinkId, peerDeviceId, identityDhKeyPair, preKeyState, handshakeData,
     });
@@ -586,8 +703,10 @@ export class PeerLinkService {
    */
   async encryptDirectMessageForDevice({ ownerAccountId = this.ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, plaintextBytes } = {}) {
     const sessions = this.#requireDeviceSessions();
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    await this.#ensureDeliveryReady(owner);
     return sessions.encryptForDevice({
-      ownerAccountId: requireId(ownerAccountId, "ownerAccountId"),
+      ownerAccountId: owner,
       peerAccountId: requireId(peerAccountId, "peerAccountId"),
       peerLinkId, peerDeviceId, plaintextBytes,
     });
@@ -1352,7 +1471,7 @@ export class PeerLinkService {
       // never clobber it with a session-less relationship record.
       return existing;
     }
-    return this.peerLinkStorage.peerLinks.create({
+    return this.#createPeerLink({
       peerLinkId: linkId,
       localAccountId: owner,
       peerAccountId: peer,
@@ -1422,12 +1541,27 @@ export class PeerLinkService {
   /**
    * Decrypt a packet known to be from a specific peer device.
    */
-  async decryptFromDevice({ ownerAccountId = this.ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, packetBytes } = {}) {
+  async decryptFromDevice({ ownerAccountId = this.ownerAccountId, peerAccountId, peerLinkId, peerDeviceId, packetBytes, deliveryContext = null } = {}) {
     const sessions = this.#requireDeviceSessions();
+    const owner = requireId(ownerAccountId, "ownerAccountId");
+    await this.#ensureDeliveryReady(owner);
+    const sealedDigest = DeliveryCommitStore.sealedDigest(packetBytes);
+    const existingDelivery = await this.#lookupCommittedDelivery(owner, sealedDigest);
+    if (existingDelivery) {
+      if (existingDelivery.replay.state === "applied") {
+        return { deliveryDuplicate: true, deliveryWork: null, plaintextBytes: null, sessionId: null };
+      }
+      return {
+        deliveryDuplicate: true,
+        deliveryWork: existingDelivery.work,
+        plaintextBytes: base64ToBytes(existingDelivery.work.plaintextB64),
+        sessionId: existingDelivery.work.sessionId,
+      };
+    }
     return sessions.decryptFromDevice({
-      ownerAccountId: requireId(ownerAccountId, "ownerAccountId"),
+      ownerAccountId: owner,
       peerAccountId: requireId(peerAccountId, "peerAccountId"),
-      peerLinkId, peerDeviceId, packetBytes,
+      peerLinkId, peerDeviceId, packetBytes, deliveryContext,
     });
   }
 
@@ -1480,9 +1614,9 @@ export class PeerLinkService {
     return this._getInviteRecord(ownerAccountId, inviteId);
   }
 
-  async _appendPeerLinkEvent({ ownerAccountId = this.ownerAccountId, peerLinkId, type, summary, details, atMs } = {}) {
+  #buildPeerLinkEventRecord({ ownerAccountId = this.ownerAccountId, peerLinkId, type, summary, details, atMs } = {}) {
     const owner = requireId(ownerAccountId, "ownerAccountId");
-    const eventRecord = {
+    return {
       ownerAccountId: owner,
       eventId: stableId("pev"),
       peerLinkId: requireId(peerLinkId, "peerLinkId"),
@@ -1491,8 +1625,138 @@ export class PeerLinkService {
       summary: nonEmpty(summary) || null,
       details: details && typeof details === "object" && !Array.isArray(details) ? cloneJson(details) : {},
     };
+  }
+
+  async #appendPeerLinkEventInLane(input = {}) {
+    const eventRecord = this.#buildPeerLinkEventRecord(input);
     const stored = await this.peerLinkStorage.events.append(eventRecord);
     return stored;
+  }
+
+  async _appendPeerLinkEvent(input = {}) {
+    const owner = requireId(input.ownerAccountId || this.ownerAccountId, "ownerAccountId");
+    await this.#ensureDeliveryReady(owner);
+    return this.#dependencyLanes.runOwner(owner, () => this.#appendPeerLinkEventInLane(input));
+  }
+
+  async #createPeerLink(record) {
+    const owner = requireId(record && record.localAccountId, "localAccountId");
+    await this.#ensureDeliveryReady(owner);
+    return this.#dependencyLanes.runOwner(owner, () => this.peerLinkStorage.peerLinks.create(record));
+  }
+
+  async #updatePeerLink(record, expectedVersion) {
+    const owner = requireId(record && record.localAccountId, "localAccountId");
+    await this.#ensureDeliveryReady(owner);
+    return this.#dependencyLanes.runOwner(owner, () => this.peerLinkStorage.peerLinks.update(record, expectedVersion));
+  }
+
+  async #lookupCommittedDelivery(owner, sealedDigest) {
+    let existing = await this.#deliveryCommitStore.lookup(owner, sealedDigest);
+    if (existing && existing.replay.state === "ready-to-apply" && !existing.work) {
+      await this.#deliveryCommitStore.recoverOwner(owner);
+      existing = await this.#deliveryCommitStore.lookup(owner, sealedDigest);
+      if (!existing || existing.replay.state !== "ready-to-apply" || !existing.work) {
+        const err = new Error("Committed delivery is missing durable work");
+        err.code = "DELIVERY_COMMIT_FATAL";
+        throw err;
+      }
+    }
+    return existing;
+  }
+
+  async #commitReceiveAdvance({
+    owner,
+    peerLinkRecord,
+    sessionRecord,
+    secureChannelManager,
+    plaintextBytes,
+    packetBytes,
+    authenticatedSenderAccountId,
+    authenticatedSenderDeviceId = null,
+    nextSessionStatus,
+    laneId,
+    confirmSession = false,
+    deliveryContext = null,
+  }) {
+    const now = this.clock();
+    const sealedDigest = DeliveryCommitStore.sealedDigest(packetBytes);
+    const sessionIntent = await this.peerLinkStorage.sessions.preparePut({
+      ...sessionRecord,
+      localAccountId: owner,
+      peerAccountId: authenticatedSenderAccountId,
+      status: nextSessionStatus,
+      ratchetSnapshot: secureChannelManager.exportSnapshot(),
+      updatedAtMs: now,
+    }, Number(sessionRecord.version));
+
+    let peerLinkIntent = null;
+    let lifecycleEventIntent = null;
+    if (confirmSession) {
+      this.#checkPeerLinkTransition(
+        peerLinkRecord.state,
+        PEER_LINK_STATE.SESSION_ESTABLISHED,
+        peerLinkRecord.peerLinkId,
+      );
+      peerLinkIntent = await this.peerLinkStorage.peerLinks.prepareUpdate({
+        ...peerLinkRecord,
+        state: PEER_LINK_STATE.SESSION_ESTABLISHED,
+        activeSessionId: sessionIntent.nextSessionRecord.sessionId,
+        lastStateChangeAtMs: now,
+        lastErrorCode: null,
+        lastErrorMessage: null,
+      }, peerLinkRecord.version);
+      const eventRecord = this.#buildPeerLinkEventRecord({
+        ownerAccountId: owner,
+        peerLinkId: peerLinkRecord.peerLinkId,
+        type: "session_established",
+        summary: "Secure session confirmed",
+        details: {
+          sessionId: sessionIntent.nextSessionRecord.sessionId,
+          peerAccountId: authenticatedSenderAccountId,
+        },
+        atMs: now,
+      });
+      lifecycleEventIntent = await this.peerLinkStorage.events.prepareAppend(eventRecord);
+    }
+
+    const work = new DecryptedDeliveryWorkV1({
+      owner,
+      sealedDigest,
+      laneId,
+      sessionId: sessionIntent.nextSessionRecord.sessionId,
+      peerLinkId: peerLinkRecord.peerLinkId,
+      authenticatedSenderAccountId,
+      authenticatedSenderDeviceId,
+      sourceMailboxId: deliveryContext && deliveryContext.mailboxId ? deliveryContext.mailboxId : null,
+      sourceEventId: deliveryContext && deliveryContext.eventId ? deliveryContext.eventId : null,
+      plaintextB64: bytesToBase64(plaintextBytes),
+      createdAtMs: now,
+    });
+    const commit = new DeliveryCommitRecordV1({
+      owner,
+      sealedDigest,
+      runtimeEpoch: this.#deliveryCommitStore.runtimeEpoch,
+      laneId,
+      commitGeneration: this.#nextCommitGeneration(owner, laneId),
+      sessionIntent,
+      peerLinkIntent,
+      lifecycleEventIntent,
+      work,
+      replayState: "ready-to-apply",
+      createdAtMs: now,
+    });
+    const committedWork = await this.#deliveryCommitStore.commitAndRollForward(commit);
+    const canonicalPeerLink = peerLinkIntent
+      ? await this.peerLinkStorage.peerLinks.getById(owner, peerLinkRecord.peerLinkId)
+      : peerLinkRecord;
+    return {
+      deliveryWork: committedWork,
+      plaintextBytes,
+      encrypted: true,
+      snapshot: await this._buildSnapshot(canonicalPeerLink),
+      event: lifecycleEventIntent ? cloneJson(lifecycleEventIntent.eventRecord) : null,
+    };
   }
 
   _createSecureChannelManager(snapshot) {
@@ -1560,7 +1824,21 @@ export class PeerLinkService {
   // flows through unchanged; #commitSession never re-reads the record. A
   // peerLinks version mismatch propagates to the caller (the ack path wraps it
   // to recover from a duplicate ack).
-  async #commitSession({
+  async #commitSession(args = {}) {
+    const owner = requireId(args.ownerAccountId, "ownerAccountId");
+    await this.#ensureDeliveryReady(owner);
+    const existingSessionId = args.existingSession && args.existingSession.sessionId
+      ? requireId(args.existingSession.sessionId, "existingSession.sessionId")
+      : null;
+    if (existingSessionId) {
+      this.#deliveryCommitStore.assertAvailable(owner, "ratchet:" + existingSessionId);
+      return this.#dependencyLanes.runSession(owner, existingSessionId, () => this.#commitSessionInLane(args));
+    }
+    this.#deliveryCommitStore.assertAvailable(owner, "owner-global");
+    return this.#dependencyLanes.runOwner(owner, () => this.#commitSessionInLane(args));
+  }
+
+  async #commitSessionInLane({
     ownerAccountId,
     peerLinkRecord,
     peerAccountId,
@@ -1643,7 +1921,7 @@ export class PeerLinkService {
     // 5. Append the lifecycle event. peerAccountId + sessionId are common to
     //    every establish event, so they are merged in here; the caller passes
     //    only the extras (inviteId / requestId). Caller keys win on collision.
-    const event = await this._appendPeerLinkEvent({
+    const event = await this.#appendPeerLinkEventInLane({
       ownerAccountId: owner,
       peerLinkId: nextPeerLinkRecord.peerLinkId,
       type: eventType,
@@ -1677,194 +1955,6 @@ export class PeerLinkService {
       event,
       sessionRecord: storedSession,
       peerLinkRecord: nextPeerLinkRecord,
-    };
-  }
-
-  // DT-007 (RISK REDUCTION ONLY — open until DT-302's durable commit intent):
-  // #commitSession persists the advanced ratchet (sessions.put) BEFORE the
-  // peer-link CAS that can throw on a stale snapshot. If a decrypt caller let
-  // that throw escape, the caller would report decrypt-failed, the deposit
-  // would stay buffered, and every retry would decrypt against the
-  // already-advanced ratchet — permanent silent plaintext loss.
-  //
-  // STAGE-AWARE recovery contract (rev-2/rev-3 review): plaintext is returned
-  // ONLY after BOTH durability facts hold — the session write RETURNED
-  // SUCCESSFULLY at least once, and the canonical record reads back holding
-  // EXACTLY this decrypt's advanced ratchet snapshot. If either fails, the
-  // ratchet advance was never proven durable (or a concurrent writer
-  // clobbered it), so the original error is re-thrown and the deposit stays
-  // buffered.
-  //
-  // WHAT RE-THROWING DOES AND DOES NOT SAVE. If the write never reached
-  // storage, the stored ratchet is unchanged and a later drain decrypts this
-  // same packet cleanly — nothing is lost. If the write LANDED and was then
-  // REJECTED (readable but not proven durable — e.g. rename succeeds, the
-  // directory fsync fails), the stored ratchet HAS advanced: re-throwing is
-  // still correct, because the system must never report a delivery it cannot
-  // prove, but this packet can no longer decrypt and its plaintext is gone.
-  // DT-007 does not close that hole — it only guarantees the failure is loud
-  // instead of silent. Closing it is DT-302's durable commit intent.
-  //
-  // When the ratchet IS verified durable, the peer-link
-  // transition is retried once against a fresh read (two attempts total,
-  // repo retry policy); any transition/event stage that still cannot land is
-  // surfaced as an owned PeerLinkCommitErrorV1 with the failed stage —
-  // including an event-append failure AFTER a successful CAS, which is never
-  // silently dropped. A crash between the ratchet persist and the caller
-  // staging the plaintext remains unrecoverable here by design (DT-302).
-  async #commitSessionAfterDecrypt(args) {
-    const progress = { sessionPersisted: false, peerLinkUpdated: false, eventAppended: false, sessionPutInput: null };
-    try {
-      return await this.#commitSession({ ...args, progress });
-    } catch (firstErr) {
-      return await this.#recoverCommitAfterDecrypt(args, progress, firstErr);
-    }
-  }
-
-  // Read back the canonical session record and require byte-exact equality of
-  // its ratchetSnapshot with this decrypt's advanced state. exportSnapshot()
-  // is a pure serialization of the in-memory ratchet, which has not advanced
-  // since the decrypt, so equality proves the durable record is OURS — not a
-  // pre-advance leftover and not a concurrent writer's clobber.
-  //
-  // NOT SUFFICIENT ON ITS OWN: a backend may make the bytes READABLE and
-  // still reject the write as non-durable (FsKeyValueStore renames the temp
-  // file, then fails its directory fsync and rejects — the record reads back
-  // byte-equal but can vanish on power loss). Callers must pair this with the
-  // "the write returned successfully" fact — see #confirmAdvancedRatchetDurable.
-  async #storedRatchetMatches({ ownerAccountId, existingSession, secureChannelManager }, progress) {
-    if (!secureChannelManager) return false;
-    const putInput = progress && progress.sessionPutInput ? progress.sessionPutInput : null;
-    const sessionId = putInput && putInput.sessionId
-      ? putInput.sessionId
-      : (existingSession && existingSession.sessionId ? existingSession.sessionId : null);
-    if (!sessionId) return false;
-    const stored = await this.peerLinkStorage.sessions.getById(ownerAccountId, sessionId);
-    if (!stored || !stored.ratchetSnapshot) return false;
-    const expected = secureChannelManager.exportSnapshot();
-    return canonicalJSONStringify(stored.ratchetSnapshot) === canonicalJSONStringify(expected);
-  }
-
-  // Durability proof gating EVERY plaintext return out of a failed commit.
-  // TWO facts are required, and read-back is only the second of them:
-  //   (a) the durability-owning write RETURNED SUCCESSFULLY at least once. A
-  //       write that threw is REJECTED, and a rejected write can never be
-  //       upgraded to "durable" by observing its bytes (see #storedRatchetMatches).
-  //   (b) the canonical record holds byte-exactly THIS decrypt's advanced
-  //       ratchet — guards a concurrent writer having clobbered it.
-  // When (a) is missing, a BOUNDED identical rewrite is attempted (repo
-  // two-retry policy). The input is byte-identical to the original put, so a
-  // successful rewrite asserts the SAME logical ratchet advance rather than a
-  // new one (the stored record itself differs: the session store increments
-  // `version` per put). If no attempt
-  // returns successfully, this interim layer cannot safely classify the
-  // result — it fails closed (the caller re-throws, the deposit stays
-  // buffered) and leaves final recovery to DT-302's durable commit intent.
-  async #confirmAdvancedRatchetDurable(args, progress) {
-    if (!progress) return false;
-    if (!progress.sessionPersisted) {
-      if (!progress.sessionPutInput) return false;
-      let lastRewriteErr = null;
-      for (let attempt = 0; attempt < SESSION_REWRITE_ATTEMPTS; attempt += 1) {
-        try {
-          await this.peerLinkStorage.sessions.put(progress.sessionPutInput);
-          progress.sessionPersisted = true;
-          lastRewriteErr = null;
-          break;
-        } catch (rewriteErr) {
-          lastRewriteErr = rewriteErr;
-        }
-      }
-      if (!progress.sessionPersisted) {
-        // Handled, not swallowed: the caller re-throws its ORIGINAL error and
-        // the deposit stays buffered. Logged so the unclassifiable state is
-        // diagnosable rather than invisible.
-        // eslint-disable-next-line no-console
-        console.warn(
-          "[PeerLinkService] session write could not be confirmed durable after "
-          + SESSION_REWRITE_ATTEMPTS + " identical rewrites; failing closed: "
-          + (lastRewriteErr && lastRewriteErr.message ? lastRewriteErr.message : String(lastRewriteErr)),
-        );
-        return false;
-      }
-    }
-    return await this.#storedRatchetMatches(args, progress);
-  }
-
-  async #recoverCommitAfterDecrypt(args, progress, firstErr) {
-    const owner = args.ownerAccountId;
-    const peerLinkId = args.peerLinkRecord.peerLinkId;
-    const describe = (err) => (err && err.message ? err.message : String(err));
-    const failedStage = (p) => {
-      if (!p.sessionPersisted) return "session-write";
-      if (!p.peerLinkUpdated) return "peer-link-transition";
-      return "event-append";
-    };
-
-    // Gate EVERYTHING on durability proof for THIS decrypt's ratchet advance.
-    if (!(await this.#confirmAdvancedRatchetDurable(args, progress))) {
-      throw firstErr;
-    }
-
-    const fresh = await this.peerLinkStorage.peerLinks.getById(owner, peerLinkId);
-    if (fresh && fresh.state === PEER_LINK_STATE.SESSION_ESTABLISHED) {
-      if (progress.peerLinkUpdated && !progress.eventAppended) {
-        // OUR CAS landed and the lifecycle event append failed after it —
-        // surfaced explicitly, never treated as "nothing left to commit".
-        return {
-          snapshot: await this._buildSnapshot(fresh),
-          event: null,
-          sessionRecord: null,
-          peerLinkRecord: fresh,
-          commitError: new PeerLinkCommitErrorV1({ stage: "event-append", message: describe(firstErr) }),
-        };
-      }
-      // A concurrent commit established the link and our ratchet is verified
-      // durable on the canonical record — the transition is genuinely done.
-      return {
-        snapshot: await this._buildSnapshot(fresh),
-        event: null,
-        sessionRecord: null,
-        peerLinkRecord: fresh,
-      };
-    }
-
-    if (fresh) {
-      const retryProgress = { sessionPersisted: false, peerLinkUpdated: false, eventAppended: false, sessionPutInput: null };
-      try {
-        return await this.#commitSession({ ...args, peerLinkRecord: fresh, progress: retryProgress });
-      } catch (retryErr) {
-        // Durability was already PROVEN above (successful write + byte-exact
-        // read-back) before this retry ran. If the retry's own sessions.put
-        // returned, re-prove through it; if the retry failed before/at the
-        // write, the earlier proof still stands and only the no-clobber
-        // read-back needs re-checking. Either way plaintext never escapes
-        // without a write that returned successfully.
-        const stillDurable = retryProgress.sessionPersisted
-          ? await this.#confirmAdvancedRatchetDurable(args, retryProgress)
-          : await this.#storedRatchetMatches(args, progress);
-        if (!stillDurable) {
-          throw retryErr;
-        }
-        return {
-          snapshot: await this._buildSnapshot(fresh),
-          event: null,
-          sessionRecord: null,
-          peerLinkRecord: fresh,
-          commitError: new PeerLinkCommitErrorV1({ stage: failedStage(retryProgress), message: describe(retryErr) }),
-        };
-      }
-    }
-
-    // The peer link vanished between decrypt and commit (teardown raced us).
-    // The ratchet is verified durable, so the plaintext still wins; the
-    // caller gets the stale snapshot it started from plus the typed marker.
-    return {
-      snapshot: await this._buildSnapshot(args.peerLinkRecord),
-      event: null,
-      sessionRecord: null,
-      peerLinkRecord: args.peerLinkRecord,
-      commitError: new PeerLinkCommitErrorV1({ stage: failedStage(progress), message: describe(firstErr) }),
     };
   }
 
@@ -2438,7 +2528,7 @@ export class PeerLinkService {
     if (elapsed < HANDSHAKE_ACK_TIMEOUT_MS) return record;
     const nowMs = this.clock();
     try {
-      const updated = await this.peerLinkStorage.peerLinks.update({
+      const updated = await this.#updatePeerLink({
         ...record,
         state: "failed",
         lastStateChangeAtMs: nowMs,
@@ -2500,162 +2590,160 @@ export class PeerLinkService {
     if (!(plaintextBytes instanceof Uint8Array) || plaintextBytes.length === 0) {
       throw new Error("encryptDirectMessage requires non-empty plaintextBytes");
     }
-    const peerLinkRecord = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
-    if (!peerLinkRecord) {
+    await this.#ensureDeliveryReady(owner);
+    const initialPeerLink = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
+    if (!initialPeerLink) {
       const noPeerLink = new Error("No peer link exists for this contact");
       noPeerLink.code = "THREAD_NOT_READY";
       throw noPeerLink;
     }
-    const sessionRecord = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, peerLinkRecord.peerLinkId);
-    if (!sessionRecord || typeof sessionRecord !== "object") {
+    const initialSession = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, initialPeerLink.peerLinkId);
+    if (!initialSession || typeof initialSession !== "object") {
       const missingSession = new Error("Secure session is not ready yet");
       missingSession.code = "THREAD_NOT_READY";
       throw missingSession;
     }
-    const canSend = isSessionUsable(sessionRecord.status);
-    if (!canSend) {
-      const unavailableSession = new Error("Secure session is not ready yet");
-      unavailableSession.code = "THREAD_NOT_READY";
-      throw unavailableSession;
-    }
-
-    const secureChannelManager = this._createSecureChannelManager(sessionRecord.ratchetSnapshot);
-    const codec = new E2eePacketCodec({ secureChannelManager });
-    const encryptedPacket = await codec.encryptForPeer({
-      peerId: remote,
-      plaintextBytes,
+    return this.#dependencyLanes.runSession(owner, initialSession.sessionId, async (laneId) => {
+      this.#deliveryCommitStore.assertAvailable(owner, laneId);
+      const peerLinkRecord = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
+      const sessionRecord = await this.peerLinkStorage.sessions.getById(owner, initialSession.sessionId);
+      if (!peerLinkRecord || !sessionRecord || sessionRecord.peerLinkId !== peerLinkRecord.peerLinkId
+          || !isSessionUsable(sessionRecord.status)) {
+        const unavailableSession = new Error("Secure session is not ready yet");
+        unavailableSession.code = "THREAD_NOT_READY";
+        throw unavailableSession;
+      }
+      const secureChannelManager = this._createSecureChannelManager(sessionRecord.ratchetSnapshot);
+      const codec = new E2eePacketCodec({ secureChannelManager });
+      const encryptedPacket = await codec.encryptForPeer({ peerId: remote, plaintextBytes });
+      const storedSession = await this.peerLinkStorage.sessions.put({
+        ...sessionRecord,
+        localAccountId: owner,
+        peerAccountId: remote,
+        ratchetSnapshot: secureChannelManager.exportSnapshot(),
+        updatedAtMs: this.clock(),
+      });
+      return {
+        peerLinkId: peerLinkRecord.peerLinkId,
+        sessionId: storedSession.sessionId,
+        encryptedPacket,
+        sessionState: storedSession.status,
+      };
     });
-    const sessionSnapshot = secureChannelManager.exportSnapshot();
-    const storedSession = await this.peerLinkStorage.sessions.put({
-      ...sessionRecord,
-      localAccountId: owner,
-      peerAccountId: remote,
-      ratchetSnapshot: sessionSnapshot,
-      updatedAtMs: this.clock(),
-    });
-
-    return {
-      peerLinkId: peerLinkRecord.peerLinkId,
-      sessionId: storedSession.sessionId,
-      encryptedPacket,
-      sessionState: storedSession.status,
-    };
   }
 
   async decryptDirectMessage({
     ownerAccountId = this.ownerAccountId,
     peerAccountId,
     packetBytes,
+    deliveryContext = null,
   } = {}) {
     const owner = requireId(ownerAccountId, "ownerAccountId");
     const remote = requireId(peerAccountId, "peerAccountId");
     if (!(packetBytes instanceof Uint8Array) || packetBytes.length === 0) {
       throw new Error("decryptDirectMessage requires non-empty packetBytes");
     }
-    const peerLinkRecord = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
-    if (!peerLinkRecord) {
+    await this.#ensureDeliveryReady(owner);
+    const sealedDigest = DeliveryCommitStore.sealedDigest(packetBytes);
+    const existingDelivery = await this.#lookupCommittedDelivery(owner, sealedDigest);
+    if (existingDelivery) {
+      if (existingDelivery.replay.state === "applied") {
+        return { deliveryDuplicate: true, deliveryWork: null, plaintextBytes: null, encrypted: true, snapshot: null, event: null };
+      }
+      const replayPeerLink = await this.peerLinkStorage.peerLinks.getById(owner, existingDelivery.work.peerLinkId);
+      return {
+        deliveryDuplicate: true,
+        deliveryWork: existingDelivery.work,
+        plaintextBytes: base64ToBytes(existingDelivery.work.plaintextB64),
+        encrypted: true,
+        snapshot: await this._buildSnapshot(replayPeerLink),
+        event: null,
+      };
+    }
+
+    const initialPeerLink = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
+    if (!initialPeerLink) {
       const missingPeerLink = new Error("Secure session is not ready yet");
       missingPeerLink.code = "THREAD_NOT_READY";
       throw missingPeerLink;
     }
-    const sessionRecord = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, peerLinkRecord.peerLinkId);
-    if (!sessionRecord || typeof sessionRecord !== "object") {
+    const initialSession = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, initialPeerLink.peerLinkId);
+    if (!initialSession || typeof initialSession !== "object") {
       const missingSession = new Error("Secure session is not ready yet");
       missingSession.code = "THREAD_NOT_READY";
       throw missingSession;
     }
-    const sessionStatus = nonEmpty(sessionRecord.status) || "pending";
-    const canDecrypt = isSessionUsable(sessionStatus);
-    if (!canDecrypt) {
-      const unavailableSession = new Error("Secure session is not ready yet");
-      unavailableSession.code = "THREAD_NOT_READY";
-      throw unavailableSession;
-    }
-
-    const secureChannelManager = this._createSecureChannelManager(sessionRecord.ratchetSnapshot);
-    const codec = new E2eePacketCodec({ secureChannelManager });
-    const result = await codec.decryptIncoming({ packetBytes });
-
-    // Reject plaintext packets when a secure session exists — accepting them
-    // would let an attacker bypass E2EE by injecting unencrypted deposits.
-    // Handshake control messages are allowed through (they are always plaintext).
-    if (!result.encrypted && !result.handshake) {
-      const downgradeErr = new Error("Plaintext packet rejected — secure session exists");
-      downgradeErr.code = "PLAINTEXT_REJECTED";
-      throw downgradeErr;
-    }
-
-    // Detect decryption failure: encrypted packet but no peerId means the ratchet
-    // could not decrypt. Return still-encrypted bytes would leak garbled data to
-    // the app layer. Track the failure and throw instead.
-    if (result.encrypted && !result.peerId && !result.handshake) {
-      const failKey = owner + ":" + remote;
-      const prevCount = this.#decryptFailureCounts.get(failKey) || 0;
-      this.#decryptFailureCounts.set(failKey, prevCount + 1);
-      const decryptErr = new Error("E2EE decryption failed — possible ratchet desync for peer " + remote);
-      decryptErr.code = "DECRYPT_FAILED";
-      decryptErr.peerAccountId = remote;
-      decryptErr.peerLinkId = peerLinkRecord.peerLinkId;
-      decryptErr.consecutiveFailures = prevCount + 1;
-      decryptErr.rehandshakeNeeded = (prevCount + 1) >= REHANDSHAKE_DECRYPT_FAILURE_THRESHOLD;
-      throw decryptErr;
-    }
-
-    // Successful decrypt — reset failure/recovery counters for this peer.
-    const successKey = owner + ":" + remote;
-    this.#decryptFailureCounts.delete(successKey);
-    this.#anyPeerMissCounts.delete(successKey);
-
-    const nextSessionStatus = sessionStatus === "pending_remote_confirm" ? "active" : sessionStatus;
-    // A first successful decrypt confirms the session (and any pending_remote_confirm
-    // → active flip); route that establishment write through the single
-    // #commitSession path. Steady-state decrypts (already established, no status
-    // change) only persist the advanced ratchet — no peer-link write/event.
-    if (peerLinkRecord.state !== "session_established" || nextSessionStatus !== sessionStatus) {
-      // DT-007: the decrypt has succeeded and the ratchet advance is about to
-      // be persisted inside the commit. From here on a commit failure must not
-      // surface as a decrypt failure ONCE the advance is proven durable; while
-      // it is unproven the error still propagates (fail closed), which can
-      // lose this packet's plaintext if the write landed and was then rejected
-      // — the accepted DT-302 gap. See #commitSessionAfterDecrypt.
-      const commit = await this.#commitSessionAfterDecrypt({
-        ownerAccountId: owner,
+    return this.#dependencyLanes.runSession(owner, initialSession.sessionId, async (laneId) => {
+      const duplicate = await this.#lookupCommittedDelivery(owner, sealedDigest);
+      if (duplicate) {
+        if (duplicate.replay.state === "applied") {
+          return { deliveryDuplicate: true, deliveryWork: null, plaintextBytes: null, encrypted: true, snapshot: null, event: null };
+        }
+        const replayPeerLink = await this.peerLinkStorage.peerLinks.getById(owner, duplicate.work.peerLinkId);
+        return {
+          deliveryDuplicate: true,
+          deliveryWork: duplicate.work,
+          plaintextBytes: base64ToBytes(duplicate.work.plaintextB64),
+          encrypted: true,
+          snapshot: await this._buildSnapshot(replayPeerLink),
+          event: null,
+        };
+      }
+      this.#deliveryCommitStore.assertAvailable(owner, laneId);
+      const peerLinkRecord = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
+      const sessionRecord = peerLinkRecord
+        ? await this.peerLinkStorage.sessions.getById(owner, initialSession.sessionId)
+        : null;
+      if (!peerLinkRecord || !sessionRecord || sessionRecord.peerLinkId !== peerLinkRecord.peerLinkId) {
+        const missingSession = new Error("Secure session is not ready yet");
+        missingSession.code = "THREAD_NOT_READY";
+        throw missingSession;
+      }
+      const sessionStatus = nonEmpty(sessionRecord.status) || "pending";
+      if (!isSessionUsable(sessionStatus)) {
+        const unavailableSession = new Error("Secure session is not ready yet");
+        unavailableSession.code = "THREAD_NOT_READY";
+        throw unavailableSession;
+      }
+      const secureChannelManager = this._createSecureChannelManager(sessionRecord.ratchetSnapshot);
+      const codec = new E2eePacketCodec({ secureChannelManager });
+      const result = await codec.decryptIncoming({ packetBytes });
+      if (!result.encrypted && !result.handshake) {
+        const downgradeErr = new Error("Plaintext packet rejected — secure session exists");
+        downgradeErr.code = "PLAINTEXT_REJECTED";
+        throw downgradeErr;
+      }
+      if (result.encrypted && (!result.peerId || result.peerId !== remote) && !result.handshake) {
+        const failKey = owner + ":" + remote;
+        const prevCount = this.#decryptFailureCounts.get(failKey) || 0;
+        this.#decryptFailureCounts.set(failKey, prevCount + 1);
+        const decryptErr = new Error("E2EE decryption failed — possible ratchet desync for peer " + remote);
+        decryptErr.code = "DECRYPT_FAILED";
+        decryptErr.peerAccountId = remote;
+        decryptErr.peerLinkId = peerLinkRecord.peerLinkId;
+        decryptErr.consecutiveFailures = prevCount + 1;
+        decryptErr.rehandshakeNeeded = (prevCount + 1) >= REHANDSHAKE_DECRYPT_FAILURE_THRESHOLD;
+        throw decryptErr;
+      }
+      const nextSessionStatus = sessionStatus === "pending_remote_confirm" ? "active" : sessionStatus;
+      const committed = await this.#commitReceiveAdvance({
+        owner,
         peerLinkRecord,
-        peerAccountId: remote,
+        sessionRecord,
         secureChannelManager,
-        sessionStatus: nextSessionStatus,
-        peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
-        existingSession: sessionRecord,
-        eventType: "session_established",
-        eventSummary: "Secure session confirmed",
-        eventDetails: { sessionId: sessionRecord.sessionId, peerAccountId: remote },
-        atMs: this.clock(),
-      });
-      return {
         plaintextBytes: result.plaintextBytes,
-        encrypted: result.encrypted === true,
-        snapshot: commit.snapshot,
-        event: commit.event,
-        ...(commit.commitError ? { commitError: commit.commitError } : {}),
-      };
-    }
-
-    const sessionSnapshot = secureChannelManager.exportSnapshot();
-    await this.peerLinkStorage.sessions.put({
-      ...sessionRecord,
-      localAccountId: owner,
-      peerAccountId: remote,
-      status: nextSessionStatus,
-      ratchetSnapshot: sessionSnapshot,
-      updatedAtMs: this.clock(),
+        packetBytes,
+        authenticatedSenderAccountId: result.peerId,
+        nextSessionStatus,
+        laneId,
+        confirmSession: peerLinkRecord.state !== "session_established" || nextSessionStatus !== sessionStatus,
+        deliveryContext,
+      });
+      const successKey = owner + ":" + remote;
+      this.#decryptFailureCounts.delete(successKey);
+      this.#anyPeerMissCounts.delete(successKey);
+      return committed;
     });
-
-    return {
-      plaintextBytes: result.plaintextBytes,
-      encrypted: result.encrypted === true,
-      snapshot: await this._buildSnapshot(peerLinkRecord),
-      event: null,
-    };
   }
 
   /**
@@ -2665,10 +2753,29 @@ export class PeerLinkService {
   async decryptDirectMessageAnyPeer({
     ownerAccountId = this.ownerAccountId,
     packetBytes,
+    deliveryContext = null,
   } = {}) {
     const owner = requireId(ownerAccountId, "ownerAccountId");
     if (!(packetBytes instanceof Uint8Array) || packetBytes.length === 0) {
       throw new Error("decryptDirectMessageAnyPeer requires non-empty packetBytes");
+    }
+    await this.#ensureDeliveryReady(owner);
+    const sealedDigest = DeliveryCommitStore.sealedDigest(packetBytes);
+    const existingDelivery = await this.#lookupCommittedDelivery(owner, sealedDigest);
+    if (existingDelivery) {
+      if (existingDelivery.replay.state === "applied") {
+        return { deliveryDuplicate: true, deliveryWork: null, plaintextBytes: null, encrypted: true, snapshot: null, event: null };
+      }
+      const replayPeerLink = await this.peerLinkStorage.peerLinks.getById(owner, existingDelivery.work.peerLinkId);
+      return {
+        deliveryDuplicate: true,
+        deliveryWork: existingDelivery.work,
+        plaintextBytes: base64ToBytes(existingDelivery.work.plaintextB64),
+        encrypted: true,
+        snapshot: await this._buildSnapshot(replayPeerLink),
+        event: null,
+        peerDeviceId: existingDelivery.work.authenticatedSenderDeviceId,
+      };
     }
     const rows = await this.peerLinkStorage.peerLinks.listByOwner(owner);
     const trace = process.env.REZ_PEERLINK_TRACE === "1";
@@ -2690,6 +2797,7 @@ export class PeerLinkService {
           peerAccountId: row.peerAccountId,
           peerLinkId: row.peerLinkId,
           packetBytes,
+          deliveryContext,
         });
         if (deviceHit) {
           const deviceSuccessKey = owner + ":" + row.peerAccountId;
@@ -2702,90 +2810,79 @@ export class PeerLinkService {
             snapshot: await this._buildSnapshot(row),
             event: null,
             peerDeviceId: deviceHit.peerDeviceId,
+            deliveryWork: deviceHit.deliveryWork,
+            deliveryDuplicate: deviceHit.deliveryDuplicate === true,
           };
         }
       }
 
-      const sessionRecord = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, row.peerLinkId);
-      if (!sessionRecord || typeof sessionRecord !== "object") {
+      const initialSession = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, row.peerLinkId);
+      if (!initialSession || typeof initialSession !== "object") {
         if (trace) tried.push(row.peerAccountId + ":no-session");
         continue;
       }
-      const sessionStatus = nonEmpty(sessionRecord.status) || "pending";
-      const canDecrypt = isSessionUsable(sessionStatus);
-      if (!canDecrypt) {
-        if (trace) tried.push(row.peerAccountId + ":status=" + sessionStatus);
+      const attempt = await this.#dependencyLanes.runSession(owner, initialSession.sessionId, async (laneId) => {
+        const duplicate = await this.#lookupCommittedDelivery(owner, sealedDigest);
+        if (duplicate) return { kind: "duplicate", duplicate };
+        this.#deliveryCommitStore.assertAvailable(owner, laneId);
+        const sessionRecord = await this.peerLinkStorage.sessions.getById(owner, initialSession.sessionId);
+        const freshPeerLink = await this.peerLinkStorage.peerLinks.getById(owner, row.peerLinkId);
+        if (!sessionRecord || !freshPeerLink || sessionRecord.peerLinkId !== freshPeerLink.peerLinkId) {
+          return { kind: "unavailable", status: "missing" };
+        }
+        const sessionStatus = nonEmpty(sessionRecord.status) || "pending";
+        if (!isSessionUsable(sessionStatus)) return { kind: "unavailable", status: sessionStatus };
+        const secureChannelManager = this._createSecureChannelManager(sessionRecord.ratchetSnapshot);
+        const codec = new E2eePacketCodec({ secureChannelManager });
+        const result = await codec.decryptIncoming({ packetBytes });
+        if (!result.encrypted || !result.peerId || result.peerId !== row.peerAccountId) {
+          return { kind: "miss", encrypted: result.encrypted === true, peerId: result.peerId };
+        }
+        const nextSessionStatus = sessionStatus === "pending_remote_confirm" ? "active" : sessionStatus;
+        const committed = await this.#commitReceiveAdvance({
+          owner,
+          peerLinkRecord: freshPeerLink,
+          sessionRecord,
+          secureChannelManager,
+          plaintextBytes: result.plaintextBytes,
+          packetBytes,
+          authenticatedSenderAccountId: result.peerId,
+          nextSessionStatus,
+          laneId,
+          confirmSession: freshPeerLink.state !== "session_established" || nextSessionStatus !== sessionStatus,
+          deliveryContext,
+        });
+        return { kind: "hit", committed };
+      });
+      if (attempt.kind === "unavailable") {
+        if (trace) tried.push(row.peerAccountId + (attempt.status === "missing" ? ":no-session" : ":status=" + attempt.status));
         continue;
       }
-
-      const secureChannelManager = this._createSecureChannelManager(sessionRecord.ratchetSnapshot);
-      const codec = new E2eePacketCodec({ secureChannelManager });
-      const result = await codec.decryptIncoming({ packetBytes });
-
-      // Wrong session — SID mismatch returns peerId null, no state mutation.
-      // This link had a usable session yet did not decrypt the packet, so it is
-      // a recovery candidate (see total-miss handling below).
-      if (!result.encrypted || !result.peerId) {
-        if (trace) tried.push(row.peerAccountId + ":no-match(enc=" + (result.encrypted ? 1 : 0) + ",pid=" + (result.peerId ? 1 : 0) + ")");
+      if (attempt.kind === "duplicate") {
+        if (attempt.duplicate.replay.state === "applied") {
+          return { deliveryDuplicate: true, deliveryWork: null, plaintextBytes: null, encrypted: true, snapshot: null, event: null };
+        }
+        const replayPeerLink = await this.peerLinkStorage.peerLinks.getById(owner, attempt.duplicate.work.peerLinkId);
+        return {
+          deliveryDuplicate: true,
+          deliveryWork: attempt.duplicate.work,
+          plaintextBytes: base64ToBytes(attempt.duplicate.work.plaintextB64),
+          encrypted: true,
+          snapshot: await this._buildSnapshot(replayPeerLink),
+          event: null,
+          peerDeviceId: attempt.duplicate.work.authenticatedSenderDeviceId,
+        };
+      }
+      if (attempt.kind === "miss") {
+        if (trace) tried.push(row.peerAccountId + ":no-match(enc=" + (attempt.encrypted ? 1 : 0) + ",pid=" + (attempt.peerId ? 1 : 0) + ")");
         candidates.push(row);
         continue;
       }
-
-      // Successful trial decrypt — reset counters, persist ratchet, confirm link.
       const successKey = owner + ":" + row.peerAccountId;
       this.#decryptFailureCounts.delete(successKey);
       this.#anyPeerMissCounts.delete(successKey);
-      // Mark the session healthy: it just decrypted authenticated traffic. Used
-      // to refuse a destructive re-handshake armed by undecryptable noise.
       this.#anyPeerLastSuccessAt.set(successKey, this.clock());
-
-      const nextSessionStatus = sessionStatus === "pending_remote_confirm" ? "active" : sessionStatus;
-      // First successful trial decrypt confirms the session — route that
-      // establishment write through the single #commitSession path. Steady-state
-      // trial decrypts only persist the advanced ratchet (no peer-link write).
-      if (row.state !== "session_established" || nextSessionStatus !== sessionStatus) {
-        // DT-007: same rule as decryptDirectMessage — a successful decrypt's
-        // plaintext survives any peer-link commit failure whose ratchet advance
-        // is PROVEN durable; an unproven advance still fails closed (and can
-        // lose this packet — the accepted DT-302 gap).
-        const commit = await this.#commitSessionAfterDecrypt({
-          ownerAccountId: owner,
-          peerLinkRecord: row,
-          peerAccountId: row.peerAccountId,
-          secureChannelManager,
-          sessionStatus: nextSessionStatus,
-          peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
-          existingSession: sessionRecord,
-          eventType: "session_established",
-          eventSummary: "Secure session confirmed",
-          eventDetails: { sessionId: sessionRecord.sessionId, peerAccountId: row.peerAccountId },
-          atMs: this.clock(),
-        });
-        return {
-          plaintextBytes: result.plaintextBytes,
-          encrypted: result.encrypted === true,
-          snapshot: commit.snapshot,
-          event: commit.event,
-          ...(commit.commitError ? { commitError: commit.commitError } : {}),
-        };
-      }
-
-      const sessionSnapshot = secureChannelManager.exportSnapshot();
-      await this.peerLinkStorage.sessions.put({
-        ...sessionRecord,
-        localAccountId: owner,
-        peerAccountId: row.peerAccountId,
-        status: nextSessionStatus,
-        ratchetSnapshot: sessionSnapshot,
-        updatedAtMs: this.clock(),
-      });
-
-      return {
-        plaintextBytes: result.plaintextBytes,
-        encrypted: result.encrypted === true,
-        snapshot: await this._buildSnapshot(row),
-        event: null,
-      };
+      return attempt.committed;
     }
 
     if (trace) {
@@ -3320,7 +3417,7 @@ export class PeerLinkService {
       // attempts were marked terminal, so there is nothing stale to carry over
       // beyond the row identity itself. Clear the error fields and re-bind the
       // new invite.
-      peerLinkRecord = await this.peerLinkStorage.peerLinks.update({
+      peerLinkRecord = await this.#updatePeerLink({
         ...existing,
         remoteIdentitySigningPublicKeyB64: inviterIdentitySigningPubKeyB64,
         remoteIdentityDhPublicKeyB64: inviterIdentityDhPubKeyB64,
@@ -3334,7 +3431,7 @@ export class PeerLinkService {
         lastErrorMessage: null,
       }, existing.version);
     } else {
-      peerLinkRecord = await this.peerLinkStorage.peerLinks.create({
+      peerLinkRecord = await this.#createPeerLink({
         peerLinkId,
         localAccountId: acceptor,
         peerAccountId: inviterAccountId,
@@ -3503,7 +3600,7 @@ export class PeerLinkService {
           }, handshakeAttempt.version);
           const currentForUpdate = freshAfterSend || peerLinkRecord;
           this.#checkPeerLinkTransition(currentForUpdate.state, PEER_LINK_STATE.HANDSHAKE_SENT, currentForUpdate.peerLinkId);
-          peerLinkRecord = await this.peerLinkStorage.peerLinks.update({
+          peerLinkRecord = await this.#updatePeerLink({
             ...currentForUpdate,
             state: PEER_LINK_STATE.HANDSHAKE_SENT,
             lastStateChangeAtMs: nowMs,
@@ -3556,7 +3653,7 @@ export class PeerLinkService {
             );
           }
           this.#checkPeerLinkTransition(currentForErr.state, PEER_LINK_STATE.DEGRADED, currentForErr.peerLinkId);
-          peerLinkRecord = await this.peerLinkStorage.peerLinks.update({
+          peerLinkRecord = await this.#updatePeerLink({
             ...currentForErr,
             state: PEER_LINK_STATE.DEGRADED,
             lastStateChangeAtMs: nowMs,
@@ -3776,7 +3873,7 @@ export class PeerLinkService {
     const peerAccountIdentityPubKeyB64 = nonEmpty(senderBinding.accountIdentityPublicKeyB64);
     let peerLinkRecord = existing;
     if (!peerLinkRecord) {
-      peerLinkRecord = await this.peerLinkStorage.peerLinks.create({
+      peerLinkRecord = await this.#createPeerLink({
         peerLinkId: stableId("pl"),
         localAccountId: owner,
         peerAccountId,
@@ -4072,6 +4169,11 @@ export class PeerLinkService {
     } catch {
       return null;
     }
+    await this.#ensureDeliveryReady(owner);
+    return this.#dependencyLanes.runOwner(owner, () => this.#handleHandshakeRejectInLane(owner, reject));
+  }
+
+  async #handleHandshakeRejectInLane(owner, reject) {
     const remote = reject.senderAccountId;
     const peerLinkRecord = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
     if (!peerLinkRecord) {
@@ -4143,7 +4245,7 @@ export class PeerLinkService {
       lastErrorMessage: "handshake rejected by inviter",
     }, peerLinkRecord.version);
 
-    const eventRecord = await this._appendPeerLinkEvent({
+    const eventRecord = await this.#appendPeerLinkEventInLane({
       ownerAccountId: owner,
       peerLinkId: rejectedRecord.peerLinkId,
       type: "handshake_rejected",
