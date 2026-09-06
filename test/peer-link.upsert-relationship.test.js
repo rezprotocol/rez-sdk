@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createKeyValueBackedPeerLinkStorage } from "../src/peer-link/createKeyValueBackedPeerLinkStorage.js";
 import { PeerLinkService } from "../src/peer-link/PeerLinkService.js";
 import { BrowserCryptoProvider } from "../src/e2ee/BrowserCryptoProvider.js";
+import { withTestRuntimeOwnership } from "./support/runtimeOwnership.js";
 
 // Both host KV absence encodings exist in production: IndexedDB-backed
 // stores return `undefined` for a missing key; the mobile host contract
@@ -13,12 +14,13 @@ function makeStorageProvider({ missingReadsAs = undefined } = {}) {
   const m = new Map();
   const kv = {
     async get(k) { return m.has(k) ? m.get(k) : missingReadsAs; },
+    async getStrict(k) { return this.get(k); },
     async set(k, v) { m.set(k, v); },
     async delete(k) { return m.delete(k); },
     async keys(prefix) { const out = []; for (const k of m.keys()) if (!prefix || k.startsWith(prefix)) out.push(k); return out; },
   };
   const peerLinkStorage = createKeyValueBackedPeerLinkStorage({ keyValueStore: kv });
-  return { getPeerLinkStorage() { return peerLinkStorage; }, getKeyValueStore() { return kv; }, peerLinkStorage };
+  return withTestRuntimeOwnership({ getPeerLinkStorage() { return peerLinkStorage; }, getKeyValueStore() { return kv; }, peerLinkStorage });
 }
 
 function makeService(sp) {

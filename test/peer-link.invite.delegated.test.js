@@ -15,6 +15,7 @@ import { createKeyValueBackedPeerLinkStorage } from "../src/peer-link/createKeyV
 import { PeerLinkService, x3dhBindingPayload } from "../src/peer-link/PeerLinkService.js";
 // REAL crypto — the invite path runs genuine Ed25519 + X3DH end to end.
 import { BrowserCryptoProvider } from "../src/e2ee/BrowserCryptoProvider.js";
+import { withTestRuntimeOwnership } from "./support/runtimeOwnership.js";
 
 // S2.5 S8 L6 — invite create/accept dual-mode (inventory P1/P2/V1/V2). A
 // DELEGATED inviter signs the invite envelope AND its durable record with its
@@ -30,6 +31,7 @@ function makeKvStore() {
   const m = new Map();
   return {
     async get(k) { return m.has(k) ? m.get(k) : undefined; },
+    async getStrict(k) { return this.get(k); },
     async set(k, v) { m.set(k, v); },
     async delete(k) { return m.delete(k); },
     async keys(prefix) {
@@ -43,11 +45,11 @@ function makeKvStore() {
 function makeStorageProvider() {
   const kv = makeKvStore();
   const peerLinkStorage = createKeyValueBackedPeerLinkStorage({ keyValueStore: kv });
-  return {
+  return withTestRuntimeOwnership({
     getPeerLinkStorage() { return peerLinkStorage; },
     getKeyValueStore() { return kv; },
     peerLinkStorage,
-  };
+  });
 }
 
 function signedPayloadBytes(payload) {

@@ -68,6 +68,7 @@ test("golden record survives an IndexedDB-style keyed round trip byte-identicall
   const db = {
     async put(key, value) { stored.set(key, structuredClone(value)); },
     async get(key) { return structuredClone(stored.get(key)); },
+    async getStrict(key) { return this.get(key); },
   };
   await db.put(GOLDEN_DURABLE_RECORD_V1_LOCAL_ID, GOLDEN_DURABLE_RECORD_V1);
   const back = await db.get(GOLDEN_DURABLE_RECORD_V1_LOCAL_ID);

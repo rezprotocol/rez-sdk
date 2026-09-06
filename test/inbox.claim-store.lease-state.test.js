@@ -17,6 +17,7 @@ import { InboxClaimStore } from "../src/inbox/InboxClaimStore.js";
 class MemoryKV {
   constructor() { this.m = new Map(); this.failNextSet = false; }
   async get(k) { return this.m.has(k) ? this.m.get(k) : null; }
+  async getStrict(k) { return this.get(k); }
   async set(k, v) {
     if (this.failNextSet) {
       this.failNextSet = false;

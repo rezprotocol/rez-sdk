@@ -18,6 +18,7 @@ import { derivePeerScopedKey, openFromPeer } from "../src/peer-link/peerScopedSe
 // round-trip needs genuine AES-GCM/ratchet auth (FakeCryptoProvider collapses
 // first-message keys and cannot prove peer-scoping).
 import { BrowserCryptoProvider } from "../src/e2ee/BrowserCryptoProvider.js";
+import { withTestRuntimeOwnership } from "./support/runtimeOwnership.js";
 
 const enc = (s) => new TextEncoder().encode(s);
 const dec = (b) => new TextDecoder().decode(b);
@@ -27,6 +28,7 @@ function makeKvStore() {
   const m = new Map();
   return {
     async get(k) { return m.has(k) ? m.get(k) : undefined; },
+    async getStrict(k) { return this.get(k); },
     async set(k, v) { m.set(k, v); },
     async delete(k) { return m.delete(k); },
     async keys(prefix) {
@@ -40,11 +42,11 @@ function makeKvStore() {
 function makeStorageProvider() {
   const kv = makeKvStore();
   const peerLinkStorage = createKeyValueBackedPeerLinkStorage({ keyValueStore: kv });
-  return {
+  return withTestRuntimeOwnership({
     getPeerLinkStorage() { return peerLinkStorage; },
     getKeyValueStore() { return kv; },
     peerLinkStorage,
-  };
+  });
 }
 
 async function makeDeviceKey(crypto) {

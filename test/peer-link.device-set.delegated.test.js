@@ -17,6 +17,7 @@ import { DEVICE_SET_PUBLISH_CAPABILITY } from "../src/peer-link/deviceSetPublish
 // REAL crypto — the seal is a static-static X25519 agreement; the delegated
 // envelope + inner set carry genuine Ed25519 signatures verified end to end.
 import { BrowserCryptoProvider } from "../src/e2ee/BrowserCryptoProvider.js";
+import { withTestRuntimeOwnership } from "./support/runtimeOwnership.js";
 
 // S2.5 S9 K2 — cert-mode device-set PUBLISH (the S8 L5 delegated params, now
 // wired through the service). A delegated publisher (hasAdminRoot=false) signs
@@ -32,6 +33,7 @@ function makeKvStore() {
   const m = new Map();
   return {
     async get(k) { return m.has(k) ? m.get(k) : undefined; },
+    async getStrict(k) { return this.get(k); },
     async set(k, v) { m.set(k, v); },
     async delete(k) { return m.delete(k); },
     async keys(prefix) {
@@ -45,11 +47,11 @@ function makeKvStore() {
 function makeStorageProvider() {
   const kv = makeKvStore();
   const peerLinkStorage = createKeyValueBackedPeerLinkStorage({ keyValueStore: kv });
-  return {
+  return withTestRuntimeOwnership({
     getPeerLinkStorage() { return peerLinkStorage; },
     getKeyValueStore() { return kv; },
     peerLinkStorage,
-  };
+  });
 }
 
 async function buildLeafCert(c, { accountPubB64, accountPrivBytes, granteePubB64, capabilities }) {

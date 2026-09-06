@@ -12,6 +12,7 @@ import {
 import { createKeyValueBackedPeerLinkStorage } from "../src/peer-link/createKeyValueBackedPeerLinkStorage.js";
 import { PeerLinkService, x3dhBindingPayload } from "../src/peer-link/PeerLinkService.js";
 import { BrowserCryptoProvider } from "../src/e2ee/BrowserCryptoProvider.js";
+import { withTestRuntimeOwnership } from "./support/runtimeOwnership.js";
 
 // S2.5 S9 K2 — selfProvisionDelegatedAccountBinding: the SDK-side producer of
 // the delegated x3dh-subkey binding (C signs the canonical payload and names
@@ -27,6 +28,7 @@ function makeKvStore() {
   const m = new Map();
   return {
     async get(k) { return m.has(k) ? m.get(k) : undefined; },
+    async getStrict(k) { return this.get(k); },
     async set(k, v) { m.set(k, v); },
     async delete(k) { return m.delete(k); },
     async keys(prefix) {
@@ -40,11 +42,11 @@ function makeKvStore() {
 function makeStorageProvider() {
   const kv = makeKvStore();
   const peerLinkStorage = createKeyValueBackedPeerLinkStorage({ keyValueStore: kv });
-  return {
+  return withTestRuntimeOwnership({
     getPeerLinkStorage() { return peerLinkStorage; },
     getKeyValueStore() { return kv; },
     peerLinkStorage,
-  };
+  });
 }
 
 function signedPayloadBytes(payload) {

@@ -833,9 +833,7 @@ function absenceNormalizingStore(keyValueStore) {
       return value === null ? undefined : value;
     },
     async getStrict(key) {
-      const value = typeof keyValueStore.getStrict === "function"
-        ? await keyValueStore.getStrict(key)
-        : await keyValueStore.get(key);
+      const value = await keyValueStore.getStrict(key);
       return value === null ? undefined : value;
     },
     set(key, value) {
@@ -851,8 +849,8 @@ function absenceNormalizingStore(keyValueStore) {
 }
 
 export function createKeyValueBackedPeerLinkStorage({ keyValueStore } = {}) {
-  if (!keyValueStore) {
-    throw new Error("createKeyValueBackedPeerLinkStorage requires keyValueStore");
+  if (!keyValueStore || typeof keyValueStore.getStrict !== "function") {
+    throw new Error("createKeyValueBackedPeerLinkStorage requires keyValueStore with strict reads");
   }
   const normalized = absenceNormalizingStore(keyValueStore);
   return {

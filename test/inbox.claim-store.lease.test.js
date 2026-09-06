@@ -12,6 +12,7 @@ import { InboxClaimStore } from "../src/inbox/InboxClaimStore.js";
 class MemoryKV {
   #m = new Map();
   async get(k) { return this.#m.has(k) ? this.#m.get(k) : null; }
+  async getStrict(k) { return this.get(k); }
   async set(k, v) { this.#m.set(k, v); }
 }
 class MemoryStorageProvider {

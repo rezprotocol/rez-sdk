@@ -89,8 +89,6 @@ const ACCOUNT_DEVICE_BUNDLE_PEER_SENTINEL = "@self-device-bundle";
 // flapping connection without keeping old key material around indefinitely, which would work
 // against the forward secrecy rotation exists to provide.
 const ACCOUNT_DEVICE_BUNDLE_PREKEY_RETENTION = 3;
-const DELIVERY_RUNTIME_EPOCH_KEY = "sdk:delivery:runtime-epoch:v1";
-const FALLBACK_RUNTIME_GRANTS = new WeakMap();
 
 /**
  * Pick the retained prekey state an initiator computed against.
@@ -525,27 +523,12 @@ export class PeerLinkService {
     if (this.#closed) throw new Error("PeerLinkService is closed");
     if (this.#runtimeOwnershipPromise) return this.#runtimeOwnershipPromise;
     this.#runtimeOwnershipPromise = (async () => {
-      let grant;
-      if (typeof this.storageProvider.acquireRuntimeOwnership === "function") {
-        grant = await this.storageProvider.acquireRuntimeOwnership({ namespace: "sdk-delivery" });
-      } else {
-        const keyValueStore = this.peerLinkStorage.sessions.keyValueStore;
-        let fallback = FALLBACK_RUNTIME_GRANTS.get(keyValueStore);
-        if (!fallback) {
-          fallback = (async () => {
-            const raw = await keyValueStore.getStrict(DELIVERY_RUNTIME_EPOCH_KEY);
-            const prior = raw === undefined ? 0 : Number(raw);
-            if (!Number.isSafeInteger(prior) || prior < 0) {
-              throw new Error("Invalid delivery runtime epoch");
-            }
-            const runtimeEpoch = prior + 1;
-            await keyValueStore.set(DELIVERY_RUNTIME_EPOCH_KEY, runtimeEpoch);
-            return { runtimeEpoch };
-          })();
-          FALLBACK_RUNTIME_GRANTS.set(keyValueStore, fallback);
-        }
-        grant = await fallback;
+      if (typeof this.storageProvider.acquireRuntimeOwnership !== "function") {
+        const err = new Error("Storage provider does not implement exclusive delivery runtime ownership");
+        err.code = "DELIVERY_RUNTIME_OWNERSHIP_UNSUPPORTED";
+        throw err;
       }
+      const grant = await this.storageProvider.acquireRuntimeOwnership({ namespace: "sdk-delivery" });
       if (!grant || !Number.isSafeInteger(grant.runtimeEpoch) || grant.runtimeEpoch < 1) {
         throw new Error("Storage provider returned an invalid delivery runtime grant");
       }
@@ -557,11 +540,11 @@ export class PeerLinkService {
 
   async close() {
     if (this.#closed) return;
-    if (!this.#runtimeOwnershipPromise) return;
     this.#closed = true;
     await Promise.all([...this.#deliveryReadyByOwner.keys()].map((owner) => (
       this.#dependencyLanes.closeOwner(owner)
     )));
+    if (!this.#runtimeOwnershipPromise) return;
     let grant = null;
     try {
       grant = await this.#runtimeOwnershipPromise;

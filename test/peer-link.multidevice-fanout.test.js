@@ -5,6 +5,7 @@ import { SeedKeys } from "@rezprotocol/core/src/crypto/seedDerivation.js";
 import { createKeyValueBackedPeerLinkStorage } from "../src/peer-link/createKeyValueBackedPeerLinkStorage.js";
 import { PeerLinkService } from "../src/peer-link/PeerLinkService.js";
 import { BrowserCryptoProvider } from "../src/e2ee/BrowserCryptoProvider.js";
+import { withTestRuntimeOwnership } from "./support/runtimeOwnership.js";
 
 // S2.5 S12 L7 — the MULTI-DEVICE device set, un-mocked. Two devices of ONE
 // account (sharing the seed-derived account identity-DH key) each self-publish a
@@ -21,12 +22,13 @@ function makeStorageProvider() {
   const m = new Map();
   const kv = {
     async get(k) { return m.has(k) ? m.get(k) : undefined; },
+    async getStrict(k) { return this.get(k); },
     async set(k, v) { m.set(k, v); },
     async delete(k) { return m.delete(k); },
     async keys(prefix) { const o = []; for (const k of m.keys()) if (!prefix || k.startsWith(prefix)) o.push(k); return o; },
   };
   const peerLinkStorage = createKeyValueBackedPeerLinkStorage({ keyValueStore: kv });
-  return { getPeerLinkStorage() { return peerLinkStorage; }, getKeyValueStore() { return kv; }, peerLinkStorage };
+  return withTestRuntimeOwnership({ getPeerLinkStorage() { return peerLinkStorage; }, getKeyValueStore() { return kv; }, peerLinkStorage });
 }
 
 // One account "device": same B + injected account identity-DH, its own device key

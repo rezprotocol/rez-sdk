@@ -10,6 +10,7 @@ import {
 import { createKeyValueBackedPeerLinkStorage } from "../src/peer-link/createKeyValueBackedPeerLinkStorage.js";
 import { PeerLinkService } from "../src/peer-link/PeerLinkService.js";
 import { BrowserCryptoProvider } from "../src/e2ee/BrowserCryptoProvider.js";
+import { withTestRuntimeOwnership } from "./support/runtimeOwnership.js";
 
 // S2.5 S9 K2 — the explicit signing-mode contract. `hasAdminRoot` has THREE
 // outcomes: true = direct (account admin root signs through the authority),
@@ -25,6 +26,7 @@ function makeKvStore() {
   const m = new Map();
   return {
     async get(k) { return m.has(k) ? m.get(k) : undefined; },
+    async getStrict(k) { return this.get(k); },
     async set(k, v) { m.set(k, v); },
     async delete(k) { return m.delete(k); },
     async keys(prefix) {
@@ -38,11 +40,11 @@ function makeKvStore() {
 function makeStorageProvider() {
   const kv = makeKvStore();
   const peerLinkStorage = createKeyValueBackedPeerLinkStorage({ keyValueStore: kv });
-  return {
+  return withTestRuntimeOwnership({
     getPeerLinkStorage() { return peerLinkStorage; },
     getKeyValueStore() { return kv; },
     peerLinkStorage,
-  };
+  });
 }
 
 async function buildLeafCert(c, { accountPubB64, accountPrivBytes, granteePubB64, capabilities }) {

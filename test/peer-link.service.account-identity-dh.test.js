@@ -6,6 +6,7 @@ import { createKeyValueBackedPeerLinkStorage } from "../src/peer-link/createKeyV
 import { PeerLinkService, x3dhBindingPayload } from "../src/peer-link/PeerLinkService.js";
 import { derivePeerScopedKey } from "../src/peer-link/peerScopedSeal.js";
 import { BrowserCryptoProvider } from "../src/e2ee/BrowserCryptoProvider.js";
+import { withTestRuntimeOwnership } from "./support/runtimeOwnership.js";
 
 // Audit P1 — the account-level identity-DH key (X3DH DH1 + the device-set
 // peer-scoped seal) was generated random per-device-local, so a 2nd device of an
@@ -32,12 +33,13 @@ function makeStorageProvider() {
   const m = new Map();
   const kv = {
     async get(k) { return m.has(k) ? m.get(k) : undefined; },
+    async getStrict(k) { return this.get(k); },
     async set(k, v) { m.set(k, v); },
     async delete(k) { return m.delete(k); },
     async keys(prefix) { const o = []; for (const k of m.keys()) if (!prefix || k.startsWith(prefix)) o.push(k); return o; },
   };
   const peerLinkStorage = createKeyValueBackedPeerLinkStorage({ keyValueStore: kv });
-  return { getPeerLinkStorage() { return peerLinkStorage; }, getKeyValueStore() { return kv; }, peerLinkStorage };
+  return withTestRuntimeOwnership({ getPeerLinkStorage() { return peerLinkStorage; }, getKeyValueStore() { return kv; }, peerLinkStorage });
 }
 
 // One account "device": same B (chat-server) identity + same injected account
