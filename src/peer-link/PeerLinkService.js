@@ -2761,7 +2761,7 @@ export class PeerLinkService {
       };
     }
     const rows = await this.peerLinkStorage.peerLinks.listByOwner(owner);
-    const trace = process.env.REZ_PEERLINK_TRACE === "1";
+    const trace = typeof process !== "undefined" && process.env && process.env.REZ_PEERLINK_TRACE === "1";
     const tried = [];
     // Links with a usable session that nonetheless failed to decrypt this packet
     // ("should have decrypted but didn't") — the recovery-attribution candidates.
