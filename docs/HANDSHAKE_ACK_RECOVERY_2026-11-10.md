@@ -1,6 +1,8 @@
 # Handshake acknowledgement recovery — 2026-11-10
 
-Status: clean-source tests and web build pass; staged/live browser acceptance pending.
+Status: committed, pushed and live as the web-ack-20261110 release. Clean-source
+tests, web build and fresh-account browser acceptance pass. Older interrupted
+files exposed a separate persistence gap, described below.
 
 The hosted byte-bounded mailbox can return a short first page containing an
 old connection-confirmation acknowledgement followed by a file manifest and
@@ -54,13 +56,24 @@ dependencies after the nonce-ordering repair.
 Uncommitted runtime-ownership/native-storage work is excluded from the clean
 candidate and commits. iPhone and Swift sources remain untouched.
 
-## Remaining acceptance work
+## Live acceptance and remaining work
 
-Staged client acceptance and recovery of partially processed older transfers
-are not yet proven. This does not add persistent chunk reassembly, on-demand
-media retrieval or image delivery receipts. Those claims must not be inferred
-from acknowledgement replay. The earlier live notification timeout is also
-under separate investigation. New tester invitations remain on hold.
+The public entry selected `assets/index-C6SbI2X8.js` with entry SHA-256
+`4e410f30d3393acbc0ee5ea71fe05c6a8c414de9107885b049a55be376e91d8e`.
+A fresh-account Chrome offline valid 1.7 MB PNG/render/reply workflow passed
+in 43 seconds. Firefox existing-contact unlock measured 2.237 seconds and
+first-message delivery 442 ms. Normal refresh retains saved site data.
+
+An older-client/partially processed image reproduction failed with unknown
+transfer chunks. An earlier attempt rendered the exact image but timed out
+during cleanup; it is not counted as a complete pass. ACK replay fixes the
+cursor barrier, but cannot recreate bytes discarded by the old in-memory
+reassembler. The separate durable-chunk/background-startup repair is recorded
+in `CLIENT_SYNC_RECOVERY_2026-11-10.md`; legacy lost bytes may need sender
+resend. This ACK change itself adds no persistent chunk reassembly, on-demand
+media retrieval or image delivery receipt. The earlier intermittent connection
+timeouts remain unattributed; the Node lookup report records passing and
+failed soaks explicitly. New tester invitations remain on hold.
 
 Evidence: `/tmp/rez-client-acceptance-20261110/ack-*`,
 `routing-chrome-image-profile.log`, and the clean source/build fixture at

@@ -165,11 +165,8 @@ test("handleIncomingPayload — out-of-order chunks work", async () => {
   assert.deepEqual(receivedFiles[0].fileBytes, data);
 });
 
-test("handleIncomingPayload — bad chunk hash is rejected (logged, not thrown)", async () => {
-  const logs = [];
+test("handleIncomingPayload — bad chunk hash rejects without acknowledging it", async () => {
   const { svc } = createService();
-  // Override log to capture errors
-  svc.log = { error: (...args) => logs.push(args) };
 
   const data = makeBytes(1024);
   const { manifest } = FileChunker.chunk(data, { fileName: "bad.bin", chunkSizeBytes: 1024 });
@@ -184,9 +181,7 @@ test("handleIncomingPayload — bad chunk hash is rejected (logged, not thrown)"
     hashHex: bytesToHex(Hash.sha256(new Uint8Array([0, 0, 0]))),
   });
 
-  const consumed = await svc.handleIncomingPayload(badChunk.toJSON(), { senderAccountId: "acct:alice", contextId: "ctx-1" });
-  assert.equal(consumed, true);
-  assert.ok(logs.length > 0, "should have logged a hash mismatch error");
+  await assert.rejects(svc.handleIncomingPayload(badChunk.toJSON(), { senderAccountId: "acct:alice", contextId: "ctx-1" }), /hash\/size mismatch/);
 
   // Session should NOT have marked chunk as received
   const session = svc.getTransferSession(manifest.transferId);

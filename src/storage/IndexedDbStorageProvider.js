@@ -108,7 +108,8 @@ export class IndexedDbStorageProvider {
       const tx = db.transaction(this._storeName, "readwrite");
       const store = tx.objectStore(this._storeName);
       const request = store.put(payload, normalizedKey);
-      request.onsuccess = () => resolve(payload);
+      // Request success can still be followed by an aborted transaction.
+      tx.oncomplete = () => resolve(payload);
       request.onerror = () => reject(request.error || new Error("IndexedDB put failed"));
       tx.onabort = () => reject(tx.error || new Error("IndexedDB put transaction aborted"));
       tx.onerror = () => reject(tx.error || new Error("IndexedDB put transaction failed"));
@@ -122,7 +123,7 @@ export class IndexedDbStorageProvider {
       const tx = db.transaction(this._storeName, "readwrite");
       const store = tx.objectStore(this._storeName);
       const request = store.delete(normalizedKey);
-      request.onsuccess = () => resolve();
+      tx.oncomplete = () => resolve();
       request.onerror = () => reject(request.error || new Error("IndexedDB delete failed"));
       tx.onabort = () => reject(tx.error || new Error("IndexedDB delete transaction aborted"));
       tx.onerror = () => reject(tx.error || new Error("IndexedDB delete transaction failed"));
@@ -151,7 +152,7 @@ export class IndexedDbStorageProvider {
       const tx = db.transaction(this._storeName, "readwrite");
       const store = tx.objectStore(this._storeName);
       const request = store.clear();
-      request.onsuccess = () => resolve();
+      tx.oncomplete = () => resolve();
       request.onerror = () => reject(request.error || new Error("IndexedDB clear failed"));
       tx.onabort = () => reject(tx.error || new Error("IndexedDB clear transaction aborted"));
       tx.onerror = () => reject(tx.error || new Error("IndexedDB clear transaction failed"));
