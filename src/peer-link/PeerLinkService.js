@@ -1757,13 +1757,12 @@ export class PeerLinkService {
   // #commitSession (and the acceptInvite/reject updates) via assertTransition so
   // every state write is validated against the SSOT transition table without
   // changing behavior. See PeerLinkStateMachine.
-  #logIllegalTransition(result, peerLinkId) {
+  #logIllegalTransition(result) {
     // eslint-disable-next-line no-console
     console.warn(
       "[PLTRACE] illegal peer-link transition "
       + (result && result.from ? result.from : "<none>")
-      + " -> " + (result && result.to ? result.to : "<none>")
-      + " peerLinkId=" + (peerLinkId || "<unknown>"),
+      + " -> " + (result && result.to ? result.to : "<none>"),
     );
   }
 
@@ -2870,7 +2869,7 @@ export class PeerLinkService {
 
     if (trace) {
       // eslint-disable-next-line no-console
-      console.log("[PLTRACE] decryptAnyPeer owner=" + owner + " NO MATCH; links tried=[" + tried.join(", ") + "] (rows=" + rows.length + ")");
+      console.log("[PLTRACE] decryptAnyPeer found no matching session (rows=" + rows.length + ")");
     }
     // Recovery attribution. We cannot read the sender from an opaque packet, so
     // a total miss against usable sessions means one of those links may carry a
@@ -3628,11 +3627,7 @@ export class PeerLinkService {
             // conflict), but we never swallow silently: surface it so a broken
             // diagnostic trail is visible while still degrading the peer link.
             console.warn(
-              "[PeerLinkService] handshake-attempt failure update conflicted for "
-                + peerLinkId + ": "
-                + (attemptUpdateErr && attemptUpdateErr.message
-                  ? attemptUpdateErr.message
-                  : String(attemptUpdateErr))
+              "[PeerLinkService] handshake-attempt failure update conflicted"
             );
           }
           this.#checkPeerLinkTransition(currentForErr.state, PEER_LINK_STATE.DEGRADED, currentForErr.peerLinkId);
