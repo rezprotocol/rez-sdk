@@ -4002,8 +4002,11 @@ export class PeerLinkService {
     if (!peerLinkRecord) {
       return null;
     }
-    // Only accept ack if we're waiting for confirmation
-    if (peerLinkRecord.state !== "handshake_sent" && peerLinkRecord.state !== "accept_committed") {
+    // A durable mailbox may replay an ack already applied before a refresh.
+    // Established links still authenticate it below, without re-committing
+    // the session or resetting ratchet state.
+    const alreadyEstablished = peerLinkRecord.state === PEER_LINK_STATE.SESSION_ESTABLISHED;
+    if (peerLinkRecord.state !== "handshake_sent" && peerLinkRecord.state !== "accept_committed" && !alreadyEstablished) {
       return null;
     }
     // The peer-link MUST already carry the inviter's X3DH identity signing
@@ -4030,12 +4033,11 @@ export class PeerLinkService {
     // and now we know that "whoever" is the legitimate inviter.
     const nonceKey = "peer-link:ack-nonce:" + owner + ":" + peerLinkRecord.peerLinkId;
     const storedNonce = await this.kv.get(nonceKey);
+    if (!storedNonce && !alreadyEstablished) return null;
     if (storedNonce) {
       if (String(ack.ackNonce) !== String(storedNonce)) {
         return null;
       }
-      // Clean up the nonce after successful verification
-      await this.kv.delete(nonceKey);
     }
     const remoteDisplayName = typeof ack.senderDisplayName === "string" ? ack.senderDisplayName : "";
 
@@ -4047,30 +4049,42 @@ export class PeerLinkService {
     // from the ack (routing-hijack guard). A peerLinks version mismatch means a
     // duplicate ack arrived via multiple relays, or acceptInvite already
     // advanced the record — re-read and treat an established link as success.
-    const existingSession = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, peerLinkRecord.peerLinkId);
     let commit;
-    try {
-      commit = await this.#commitSession({
-        ownerAccountId: owner,
-        peerLinkRecord,
-        peerAccountId: remote,
-        sessionStatus: SESSION_STATUS.ACTIVE,
-        peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
-        existingSession,
-        peerInboxId: peerLinkRecord.peerInboxId,
-        eventType: "handshake_ack_received",
-        eventSummary: "Handshake acknowledged — session established",
-        atMs: nowMs,
-      });
-    } catch (err) {
-      const fresh = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
-      if (fresh && fresh.state === "session_established") {
-        return { snapshot: await this._buildSnapshot(fresh), event: null };
+    let replay = alreadyEstablished;
+    if (alreadyEstablished) {
+      commit = { snapshot: await this._buildSnapshot(peerLinkRecord), event: null };
+    } else {
+      const existingSession = await this.peerLinkStorage.sessions.getByPeerLinkId(owner, peerLinkRecord.peerLinkId);
+      try {
+        commit = await this.#commitSession({
+          ownerAccountId: owner,
+          peerLinkRecord,
+          peerAccountId: remote,
+          sessionStatus: SESSION_STATUS.ACTIVE,
+          peerLinkState: PEER_LINK_STATE.SESSION_ESTABLISHED,
+          existingSession,
+          peerInboxId: peerLinkRecord.peerInboxId,
+          eventType: "handshake_ack_received",
+          eventSummary: "Handshake acknowledged — session established",
+          atMs: nowMs,
+        });
+      } catch (err) {
+        const fresh = await this.peerLinkStorage.peerLinks.getByPair(owner, remote);
+        if (fresh && fresh.state === PEER_LINK_STATE.SESSION_ESTABLISHED) {
+          commit = { snapshot: await this._buildSnapshot(fresh), event: null };
+          replay = true;
+        } else {
+          // Genuinely unexpected — surface as a version conflict.
+          throw new Error(`Peer link version conflict for ${peerLinkRecord.peerLinkId}`);
+        }
       }
-      // Genuinely unexpected — surface as a version conflict.
-      throw new Error(`Peer link version conflict for ${peerLinkRecord.peerLinkId}`);
     }
 
+    // Keep proof of the attempt until confirmation is durable. A storage
+    // failure must leave a nonce-bound retry, and a crash after commit may
+    // safely replay the authenticated ack without changing the session.
+    if (storedNonce) await this.kv.delete(nonceKey);
+    if (replay) return { snapshot: commit.snapshot, event: null };
     return {
       snapshot: commit.snapshot,
       event: commit.event,
