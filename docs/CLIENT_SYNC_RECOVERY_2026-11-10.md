@@ -1,7 +1,21 @@
 # Responsive startup and attachment recovery — 2026-11-10
 
-Status: clean-source verification and live Chrome/Firefox interrupted-transfer
-acceptance pass; public promotion pending.
+Status: committed, pushed and publicly deployed at 2026-11-10 23:51:23 UTC;
+clean-source verification and live Chrome/Firefox interrupted-transfer
+acceptance pass.
+
+Source commits: Core `4da269f`, SDK `46509ee`, Chat `02f27df`. The isolated
+build excludes unrelated working changes, including the extra IndexedDB
+ownership hunks. Entry SHA-256:
+`d8a175580df0635cdbf8f04903dbfdc1a72de4cd00d8972f2b9f16d661394c89`;
+entry script `assets/index-BYcczCDv.js`. The server verified every artifact
+hash, retained the previous public entry and old hashed assets, atomically
+promoted this entry, fetched and byte-compared it, and passed `/ready` with
+storage/Redis healthy and no degradation. Release:
+`/opt/rez/releases/web-background-20261110/`. Temporary public test HTML pages
+were removed. Existing service-worker network-first navigation picks this up
+on normal refresh; saved browser data must remain intact. No network-node
+redeploy or wire migration is needed for this client-only slice.
 
 The UI previously waited for initial inbox catch-up, and file reassembly kept
 chunks only in memory. Refresh could therefore discard bytes whose deposits
@@ -63,6 +77,12 @@ consumed-page replay, and reverse reply. Unlock-to-usable measured **1.832 s
 in Chrome / 1.856 s in Firefox**. These are synthetic observations, not a
 promise for every connection. Evidence:
 `/tmp/rez-client-acceptance-20261110/background-*`.
+
+Post-promotion public Firefox login/invite/first-message/offline-reopen/reply
+also passes: **1 test**, 12.3 seconds; existing-contact unlock **1.759 s**,
+first-message receive **342 ms**. Source staging was byte-compared with the
+clean tested candidate. Unrelated Core/Chat/Node tracked-diff hashes and SDK
+unrelated diffs/full mixed IndexedDB working-file hash are unchanged.
 
 ## Required focused audit
 
