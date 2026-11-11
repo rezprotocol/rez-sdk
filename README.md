@@ -2,20 +2,20 @@
 
 App-facing runtime SDK for Rez.
 
-## Developer preview: 0.6.0-rc.11
+## Developer preview: 0.6.0-rc.12
 
 Use Node 24 or newer for the packaged connection example:
 
 ```sh
-npm install @rezprotocol/sdk@0.6.0-rc.11
+npm install @rezprotocol/sdk@0.6.0-rc.12
 node node_modules/@rezprotocol/sdk/examples/connect.mjs
 ```
 
 Alternatively, install the matching GitHub release archives together:
 
 ```sh
-npm install https://github.com/rezprotocol/rez-core/releases/download/v0.6.0-rc.11/rezprotocol-core-0.6.0-rc.11.tgz \
-  https://github.com/rezprotocol/rez-sdk/releases/download/v0.6.0-rc.11/rezprotocol-sdk-0.6.0-rc.11.tgz
+npm install https://github.com/rezprotocol/rez-core/releases/download/v0.6.0-rc.12/rezprotocol-core-0.6.0-rc.12.tgz \
+  https://github.com/rezprotocol/rez-sdk/releases/download/v0.6.0-rc.12/rezprotocol-sdk-0.6.0-rc.12.tgz
 ```
 
 The example creates a disposable identity, authenticates to
