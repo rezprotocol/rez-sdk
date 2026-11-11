@@ -2,6 +2,35 @@
 
 App-facing runtime SDK for Rez.
 
+## Developer preview: 0.6.0-rc.11
+
+Use Node 24 or newer for the packaged connection example:
+
+```sh
+npm install @rezprotocol/sdk@0.6.0-rc.11
+node node_modules/@rezprotocol/sdk/examples/connect.mjs
+```
+
+Alternatively, install the matching GitHub release archives together:
+
+```sh
+npm install https://github.com/rezprotocol/rez-core/releases/download/v0.6.0-rc.11/rezprotocol-core-0.6.0-rc.11.tgz \
+  https://github.com/rezprotocol/rez-sdk/releases/download/v0.6.0-rc.11/rezprotocol-sdk-0.6.0-rc.11.tgz
+```
+
+The example creates a disposable identity, authenticates to
+`wss://chat.rezprotocol.io/ws`, calls `node.status` and shuts down. It never
+prints private keys. Set `REZ_UPLINK` to use your own node. Core is installed
+automatically at the matching release version; applications consume the SDK.
+For a source checkout, install from the polyrepo workspace root.
+
+This is an early developer network. Retain application keys and local state in
+protected storage, handle disconnects and retryable failures, and use test data.
+Hosted durability currently relies on one database host and recovery backups.
+Transport acceptance is separate from your application's recipient delivery
+receipt. Rez Chat's invites, groups and message statuses are application logic;
+they are not an SDK chat API. Phone/native release acceptance is separate.
+
 ## Purpose
 
 `@rezprotocol/sdk` hides protocol/crypto internals behind higher-level client APIs so app code can integrate Rez without handling core primitives directly.
@@ -15,6 +44,7 @@ const rez = new RezClient({
   uplinks: ["ws://localhost:8787/ws"],
   identity: {
     accountId,
+    deviceId,
     publicKeyB64,
     privateKeyB64,
   },
