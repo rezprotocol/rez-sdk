@@ -529,12 +529,23 @@ export class PeerLinkService {
         throw err;
       }
       const grant = await this.storageProvider.acquireRuntimeOwnership({ namespace: "sdk-delivery" });
-      if (!grant || !Number.isSafeInteger(grant.runtimeEpoch) || grant.runtimeEpoch < 1) {
+      if (!grant || !Number.isSafeInteger(grant.runtimeEpoch) || grant.runtimeEpoch < 1
+          || typeof grant.assertActive !== "function" || typeof grant.release !== "function") {
+        if (grant && typeof grant.release === "function") await grant.release();
         throw new Error("Storage provider returned an invalid delivery runtime grant");
       }
-      this.#deliveryCommitStore.activateRuntimeEpoch(grant.runtimeEpoch, typeof grant.assertActive === "function" ? () => grant.assertActive() : null);
+      try {
+        grant.assertActive();
+        this.#deliveryCommitStore.activateRuntimeEpoch(grant.runtimeEpoch, () => grant.assertActive());
+      } catch (err) {
+        await grant.release();
+        throw err;
+      }
       return grant;
-    })();
+    })().catch((err) => {
+      this.#runtimeOwnershipPromise = null;
+      throw err;
+    });
     return this.#runtimeOwnershipPromise;
   }
 
@@ -564,7 +575,10 @@ export class PeerLinkService {
       ready = this.#ensureRuntimeOwnership().then(() => this.#dependencyLanes.runOwner(owner, async () => {
         await this.#deliveryCommitStore.recoverOwner(owner);
         await this.peerLinkStorage.events.migrateLegacyIndexesForOwner(owner);
-      }));
+      })).catch((err) => {
+        this.#deliveryReadyByOwner.delete(owner);
+        throw err;
+      });
       this.#deliveryReadyByOwner.set(owner, ready);
     }
     return ready;

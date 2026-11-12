@@ -39,9 +39,27 @@ test("one memory provider admits one runtime until its owner releases", async ()
     (err) => err.code === "DELIVERY_RUNTIME_ALREADY_ACTIVE",
   );
   await first.close();
-  const replacement = makeService(provider);
-  assert.deepEqual(await replacement.listPendingDeliveryWork(), []);
-  await replacement.close();
+  assert.deepEqual(await second.listPendingDeliveryWork(), [], "a refused runtime can retry after the owner releases");
+  await second.close();
+});
+
+test("runtime admission rejects and releases grants without an active-owner assertion", async () => {
+  const provider = new MemoryStorageProvider();
+  const acquire = provider.acquireRuntimeOwnership.bind(provider);
+  let releases = 0;
+  provider.acquireRuntimeOwnership = async () => {
+    const grant = await acquire();
+    return {
+      runtimeEpoch: grant.runtimeEpoch,
+      release: async () => { releases += 1; await grant.release(); },
+    };
+  };
+  const service = makeService(provider);
+  await assert.rejects(() => service.listPendingDeliveryWork(), /invalid delivery runtime grant/);
+  assert.equal(releases, 1);
+  provider.acquireRuntimeOwnership = acquire;
+  assert.deepEqual(await service.listPendingDeliveryWork(), []);
+  await service.close();
 });
 
 test("close before first use is terminal", async () => {
